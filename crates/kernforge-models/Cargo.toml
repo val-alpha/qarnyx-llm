@@ -1,0 +1,13 @@
+[package]
+name = "kernforge-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kernforge-core = { path = "../kernforge-core" }
+kernforge-gguf = { path = "../kernforge-gguf" }
+
+[lints]
+workspace = true
