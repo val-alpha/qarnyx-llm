@@ -495,6 +495,19 @@ mod tests {
     }
 
     #[test]
+    fn decodes_second_q6_k_half_block_with_its_own_scales() {
+        let mut block = vec![0_u8; 210];
+        block[64] = 0x03;
+        block[160] = 0b0000_0001;
+        block[200] = 2;
+        put_half(&mut block, 208, 1.0);
+
+        let decoded = dequantize(14, &[256], &block).unwrap();
+        assert_eq!(decoded[128], -26.0);
+        assert_eq!(decoded[129], -32.0);
+    }
+
+    #[test]
     fn rejects_unknown_types_and_inexact_encoded_lengths() {
         assert_eq!(encoded_len(999, &[1]), Err(QuantError::UnsupportedType(999)));
 
