@@ -9,6 +9,7 @@ rust-version.workspace = true
 qarnyx-core = { path = "../qarnyx-core" }
 qarnyx-quant = { path = "../qarnyx-quant" }
 thiserror.workspace = true
+rayon = "1.12"
 
 [lints]
 workspace = true
