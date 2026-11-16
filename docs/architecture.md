@@ -114,8 +114,8 @@ The CPU backend implements:
 Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
-remains specific to the tensor type. Matrix kernels validate exact encoded storage lengths and do not materialize
-a full F32 matrix. The automatic Q4_K matvec path evaluates each packed block
+remains specific to the tensor type. Matrix kernels validate exact encoded
+storage lengths and do not materialize a full F32 matrix. The automatic Q4_K matvec path evaluates each packed block
 directly and avoids the temporary F32 row; other quantized matvec/matmul paths
 decode only the active weight row into reusable F32 scratch. RMSNorm requires
 a positive finite epsilon. RoPE pairs the first and second halves of one head
