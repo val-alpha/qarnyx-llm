@@ -319,3 +319,168 @@ fn dtype_from_ggml(tensor: &TensorInfo) -> Result<DType, TensorLoadError> {
 fn leaked_shape(shape: &[usize]) -> &'static [usize] {
     Box::leak(shape.to_vec().into_boxed_slice())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(output: &mut Vec<u8>, value: u64) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_string(output: &mut Vec<u8>, value: &str) {
+        push_u64(output, value.len() as u64);
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_metadata_string(output: &mut Vec<u8>, key: &str, value: &str) {
+        push_string(output, key);
+        push_u32(output, 8);
+        push_string(output, value);
+    }
+
+    fn push_metadata_u32(output: &mut Vec<u8>, key: &str, value: u32) {
+        push_string(output, key);
+        push_u32(output, 4);
+        push_u32(output, value);
+    }
+
+    fn push_metadata_f32(output: &mut Vec<u8>, key: &str, value: f32) {
+        push_string(output, key);
+        push_u32(output, 6);
+        push_u32(output, value.to_bits());
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn build_tiny_llama_gguf() -> Vec<u8> {
+        let tensors = [
+            ("blk.0.attn_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4_u64]),
+            (
+                "blk.0.attn_q.weight",
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                    1.0,
+                ],
+                vec![4, 4],
+            ),
+            (
+                "blk.0.attn_k.weight",
+                vec![0.0; 8],
+                vec![2, 4],
+            ),
+            (
+                "blk.0.attn_v.weight",
+                vec![0.0; 8],
+                vec![2, 4],
+            ),
+            (
+                "blk.0.attn_output.weight",
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                    1.0,
+                ],
+                vec![4, 4],
+            ),
+            ("blk.0.ffn_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4]),
+            ("blk.0.ffn_gate.weight", vec![0.0; 32], vec![8, 4]),
+            ("blk.0.ffn_up.weight", vec![0.0; 32], vec![8, 4]),
+            ("blk.0.ffn_down.weight", vec![0.0; 32], vec![4, 8]),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, tensors.len() as u64);
+        push_u64(&mut bytes, 9);
+        push_metadata_string(&mut bytes, "general.architecture", "llama");
+        push_metadata_u32(&mut bytes, "general.alignment", 32);
+        push_metadata_u32(&mut bytes, "llama.block_count", 1);
+        push_metadata_u32(&mut bytes, "llama.embedding_length", 4);
+        push_metadata_u32(&mut bytes, "llama.feed_forward_length", 8);
+        push_metadata_u32(&mut bytes, "llama.attention.head_count", 2);
+        push_metadata_u32(&mut bytes, "llama.attention.head_count_kv", 1);
+        push_metadata_u32(&mut bytes, "llama.attention.key_length", 2);
+        push_metadata_u32(&mut bytes, "llama.attention.value_length", 2);
+        push_metadata_f32(
+            &mut bytes,
+            "llama.attention.layer_norm_rms_epsilon",
+            1.0e-5,
+        );
+
+        let directory_start = bytes.len();
+        let mut offsets = Vec::with_capacity(tensors.len());
+        let mut payload_offset = 0_u64;
+
+        for (name, values, dimensions) in &tensors {
+            let padding = (32 - (payload_offset as usize % 32)) % 32;
+            payload_offset += padding as u64;
+            offsets.push(payload_offset);
+            push_string(&mut bytes, name);
+            push_u32(&mut bytes, dimensions.len() as u32);
+            for dimension in dimensions {
+                push_u64(&mut bytes, *dimension);
+            }
+            push_u32(&mut bytes, 0);
+            push_u64(&mut bytes, payload_offset);
+            payload_offset += (values.len() * 4) as u64;
+        }
+
+        let tensor_data_offset = ((bytes.len() + 31) / 32) * 32;
+        bytes.resize(tensor_data_offset, 0);
+
+        for ((_, values, _), offset) in tensors.iter().zip(offsets) {
+            let absolute = tensor_data_offset + offset as usize;
+            let payload = f32_bytes(values);
+            let end = absolute + payload.len();
+            if bytes.len() < end {
+                bytes.resize(end, 0);
+            }
+            bytes[absolute..end].copy_from_slice(&payload);
+        }
+
+        let _ = directory_start;
+        bytes
+    }
+
+    #[test]
+    fn loads_tiny_llama_model_end_to_end() {
+        let data = build_tiny_llama_gguf();
+        let gguf = GgufFile::parse(&data).expect("tiny GGUF fixture parses");
+
+        let model = LlamaModel::from_gguf(&gguf, &data).expect("LLaMA tensor mapping succeeds");
+
+        assert_eq!(model.config.embedding_length, 4);
+        assert_eq!(model.layers.len(), 1);
+        assert_eq!(model.layers[0].attention_norm, vec![1.0; 4]);
+        assert_eq!(model.layers[0].q_proj.dtype, DType::F32);
+        assert_eq!(model.layers[0].q_proj.shape, [4, 4]);
+        assert_eq!(
+            model.layers[0].q_proj.data,
+            f32_bytes(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0
+            ])
+        );
+        assert_eq!(model.layers[0].k_proj.shape, [2, 4]);
+        assert_eq!(model.layers[0].v_proj.shape, [2, 4]);
+        assert_eq!(model.layers[0].gate_proj.shape, [8, 4]);
+        assert_eq!(model.layers[0].down_proj.shape, [4, 8]);
+
+        let backend = qarnyx_cpu::CpuBackend::new(1).expect("CPU backend");
+        let output = model
+            .forward(&backend, &[1.0, 2.0, 3.0, 4.0], 0)
+            .expect("tiny model forward");
+
+        assert_eq!(output, [1.0, 2.0, 3.0, 4.0]);
+    }
+}
