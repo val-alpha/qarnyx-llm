@@ -310,7 +310,7 @@ fn dequantize_q5_k(encoded: &[u8], output: &mut [f32]) {
                 for index in 0..32 {
                     let packed = low_bits[quant_offset + index];
                     let mask = if half == 0 { low_mask } else { high_mask };
-                    let high = u8::from(high_bits[quant_offset + index] & mask != 0);
+                    let high = u8::from(high_bits[index] & mask != 0);
                     let low = if half == 0 { packed & 0x0f } else { packed >> 4 };
                     let quant = low | (high << 4);
                     let output_index = base + pair * 64 + half * 32 + index;
@@ -464,14 +464,19 @@ mod tests {
         put_half(&mut block, 0, 1.0);
         block[4] = 1;
         block[5] = 2;
+        block[6] = 3;
+        block[7] = 4;
         block[48..80].fill(0x21);
-        block[16] = 0b0000_0010;
+        block[80..112].fill(0x43);
+        block[16] = 0b0000_1110;
 
         let decoded = dequantize(13, &[256], &block).unwrap();
         assert_eq!(decoded[0], 1.0);
         assert_eq!(decoded[1], 1.0);
         assert_eq!(decoded[32], 36.0);
-        assert_eq!(decoded[64], 0.0);
+        assert_eq!(decoded[64], 57.0);
+        assert_eq!(decoded[96], 80.0);
+        assert_eq!(decoded[128], 0.0);
     }
 
     #[test]
