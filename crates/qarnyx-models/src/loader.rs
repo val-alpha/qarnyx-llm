@@ -506,6 +506,19 @@ mod tests {
 
     fn build_tiny_llama_gguf() -> Vec<u8> {
         let tensors = [
+            ("token_embd.weight", vec![
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ], vec![4_u64, 4]),
+            ("output_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4_u64]),
+            ("output.weight", vec![
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ], vec![4_u64, 4]),
             ("blk.0.attn_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4_u64]),
             (
                 "blk.0.attn_q.weight",
@@ -543,7 +556,7 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         push_u32(&mut bytes, 3);
         push_u64(&mut bytes, tensors.len() as u64);
-        push_u64(&mut bytes, 9);
+        push_u64(&mut bytes, 12);
         push_metadata_string(&mut bytes, "general.architecture", "llama");
         push_metadata_u32(&mut bytes, "general.alignment", 32);
         push_metadata_u32(&mut bytes, "llama.block_count", 1);
@@ -602,6 +615,7 @@ mod tests {
         let model = LlamaModel::from_gguf(&gguf, &data).expect("LLaMA tensor mapping succeeds");
 
         assert_eq!(model.config.embedding_length, 4);
+        assert_eq!(model.vocab_size(), 4);
         assert_eq!(model.layers.len(), 1);
         assert_eq!(model.layers[0].attention_norm, vec![1.0; 4]);
         assert_eq!(model.layers[0].q_proj.dtype, DType::F32);
@@ -616,6 +630,7 @@ mod tests {
         assert_eq!(model.layers[0].v_proj.shape, [2, 4]);
         assert_eq!(model.layers[0].gate_proj.shape, [8, 4]);
         assert_eq!(model.layers[0].down_proj.shape, [4, 8]);
+        assert_eq!(model.embed_token(2).unwrap(), [0.0, 0.0, 1.0, 0.0]);
 
         let backend = qarnyx_cpu::CpuBackend::new(1).expect("CPU backend");
         let output = model
