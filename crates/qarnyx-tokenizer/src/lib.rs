@@ -277,5 +277,6 @@ mod tests {
         assert_eq!(tokenizer.vocab_size(), 2);
         assert_eq!(tokenizer.bos_token_id, Some(1));
         assert_eq!(tokenizer.decode(&[1]).unwrap(), "hello");
+        assert_eq!(tokenizer.encode("hello").unwrap(), [1]);
     }
 }
