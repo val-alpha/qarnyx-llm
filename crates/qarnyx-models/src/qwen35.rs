@@ -4,6 +4,8 @@
 use qarnyx_core::{Backend, DType, TensorView};
 use qarnyx_gguf::{GgufFile, MetadataValue, TensorInfo};
 use qarnyx_quant::{dequantize, GgmlType};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use crate::{ModelError, TensorLoadError};
 
 const H: usize = 2048;
@@ -19,6 +21,41 @@ const Q: usize = FH * FHD;
 const ROPE: usize = 64;
 const VOCAB: usize = 248_320;
 const CONV: usize = 4;
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen35Profile {
+    entries: BTreeMap<&'static str, ProfileEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProfileEntry {
+    calls: u64,
+    nanos: u128,
+}
+
+impl Qwen35Profile {
+    fn record(&mut self, label: &'static str, elapsed: Duration) {
+        let entry = self.entries.entry(label).or_default();
+        entry.calls += 1;
+        entry.nanos += elapsed.as_nanos();
+    }
+
+    pub fn report(&self) -> String {
+        let mut rows: Vec<_> = self.entries.iter().collect();
+        rows.sort_by_key(|(_, e)| std::cmp::Reverse(e.nanos));
+        let mut out = String::from("Qwen3.5 profile (aggregate):\n");
+        out.push_str("  label                         calls      total_ms      avg_us\n");
+        for (label, entry) in rows {
+            let total_ms = entry.nanos as f64 / 1_000_000.0;
+            let avg_us = entry.nanos as f64 / entry.calls as f64 / 1_000.0;
+            out.push_str(&format!(
+                "  {:<28} {:>5} {:>13.3} {:>12.3}\n",
+                label, entry.calls, total_ms, avg_us
+            ));
+        }
+        out
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen35Config {
@@ -171,17 +208,63 @@ impl<'a> Qwen35Model<'a> {
         Ok(logits)
     }
 
+    pub fn forward_logits_profiled<B: Backend>(
+        &self,
+        b: &B,
+        id: usize,
+        pos: usize,
+        cache: &mut Qwen35Cache,
+        profile: &mut Qwen35Profile,
+    ) -> Result<Vec<f32>, ModelError> {
+        let x = self.embed_token(id)?;
+        let h = self.forward_with_cache_profiled(b, &x, pos, cache, profile)?;
+        let n = rms0(&h, &self.output_norm, self.config.rms_epsilon)?;
+        let mut logits = vec![0.0; self.vocab_size()];
+        let start = Instant::now();
+        b.matvec(self.output, &n, &mut logits)?;
+        profile.record("output_logits_matvec", start.elapsed());
+        Ok(logits)
+    }
+
     pub fn forward_with_cache<B: Backend>(&self, b: &B, input: &[f32], pos: usize, cache: &mut Qwen35Cache)
         -> Result<Vec<f32>, ModelError> {
+        let mut profile = None;
+        self.forward_with_cache_internal(b, input, pos, cache, &mut profile)
+    }
+
+    pub fn forward_with_cache_profiled<B: Backend>(
+        &self,
+        b: &B,
+        input: &[f32],
+        pos: usize,
+        cache: &mut Qwen35Cache,
+        profile: &mut Qwen35Profile,
+    ) -> Result<Vec<f32>, ModelError> {
+        let mut profile = Some(profile);
+        self.forward_with_cache_internal(b, input, pos, cache, &mut profile)
+    }
+
+    fn forward_with_cache_internal<B: Backend>(
+        &self,
+        b: &B,
+        input: &[f32],
+        pos: usize,
+        cache: &mut Qwen35Cache,
+        profile: &mut Option<&mut Qwen35Profile>,
+    ) -> Result<Vec<f32>, ModelError> {
         if pos != cache.sequence_len || input.len() != H {
             return Err(ModelError::InvalidConfig("Qwen3.5 cache position/input shape mismatch"));
         }
         let mut h = input.to_vec();
         for (i, layer) in self.layers.iter().enumerate() {
+            let start = Instant::now();
             h = match layer {
-                Qwen35Layer::Linear(w) => linear(b, &self.config, w, &h, &mut cache.recurrent[i], &mut cache.conv[i])?,
-                Qwen35Layer::Attention(w) => attention(b, &self.config, w, &h, pos, &mut cache.keys[i], &mut cache.values[i])?,
+                Qwen35Layer::Linear(w) => linear(b, &self.config, w, &h, &mut cache.recurrent[i], &mut cache.conv[i], profile)?,
+                Qwen35Layer::Attention(w) => attention(b, &self.config, w, &h, pos, &mut cache.keys[i], &mut cache.values[i], profile)?,
             };
+            if let Some(p) = profile.as_deref_mut() {
+                p.record(if matches!(layer, Qwen35Layer::Linear(_)) { "layer_linear_total" } else { "layer_attention_total" }, start.elapsed());
+            }
         }
         cache.sequence_len += 1;
         Ok(h)
@@ -189,17 +272,18 @@ impl<'a> Qwen35Model<'a> {
 }
 
 fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f32],
-    state: &mut [f32], conv_state: &mut [f32]) -> Result<Vec<f32>, ModelError> {
+    state: &mut [f32], conv_state: &mut [f32], profile: &mut Option<&mut Qwen35Profile>) -> Result<Vec<f32>, ModelError> {
     let x = rms0(input, w.attn_norm, c.rms_epsilon)?;
     let mut qkv = vec![0.0; LIN*3];
     let mut z = vec![0.0; LIN];
     let mut beta = vec![0.0; LH];
     let mut alpha = vec![0.0; LH];
-    b.matvec(w.qkv, &x, &mut qkv)?;
-    b.matvec(w.gate, &x, &mut z)?;
-    b.matvec(w.beta, &x, &mut beta)?;
-    b.matvec(w.alpha, &x, &mut alpha)?;
+    timed_matvec(b, w.qkv, &x, &mut qkv, profile, "linear_qkv_matvec")?;
+    timed_matvec(b, w.gate, &x, &mut z, profile, "linear_gate_matvec")?;
+    timed_matvec(b, w.beta, &x, &mut beta, profile, "linear_beta_matvec")?;
+    timed_matvec(b, w.alpha, &x, &mut alpha, profile, "linear_alpha_matvec")?;
 
+    let conv_start = Instant::now();
     let mut conv = vec![0.0; LIN*3];
     // GGUF layout is q(2048), k(2048), v(2048) for the 16x128 linear heads.
     let mut kernel = vec![0.0; CONV];
@@ -214,6 +298,8 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
         conv_state[base+1] = conv_state[base+2];
         conv_state[base+2] = current;
     }
+
+    if let Some(p) = profile.as_deref_mut() { p.record("linear_conv_and_state", conv_start.elapsed()); }
 
     let mut q = vec![0.0; LIN];
     let mut k = vec![0.0; LIN];
@@ -246,15 +332,19 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
         let rms=(sl.iter().map(|x| f64::from(*x)*f64::from(*x)).sum::<f64>()/LD as f64+f64::from(c.rms_epsilon)).sqrt().recip() as f32;
         for j in 0..LD { sl[j] *= rms*w.ssm_norm[j]*silu(z[h*LD+j]); }
     }
-    let mut y=vec![0.0;H]; b.matvec(w.out,&core,&mut y)?; add(&mut y,input);
-    ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y)
+    let mut y=vec![0.0;H];
+    timed_matvec(b, w.out, &core, &mut y, profile, "linear_out_matvec")?;
+    add(&mut y,input);
+    ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y, profile)
 }
 
 fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32],pos:usize,
-    keys:&mut Vec<f32>,values:&mut Vec<f32>) -> Result<Vec<f32>,ModelError> {
+    keys:&mut Vec<f32>,values:&mut Vec<f32>, profile:&mut Option<&mut Qwen35Profile>) -> Result<Vec<f32>,ModelError> {
     let x=rms0(input,w.attn_norm,c.rms_epsilon)?;
     let mut qg=vec![0.0;Q*2]; let mut k=vec![0.0;KV]; let mut v=vec![0.0;KV];
-    b.matvec(w.q,&x,&mut qg)?; b.matvec(w.k,&x,&mut k)?; b.matvec(w.v,&x,&mut v)?;
+    timed_matvec(b, w.q, &x, &mut qg, profile, "attention_q_matvec")?;
+    timed_matvec(b, w.k, &x, &mut k, profile, "attention_k_matvec")?;
+    timed_matvec(b, w.v, &x, &mut v, profile, "attention_v_matvec")?;
     // GGUF q_proj stores each attention head as [query | gate], not
     // [all queries | all gates]. Deinterleave before applying q_norm/RoPE.
     let mut q = vec![0.0; Q];
@@ -271,6 +361,7 @@ fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32
         headnorm(&mut k[h*FHD..(h+1)*FHD], w.k_norm, c.rms_epsilon);
         rope(&mut k[h*FHD..h*FHD+ROPE], c.rope_theta, pos);
     }
+    let attn_start = Instant::now();
     keys.extend_from_slice(&k); values.extend_from_slice(&v);
     let seq=keys.len()/KV; let mut a=vec![0.0;Q];
     for qh in 0..FH {
@@ -280,11 +371,14 @@ fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32
         for t in 0..seq { let vb=t*KV+kh*FHD; for j in 0..FHD { a[qb+j]+=s[t]*values[vb+j]; } }
     }
     for i in 0..Q { a[i] *= sigmoid(gate[i]); }
-    let mut y=vec![0.0;H]; b.matvec(w.out,&a,&mut y)?; add(&mut y,input);
-    ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y)
+    if let Some(p) = profile.as_deref_mut() { p.record("attention_core_softmax", attn_start.elapsed()); }
+    let mut y=vec![0.0;H];
+    timed_matvec(b, w.out, &a, &mut y, profile, "attention_out_matvec")?;
+    add(&mut y,input);
+    ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y, profile)
 }
 
-fn ffn<B:Backend>(b:&B,c:&Qwen35Config,norm:&[f32],gate:TensorView<'_>,up:TensorView<'_>,down:TensorView<'_>,input:&[f32])->Result<Vec<f32>,ModelError>{
+fn ffn<B:Backend>(b:&B,c:&Qwen35Config,norm:&[f32],gate:TensorView<'_>,up:TensorView<'_>,down:TensorView<'_>,input:&[f32], profile:&mut Option<&mut Qwen35Profile>)->Result<Vec<f32>,ModelError>{
     let x=rms0(input,norm,c.rms_epsilon)?; let mut g=vec![0.0;FF]; let mut u=vec![0.0;FF];
     b.matvec(gate,&x,&mut g)?; b.matvec(up,&x,&mut u)?; for i in 0..FF { g[i]=silu(g[i])*u[i]; }
     let mut y=vec![0.0;H]; b.matvec(down,&g,&mut y)?; add(&mut y,input); Ok(y)
