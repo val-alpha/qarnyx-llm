@@ -1,10 +1,10 @@
-//! Scalar CPU execution backend.
+//! Runtime-dispatched CPU execution backend.
 //!
 //! Matrix kernels decode one weight row at a time into a reusable scratch
-//! buffer. This supports quantized GGUF weights without expanding a complete
-//! matrix or model into F32 memory. SIMD dispatch and worker scheduling are
-//! intentionally deferred until these scalar paths are established as the
-//! correctness reference.
+//! buffer. On x86_64, AVX2/FMA accelerates the resulting F32 dot products and
+//! row-major matmul output tiles. Scalar kernels remain available as the
+//! correctness reference and portable fallback. Worker scheduling is separate
+//! and is not yet implemented.
 
 use qarnyx_core::{Backend, BackendError, DType, TensorView};
 use qarnyx_quant::{dequantize_into, encoded_len};
@@ -67,11 +67,21 @@ impl CpuFeatures {
 pub struct CpuBackend {
     worker_count: usize,
     features: CpuFeatures,
+    simd_enabled: bool,
 }
 
 impl CpuBackend {
-    /// Creates a CPU backend configuration with a fixed worker count.
+    /// Creates a CPU backend that automatically dispatches supported SIMD kernels.
     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_simd(worker_count, true)
+    }
+
+    /// Creates a scalar-only backend for reference testing and benchmarks.
+    pub fn new_scalar(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_simd(worker_count, false)
+    }
+
+    fn with_simd(worker_count: usize, simd_enabled: bool) -> Result<Self, CpuBackendError> {
         if worker_count == 0 {
             return Err(CpuBackendError::ZeroWorkers);
         }
@@ -79,10 +89,14 @@ impl CpuBackend {
         Ok(Self {
             worker_count,
             features: CpuFeatures::detect(),
+            simd_enabled,
         })
     }
 
-    /// Returns the configured number of workers.
+    /// Returns the configured worker count.
+    ///
+    /// Worker scheduling is not active yet; this value is retained for the
+    /// worker-pool milestone and does not currently create threads.
     pub const fn worker_count(&self) -> usize {
         self.worker_count
     }
@@ -90,6 +104,208 @@ impl CpuBackend {
     /// Returns detected CPU features.
     pub const fn features(&self) -> CpuFeatures {
         self.features
+    }
+
+    /// Returns whether runtime SIMD dispatch was requested and AVX2 is usable.
+    pub const fn uses_avx2(&self) -> bool {
+        self.simd_enabled && self.features.avx2
+    }
+
+    fn dot_product(&self, lhs: &[f32], rhs: &[f32]) -> f32 {
+        if self.simd_enabled && self.features.avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                if self.features.fma {
+                    return dot_avx2_fma(lhs, rhs);
+                }
+                return dot_avx2(lhs, rhs);
+            }
+        }
+        dot_scalar(lhs, rhs)
+    }
+
+    fn matmul_row(&self, row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
+        if self.simd_enabled && self.features.avx2 && columns >= 8 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                if self.features.fma {
+                    matmul_row_avx2_fma(row, input, output, columns);
+                } else {
+                    matmul_row_avx2(row, input, output, columns);
+                }
+                return;
+            }
+        }
+        matmul_row_scalar(row, input, output, columns);
+    }
+}
+
+fn dot_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .zip(rhs)
+        .map(|(weight, value)| weight * value)
+        .sum()
+}
+
+fn matmul_row_scalar(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
+    for column in 0..columns {
+        let mut sum = 0.0_f32;
+        for inner in 0..row.len() {
+            sum += row[inner] * input[inner * columns + column];
+        }
+        output[column] = sum;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(lhs: &[f32], rhs: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let zero = _mm256_setzero_ps();
+        let (mut acc0, mut acc1, mut acc2, mut acc3) = (zero, zero, zero, zero);
+        let mut index = 0;
+        while index + 32 <= lhs.len() {
+            let a0 = _mm256_loadu_ps(lhs.as_ptr().add(index));
+            let b0 = _mm256_loadu_ps(rhs.as_ptr().add(index));
+            let a1 = _mm256_loadu_ps(lhs.as_ptr().add(index + 8));
+            let b1 = _mm256_loadu_ps(rhs.as_ptr().add(index + 8));
+            let a2 = _mm256_loadu_ps(lhs.as_ptr().add(index + 16));
+            let b2 = _mm256_loadu_ps(rhs.as_ptr().add(index + 16));
+            let a3 = _mm256_loadu_ps(lhs.as_ptr().add(index + 24));
+            let b3 = _mm256_loadu_ps(rhs.as_ptr().add(index + 24));
+            acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(a0, b0));
+            acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(a1, b1));
+            acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(a2, b2));
+            acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(a3, b3));
+            index += 32;
+        }
+        while index + 8 <= lhs.len() {
+            let a = _mm256_loadu_ps(lhs.as_ptr().add(index));
+            let b = _mm256_loadu_ps(rhs.as_ptr().add(index));
+            acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(a, b));
+            index += 8;
+        }
+
+        let sum01 = _mm256_add_ps(acc0, acc1);
+        let sum23 = _mm256_add_ps(acc2, acc3);
+        let sum = _mm256_add_ps(sum01, sum23);
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+        let mut total = lanes.iter().sum::<f32>();
+        while index < lhs.len() {
+            total += lhs[index] * rhs[index];
+            index += 1;
+        }
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2_fma(lhs: &[f32], rhs: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let zero = _mm256_setzero_ps();
+        let (mut acc0, mut acc1, mut acc2, mut acc3) = (zero, zero, zero, zero);
+        let mut index = 0;
+        while index + 32 <= lhs.len() {
+            let a0 = _mm256_loadu_ps(lhs.as_ptr().add(index));
+            let b0 = _mm256_loadu_ps(rhs.as_ptr().add(index));
+            let a1 = _mm256_loadu_ps(lhs.as_ptr().add(index + 8));
+            let b1 = _mm256_loadu_ps(rhs.as_ptr().add(index + 8));
+            let a2 = _mm256_loadu_ps(lhs.as_ptr().add(index + 16));
+            let b2 = _mm256_loadu_ps(rhs.as_ptr().add(index + 16));
+            let a3 = _mm256_loadu_ps(lhs.as_ptr().add(index + 24));
+            let b3 = _mm256_loadu_ps(rhs.as_ptr().add(index + 24));
+            acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+            acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+            acc2 = _mm256_fmadd_ps(a2, b2, acc2);
+            acc3 = _mm256_fmadd_ps(a3, b3, acc3);
+            index += 32;
+        }
+        while index + 8 <= lhs.len() {
+            let a = _mm256_loadu_ps(lhs.as_ptr().add(index));
+            let b = _mm256_loadu_ps(rhs.as_ptr().add(index));
+            acc0 = _mm256_fmadd_ps(a, b, acc0);
+            index += 8;
+        }
+
+        let sum01 = _mm256_add_ps(acc0, acc1);
+        let sum23 = _mm256_add_ps(acc2, acc3);
+        let sum = _mm256_add_ps(sum01, sum23);
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+        let mut total = lanes.iter().sum::<f32>();
+        while index < lhs.len() {
+            total += lhs[index] * rhs[index];
+            index += 1;
+        }
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn matmul_row_avx2(
+    row: &[f32],
+    input: &[f32],
+    output: &mut [f32],
+    columns: usize,
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let vector_columns = columns & !7;
+        for column in (0..vector_columns).step_by(8) {
+            let mut acc = _mm256_setzero_ps();
+            for (inner, weight) in row.iter().enumerate() {
+                let values = _mm256_loadu_ps(input.as_ptr().add(inner * columns + column));
+                let scale = _mm256_set1_ps(*weight);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(scale, values));
+            }
+            _mm256_storeu_ps(output.as_mut_ptr().add(column), acc);
+        }
+        for column in vector_columns..columns {
+            let mut sum = 0.0_f32;
+            for inner in 0..row.len() {
+                sum += row[inner] * input[inner * columns + column];
+            }
+            output[column] = sum;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matmul_row_avx2_fma(
+    row: &[f32],
+    input: &[f32],
+    output: &mut [f32],
+    columns: usize,
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let vector_columns = columns & !7;
+        for column in (0..vector_columns).step_by(8) {
+            let mut acc = _mm256_setzero_ps();
+            for (inner, weight) in row.iter().enumerate() {
+                let values = _mm256_loadu_ps(input.as_ptr().add(inner * columns + column));
+                let scale = _mm256_set1_ps(*weight);
+                acc = _mm256_fmadd_ps(scale, values, acc);
+            }
+            _mm256_storeu_ps(output.as_mut_ptr().add(column), acc);
+        }
+        for column in vector_columns..columns {
+            let mut sum = 0.0_f32;
+            for inner in 0..row.len() {
+                sum += row[inner] * input[inner * columns + column];
+            }
+            output[column] = sum;
+        }
     }
 }
 
@@ -259,11 +475,7 @@ impl Backend for CpuBackend {
             decode_weight_row(
                 "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
             )?;
-            *output_value = row
-                .iter()
-                .zip(input)
-                .map(|(weight, value)| weight * value)
-                .sum();
+            *output_value = self.dot_product(&row, input);
         }
 
         Ok(())
@@ -318,13 +530,13 @@ impl Backend for CpuBackend {
                 "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
             )?;
 
-            for column in 0..n {
-                let mut sum = 0.0_f32;
-                for inner in 0..k {
-                    sum += row[inner] * input[inner * n + column];
-                }
-                output[row_index * n + column] = sum;
-            }
+            let output_start = row_index * n;
+            self.matmul_row(
+                &row,
+                input,
+                &mut output[output_start..output_start + n],
+                n,
+            );
         }
 
         Ok(())
