@@ -36,8 +36,9 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Status) | None => {
-            println!("Qarnyx 0.1.0 - GGUF v3 reader implemented");
-            println!("Quantized tensor decoding and model inference are not implemented yet.");
+            println!("Qarnyx 0.1.0 - GGUF v3 reader and M2 quantization reference implemented");
+            println!("Scalar F32/F16, Q4_0/Q8_0, Q4_K/Q5_K/Q6_K decoding is available.");
+            println!("Transformer inference and text generation are not implemented yet.");
         }
         Some(Command::Inspect {
             model,
@@ -72,17 +73,18 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
         println!("Tensor directory:");
         for tensor in &gguf.tensors {
             println!(
-                "  {:<36} shape={:?} ggml_type={} offset={} file_offset={}",
-                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.offset, tensor.file_offset
+                "  {:<36} shape={:?} ggml_type={} bytes={} offset={} file_offset={}",
+                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.byte_len, tensor.offset, tensor.file_offset
             );
         }
     } else if !gguf.tensors.is_empty() {
         println!();
         println!(
-            "First tensor:        {} {:?} (ggml_type {}, file offset {})",
+            "First tensor:        {} {:?} (ggml_type {}, {} bytes, file offset {})",
             gguf.tensors[0].name,
             gguf.tensors[0].dimensions,
             gguf.tensors[0].ggml_type,
+            gguf.tensors[0].byte_len,
             gguf.tensors[0].file_offset
         );
         println!("Use --list-tensors to print all tensor descriptors.");
