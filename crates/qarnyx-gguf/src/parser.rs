@@ -1,9 +1,9 @@
 //! Defensive, streaming reader for the GGUF v3 container format.
 //!
-//! The parser reads the header, metadata, and tensor directory. It deliberately
-//! does not read tensor payloads or infer their encoded byte lengths; those
-//! checks belong with the quantization block registry.
+//! The parser reads the header, metadata, tensor directory, and validates each
+//! tensor's complete encoded byte range without reading payload bytes.
 
+use qarnyx_quant::{encoded_len, QuantError};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -89,7 +89,21 @@ pub enum GgufError {
     TensorDataOutOfBounds {
         tensor: String,
         absolute_offset: u64,
+        byte_len: u64,
         file_size: u64,
+    },
+    UnsupportedGgmlType {
+        tensor: String,
+        ggml_type: u32,
+    },
+    InvalidTensorEncoding {
+        tensor: String,
+        ggml_type: u32,
+        reason: String,
+    },
+    OverlappingTensorRanges {
+        first: String,
+        second: String,
     },
     NonZeroPadding {
         offset: u64,
@@ -196,10 +210,23 @@ impl fmt::Display for GgufError {
             Self::TensorDataOutOfBounds {
                 tensor,
                 absolute_offset,
+                byte_len,
                 file_size,
             } => write!(
                 f,
-                "tensor {tensor} begins at byte {absolute_offset}, outside file size {file_size}"
+                "tensor {tensor} payload at byte {absolute_offset} with length {byte_len} exceeds file size {file_size}"
+            ),
+            Self::UnsupportedGgmlType { tensor, ggml_type } => write!(
+                f,
+                "tensor {tensor} uses unsupported GGML type ID {ggml_type}"
+            ),
+            Self::InvalidTensorEncoding { tensor, ggml_type, reason } => write!(
+                f,
+                "tensor {tensor} has an invalid GGML type {ggml_type} shape: {reason}"
+            ),
+            Self::OverlappingTensorRanges { first, second } => write!(
+                f,
+                "tensor payload ranges overlap: {first} and {second}"
             ),
             Self::NonZeroPadding { offset } => {
                 write!(
@@ -319,8 +346,10 @@ pub struct MetadataEntry {
 pub struct TensorInfo {
     pub name: String,
     pub dimensions: Vec<u64>,
-    /// Raw ggml_type numeric identifier. Decoding is handled by qarnyx-quant.
+    /// Raw ggml_type numeric identifier.
     pub ggml_type: u32,
+    /// Exact encoded payload length, validated against the tensor shape and type.
+    pub byte_len: u64,
     /// Offset relative to the start of the tensor data section.
     pub offset: u64,
     /// Absolute byte offset in the GGUF file.
@@ -510,6 +539,7 @@ impl GgufFile {
                 name,
                 dimensions,
                 ggml_type,
+                byte_len: 0,
                 offset,
                 file_offset: 0,
             });
@@ -534,24 +564,62 @@ impl GgufFile {
         tensor_offsets
             .try_reserve(tensor_capacity)
             .map_err(|_| GgufError::AllocationFailed("tensor offset index"))?;
+        let mut tensor_ranges = Vec::new();
+        tensor_ranges
+            .try_reserve_exact(tensor_capacity)
+            .map_err(|_| GgufError::AllocationFailed("tensor range index"))?;
 
         for tensor in &mut tensors {
             if !tensor_offsets.insert(tensor.offset) {
                 return Err(GgufError::DuplicateTensorOffset(tensor.offset));
             }
 
+            let byte_len = encoded_len(tensor.ggml_type, &tensor.dimensions).map_err(|error| {
+                match error {
+                    QuantError::UnsupportedType(ggml_type) => GgufError::UnsupportedGgmlType {
+                        tensor: tensor.name.clone(),
+                        ggml_type,
+                    },
+                    other => GgufError::InvalidTensorEncoding {
+                        tensor: tensor.name.clone(),
+                        ggml_type: tensor.ggml_type,
+                        reason: other.to_string(),
+                    },
+                }
+            })?;
             let relative_offset = tensor.offset;
+            let relative_end = relative_offset
+                .checked_add(byte_len)
+                .ok_or(GgufError::Overflow("relative tensor payload end"))?;
             let absolute_offset = tensor_data_offset
                 .checked_add(relative_offset)
                 .ok_or(GgufError::Overflow("absolute tensor offset"))?;
-            if relative_offset >= data_bytes {
+            let absolute_end = tensor_data_offset
+                .checked_add(relative_end)
+                .ok_or(GgufError::Overflow("absolute tensor payload end"))?;
+
+            if relative_offset >= data_bytes || absolute_end > file_size {
                 return Err(GgufError::TensorDataOutOfBounds {
                     tensor: tensor.name.clone(),
                     absolute_offset,
+                    byte_len,
                     file_size,
                 });
             }
+
+            tensor.byte_len = byte_len;
             tensor.file_offset = absolute_offset;
+            tensor_ranges.push((absolute_offset, absolute_end, tensor.name.clone()));
+        }
+
+        tensor_ranges.sort_unstable_by_key(|range| range.0);
+        for pair in tensor_ranges.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(GgufError::OverlappingTensorRanges {
+                    first: pair[0].2.clone(),
+                    second: pair[1].2.clone(),
+                });
+            }
         }
 
         Ok(Self {
@@ -952,6 +1020,7 @@ mod tests {
         assert_eq!(parsed.tensors[0].ggml_type, 0);
         assert_eq!(parsed.tensors[0].offset, 0);
         assert_eq!(parsed.tensors[0].file_offset, parsed.tensor_data_offset);
+        assert_eq!(parsed.tensors[0].byte_len, 128);
         assert_eq!(parsed.tensors[0].element_count(), Some(32));
     }
 
