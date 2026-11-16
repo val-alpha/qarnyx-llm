@@ -96,6 +96,9 @@ impl<'a> LlamaLayerStorage<'a> {
 pub struct LlamaModel<'a> {
     pub config: LlamaConfig,
     pub layers: Vec<LlamaLayerStorage<'a>>,
+    pub token_embedding: TensorView<'a>,
+    pub output_norm: Vec<f32>,
+    pub output: TensorView<'a>,
 }
 
 impl<'a> LlamaModel<'a> {
@@ -112,7 +115,77 @@ impl<'a> LlamaModel<'a> {
             layers.push(load_layer(gguf, data, &config, block)?);
         }
 
-        Ok(Self { config, layers })
+        let token_embedding = load_weight(
+            gguf,
+            data,
+            "token_embd.weight",
+            &[token_count(gguf)?, config.embedding_length],
+        )?;
+        let output_norm = load_f32_tensor(
+            gguf,
+            data,
+            "output_norm.weight",
+            &[config.embedding_length],
+        )?;
+        let output = load_weight(
+            gguf,
+            data,
+            "output.weight",
+            &[token_count(gguf)?, config.embedding_length],
+        )?;
+
+        Ok(Self {
+            config,
+            layers,
+            token_embedding,
+            output_norm,
+            output,
+        })
+    }
+
+    /// Returns the vocabulary size encoded by the output projection.
+    pub fn vocab_size(&self) -> usize {
+        self.output.shape[0]
+    }
+
+    /// Decode one token embedding row from the GGUF storage.
+    pub fn embed_token(&self, token_id: usize) -> Result<Vec<f32>, ModelError> {
+        if token_id >= self.vocab_size() {
+            return Err(ModelError::InvalidConfig("token ID is outside the model vocabulary"));
+        }
+        let row_bytes = self.token_embedding.data.len() / self.token_embedding.shape[0];
+        let start = token_id.checked_mul(row_bytes)
+            .ok_or(ModelError::InvalidConfig("token embedding row offset overflowed"))?;
+        let end = start.checked_add(row_bytes)
+            .ok_or(ModelError::InvalidConfig("token embedding row end overflowed"))?;
+        let row = self.token_embedding.data.get(start..end)
+            .ok_or(ModelError::InvalidConfig("token embedding row is outside tensor payload"))?;
+        let raw_type = ggml_type_from_dtype(self.token_embedding.dtype)
+            .ok_or(ModelError::InvalidConfig("unsupported token embedding dtype"))?;
+        qarnyx_quant::dequantize(raw_type, &[self.config.embedding_length as u64], row)
+            .map_err(|_| ModelError::InvalidConfig("failed to decode token embedding"))
+    }
+
+    /// Run the decoder stack and return vocabulary logits for one token.
+    pub fn forward_logits<B: qarnyx_core::Backend>(
+        &self,
+        backend: &B,
+        token_id: usize,
+        position: usize,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Vec<f32>, ModelError> {
+        let embedding = self.embed_token(token_id)?;
+        let hidden = self.forward_with_cache(backend, &embedding, position, cache)?;
+        let mut norm = vec![0.0_f32; self.config.embedding_length];
+        backend.rms_norm(
+            &hidden,
+            &self.output_norm,
+            &mut norm,
+            self.config.attention_layer_norm_rms_epsilon,
+        )?;
+        let mut logits = vec![0.0_f32; self.vocab_size()];
+        backend.matvec(self.output, &norm, &mut logits)?;
+        Ok(logits)
     }
 
     /// Run every decoder block for one token without retaining a KV cache.
@@ -280,6 +353,33 @@ fn load_f32_tensor(
             source,
         }
     })
+}
+
+fn token_count(gguf: &GgufFile) -> Result<usize, TensorLoadError> {
+    let tensor = find_tensor(gguf, "token_embd.weight")?;
+    if tensor.dimensions.len() != 2 {
+        return Err(TensorLoadError::expected_shape(
+            &tensor.name,
+            &tensor.dimensions,
+            &[0, 0],
+        ));
+    }
+    usize::try_from(tensor.dimensions[1]).map_err(|_| TensorLoadError::Config(
+        "token vocabulary size does not fit usize".into(),
+    ))
+}
+
+fn ggml_type_from_dtype(dtype: DType) -> Option<u32> {
+    match dtype {
+        DType::F32 => Some(GgmlType::F32 as u32),
+        DType::F16 => Some(GgmlType::F16 as u32),
+        DType::Q4_0 => Some(GgmlType::Q4_0 as u32),
+        DType::Q8_0 => Some(GgmlType::Q8_0 as u32),
+        DType::Q4K => Some(GgmlType::Q4_K as u32),
+        DType::Q5K => Some(GgmlType::Q5_K as u32),
+        DType::Q6K => Some(GgmlType::Q6_K as u32),
+        _ => None,
+    }
 }
 
 fn find_tensor<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a TensorInfo, TensorLoadError> {
