@@ -49,10 +49,30 @@ impl GgmlType {
 
     pub const fn info(self) -> GgmlTypeInfo {
         match self {
-            Self::F32 => GgmlTypeInfo { kind: self, name: "F32", block_size: 1, type_size: 4 },
-            Self::F16 => GgmlTypeInfo { kind: self, name: "F16", block_size: 1, type_size: 2 },
-            Self::Q4_0 => GgmlTypeInfo { kind: self, name: "Q4_0", block_size: 32, type_size: 18 },
-            Self::Q8_0 => GgmlTypeInfo { kind: self, name: "Q8_0", block_size: 32, type_size: 34 },
+            Self::F32 => GgmlTypeInfo {
+                kind: self,
+                name: "F32",
+                block_size: 1,
+                type_size: 4,
+            },
+            Self::F16 => GgmlTypeInfo {
+                kind: self,
+                name: "F16",
+                block_size: 1,
+                type_size: 2,
+            },
+            Self::Q4_0 => GgmlTypeInfo {
+                kind: self,
+                name: "Q4_0",
+                block_size: 32,
+                type_size: 18,
+            },
+            Self::Q8_0 => GgmlTypeInfo {
+                kind: self,
+                name: "Q8_0",
+                block_size: 32,
+                type_size: 34,
+            },
             Self::Q4_K => GgmlTypeInfo {
                 kind: self,
                 name: "Q4_K",
@@ -92,10 +112,9 @@ pub enum QuantError {
 impl fmt::Display for QuantError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedType(raw) => write!(
-                f,
-                "GGML tensor type {raw} is not supported by Qarnyx yet"
-            ),
+            Self::UnsupportedType(raw) => {
+                write!(f, "GGML tensor type {raw} is not supported by Qarnyx yet")
+            }
             Self::EmptyShape => write!(f, "tensor shape must contain at least one dimension"),
             Self::ZeroDimension => write!(f, "tensor shape contains a zero-sized dimension"),
             Self::RowDimensionNotBlockAligned {
@@ -151,7 +170,10 @@ pub fn dequantize_into(
 ) -> Result<(), QuantError> {
     let (info, element_count, byte_len) = shape_layout(ggml_type, dimensions)?;
     if encoded.len() as u64 != byte_len {
-        return Err(QuantError::InputLengthMismatch { expected: byte_len, actual: encoded.len() });
+        return Err(QuantError::InputLengthMismatch {
+            expected: byte_len,
+            actual: encoded.len(),
+        });
     }
     if output.len() as u64 != element_count {
         return Err(QuantError::OutputLengthMismatch {
@@ -183,7 +205,9 @@ pub fn dequantize(
     let (_, element_count, _) = shape_layout(ggml_type, dimensions)?;
     let capacity = usize::try_from(element_count).map_err(|_| QuantError::AllocationFailed)?;
     let mut output = Vec::new();
-    output.try_reserve_exact(capacity).map_err(|_| QuantError::AllocationFailed)?;
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| QuantError::AllocationFailed)?;
     output.resize(capacity, 0.0);
     dequantize_into(ggml_type, dimensions, encoded, &mut output)?;
     Ok(output)
@@ -203,16 +227,21 @@ fn shape_layout(
     }
     if row_elements % info.block_size != 0 {
         return Err(QuantError::RowDimensionNotBlockAligned {
-            ggml_type, row_elements, block_size: info.block_size,
+            ggml_type,
+            row_elements,
+            block_size: info.block_size,
         });
     }
 
     let element_count = dimensions.iter().try_fold(1_u64, |count, dimension| {
-        count.checked_mul(*dimension).ok_or(QuantError::ShapeOverflow)
+        count
+            .checked_mul(*dimension)
+            .ok_or(QuantError::ShapeOverflow)
     })?;
     let row_count = element_count / row_elements;
     let blocks_per_row = row_elements / info.block_size;
-    let byte_len = row_count.checked_mul(blocks_per_row)
+    let byte_len = row_count
+        .checked_mul(blocks_per_row)
         .and_then(|blocks| blocks.checked_mul(info.type_size))
         .ok_or(QuantError::ByteLengthOverflow)?;
     Ok((info, element_count, byte_len))
@@ -309,7 +338,11 @@ fn dequantize_q4_k(encoded: &[u8], output: &mut [f32]) {
                 let m = min_scale * f32::from(local_min);
                 for index in 0..32 {
                     let packed = quants[quant_offset + index];
-                    let quant = if half == 0 { packed & 0x0f } else { packed >> 4 };
+                    let quant = if half == 0 {
+                        packed & 0x0f
+                    } else {
+                        packed >> 4
+                    };
                     let output_index = base + pair * 64 + half * 32 + index;
                     output[output_index] = d * f32::from(quant) - m;
                 }
@@ -340,7 +373,11 @@ fn dequantize_q5_k(encoded: &[u8], output: &mut [f32]) {
                     let packed = low_bits[quant_offset + index];
                     let mask = if half == 0 { low_mask } else { high_mask };
                     let high = u8::from(high_bits[index] & mask != 0);
-                    let low = if half == 0 { packed & 0x0f } else { packed >> 4 };
+                    let low = if half == 0 {
+                        packed & 0x0f
+                    } else {
+                        packed >> 4
+                    };
                     let quant = low | (high << 4);
                     let output_index = base + pair * 64 + half * 32 + index;
                     output[output_index] = d * f32::from(quant) - m;
@@ -444,10 +481,7 @@ mod tests {
         let mut f32_bytes = Vec::new();
         f32_bytes.extend_from_slice(&1.0_f32.to_le_bytes());
         f32_bytes.extend_from_slice(&(-2.0_f32).to_le_bytes());
-        assert_eq!(
-            dequantize(0, &[2], &f32_bytes).unwrap(),
-            vec![1.0, -2.0]
-        );
+        assert_eq!(dequantize(0, &[2], &f32_bytes).unwrap(), vec![1.0, -2.0]);
 
         let f16_bytes = [0x00_u8, 0x3c, 0x00, 0xc0, 0x01, 0x00];
         let decoded = dequantize(1, &[3], &f16_bytes).unwrap();
@@ -543,9 +577,18 @@ mod tests {
 
     #[test]
     fn rejects_unknown_types_and_inexact_encoded_lengths() {
-        assert_eq!(encoded_len(999, &[1]), Err(QuantError::UnsupportedType(999)));
+        assert_eq!(
+            encoded_len(999, &[1]),
+            Err(QuantError::UnsupportedType(999))
+        );
 
         let err = dequantize(8, &[32], &[0_u8; 33]).unwrap_err();
-        assert_eq!(err, QuantError::InputLengthMismatch { expected: 34, actual: 33 });
+        assert_eq!(
+            err,
+            QuantError::InputLengthMismatch {
+                expected: 34,
+                actual: 33
+            }
+        );
     }
 }
