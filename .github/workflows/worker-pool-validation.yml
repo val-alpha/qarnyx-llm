@@ -1,0 +1,25 @@
+name: Worker pool validation
+
+on:
+  push:
+    branches: [perf/persistent-worker-pool]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Compile and test workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Run tests
+        run: cargo test --workspace
