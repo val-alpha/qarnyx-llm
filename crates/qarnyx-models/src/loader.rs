@@ -3,7 +3,7 @@ use qarnyx_gguf::{GgufFile, TensorInfo};
 use qarnyx_quant::{dequantize, GgmlType};
 use thiserror::Error;
 
-use crate::{forward_block, forward_block_with_cache, LlamaConfig, LlamaKvCache, LlamaLayerWeights, ModelError};
+use crate::{forward_block_with_cache, LlamaConfig, LlamaKvCache, LlamaLayerWeights, ModelError};
 
 /// Errors raised while mapping a parsed GGUF tensor directory onto a
 /// LLaMA-style model.
@@ -166,8 +166,7 @@ impl<'a> LlamaModel<'a> {
             .ok_or(ModelError::InvalidConfig("token embedding row end overflowed"))?;
         let row = self.token_embedding.data.get(start..end)
             .ok_or(ModelError::InvalidConfig("token embedding row is outside tensor payload"))?;
-        let raw_type = ggml_type_from_dtype(self.token_embedding.dtype)
-            .ok_or(ModelError::InvalidConfig("unsupported token embedding dtype"))?;
+        let raw_type = ggml_type_from_dtype(self.token_embedding.dtype);
         qarnyx_quant::dequantize(raw_type, &[self.config.embedding_length as u64], row)
             .map_err(|_| ModelError::InvalidConfig("failed to decode token embedding"))
     }
@@ -375,16 +374,15 @@ fn token_count(gguf: &GgufFile) -> Result<usize, TensorLoadError> {
     ))
 }
 
-fn ggml_type_from_dtype(dtype: DType) -> Option<u32> {
+fn ggml_type_from_dtype(dtype: DType) -> u32 {
     match dtype {
-        DType::F32 => Some(GgmlType::F32 as u32),
-        DType::F16 => Some(GgmlType::F16 as u32),
-        DType::Q4_0 => Some(GgmlType::Q4_0 as u32),
-        DType::Q8_0 => Some(GgmlType::Q8_0 as u32),
-        DType::Q4K => Some(GgmlType::Q4_K as u32),
-        DType::Q5K => Some(GgmlType::Q5_K as u32),
-        DType::Q6K => Some(GgmlType::Q6_K as u32),
-        _ => None,
+        DType::F32 => GgmlType::F32 as u32,
+        DType::F16 => GgmlType::F16 as u32,
+        DType::Q4_0 => GgmlType::Q4_0 as u32,
+        DType::Q8_0 => GgmlType::Q8_0 as u32,
+        DType::Q4K => GgmlType::Q4_K as u32,
+        DType::Q5K => GgmlType::Q5_K as u32,
+        DType::Q6K => GgmlType::Q6_K as u32,
     }
 }
 
