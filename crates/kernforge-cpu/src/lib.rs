@@ -154,7 +154,10 @@ mod tests {
 
     #[test]
     fn rejects_zero_workers() {
-        assert_eq!(CpuBackend::new(0).unwrap_err(), CpuBackendError::ZeroWorkers);
+        assert_eq!(
+            CpuBackend::new(0).unwrap_err(),
+            CpuBackendError::ZeroWorkers
+        );
     }
 
     #[test]
