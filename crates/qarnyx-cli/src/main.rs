@@ -54,7 +54,7 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
-        /// CPU kernel implementation: automatic (fused Q4_K), SIMD with dequantization, or scalar reference.
+        /// CPU kernel implementation: automatic SIMD, experimental fused Q4_K, or scalar reference.
         #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.
@@ -66,7 +66,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CpuKernelMode {
     Auto,
-    SimdDequant,
+    FusedQ4k,
     Scalar,
 }
 
@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status) | None => {
             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
             println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
-            println!("Use --cpu-kernel auto|simd-dequant|scalar to select CPU kernels.");
+            println!("Use --cpu-kernel auto|fused-q4k|scalar to select CPU kernels.");
         }
         Some(Command::Inspect {
             model,
@@ -171,7 +171,7 @@ fn generate_model(
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
     let backend = match cpu_kernel {
         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
-        CpuKernelMode::SimdDequant => qarnyx_cpu::CpuBackend::new_simd_dequant(workers)?,
+        CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
     };
     let config = GenerationConfig {
