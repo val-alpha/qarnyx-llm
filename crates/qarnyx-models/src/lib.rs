@@ -644,7 +644,8 @@ mod tests {
 
         assert_eq!(first, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(second, [4.0, 3.0, 2.0, 1.0]);
-        assert_eq!(cache.sequence_len(), 1);
+        cache.advance();
+        assert_eq!(cache.sequence_len(), 2);
         assert_eq!(cache.keys[0].len(), 2 * config.attention_key_length);
         assert_eq!(cache.values[0].len(), 2 * config.attention_value_length);
     }
