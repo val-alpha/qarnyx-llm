@@ -1,13 +1,9 @@
 [package]
-name = "kernforge-cpu"
+name = "qarnyx-quant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-
-[dependencies]
-kernforge-core = { path = "../kernforge-core" }
-thiserror.workspace = true
 
 [lints]
 workspace = true

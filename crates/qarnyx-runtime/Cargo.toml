@@ -1,5 +1,5 @@
 [package]
-name = "kernforge-gguf"
+name = "qarnyx-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,8 +1,8 @@
-# Kernforge Architecture
+# Qarnyx Architecture
 
 ## Project constraints
 
-Kernforge is a CPU-first inference runtime written in Rust. The initial
+Qarnyx is a CPU-first inference runtime written in Rust. The initial
 implementation is intentionally narrow: one model family, a small set of
 well-tested GGUF tensor types, one CPU backend, and one inference session.
 
@@ -18,14 +18,14 @@ assuming that a VPS allocation represents dedicated physical cores.
 
 | Crate | Responsibility | Must not own |
 |---|---|---|
-| kernforge-core | Tensor views, data types, backend contracts, common errors | File parsing or model architecture |
-| kernforge-gguf | GGUF header, metadata, tensor directory, validated tensor views | Tensor math or generation |
-| kernforge-quant | Quantization layouts and scalar reference decoders | Scheduling or model loading |
-| kernforge-cpu | Scalar/SIMD kernels, CPU feature detection, persistent workers | Tokenization or GGUF parsing |
-| kernforge-tokenizer | Tokenizer metadata and token-to-text conversion | Tensor operations |
-| kernforge-models | Model configuration and transformer forward graph | Hardware-specific intrinsics |
-| kernforge-runtime | Model lifecycle, prefill/decode, KV cache, sampling | Low-level SIMD kernels |
-| kernforge-cli | User-facing command-line interface | Inference implementation |
+| qarnyx-core | Tensor views, data types, backend contracts, common errors | File parsing or model architecture |
+| qarnyx-gguf | GGUF header, metadata, tensor directory, validated tensor views | Tensor math or generation |
+| qarnyx-quant | Quantization layouts and scalar reference decoders | Scheduling or model loading |
+| qarnyx-cpu | Scalar/SIMD kernels, CPU feature detection, persistent workers | Tokenization or GGUF parsing |
+| qarnyx-tokenizer | Tokenizer metadata and token-to-text conversion | Tensor operations |
+| qarnyx-models | Model configuration and transformer forward graph | Hardware-specific intrinsics |
+| qarnyx-runtime | Model lifecycle, prefill/decode, KV cache, sampling | Low-level SIMD kernels |
+| qarnyx-cli | User-facing command-line interface | Inference implementation |
 
 Dependencies should point inward toward core contracts. Avoid cyclic crate
 dependencies and avoid putting model-specific logic in the GGUF parser.

@@ -1,17 +1,9 @@
 [package]
-name = "kernforge-cli"
+name = "qarnyx-gguf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-
-[[bin]]
-name = "kernforge"
-path = "src/main.rs"
-
-[dependencies]
-anyhow.workspace = true
-clap.workspace = true
 
 [lints]
 workspace = true

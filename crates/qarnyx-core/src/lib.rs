@@ -1,4 +1,4 @@
-//! Shared types and contracts for Kernforge inference components.
+//! Shared types and contracts for Qarnyx inference components.
 
 pub mod backend;
 pub mod dtype;

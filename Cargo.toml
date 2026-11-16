@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/kernforge-core",
-    "crates/kernforge-gguf",
-    "crates/kernforge-quant",
-    "crates/kernforge-cpu",
-    "crates/kernforge-tokenizer",
-    "crates/kernforge-models",
-    "crates/kernforge-runtime",
-    "crates/kernforge-cli",
+    "crates/qarnyx-core",
+    "crates/qarnyx-gguf",
+    "crates/qarnyx-quant",
+    "crates/qarnyx-cpu",
+    "crates/qarnyx-tokenizer",
+    "crates/qarnyx-models",
+    "crates/qarnyx-runtime",
+    "crates/qarnyx-cli",
 ]
 
 [workspace.package]

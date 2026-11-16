@@ -1,8 +1,8 @@
-# Kernforge
+# Qarnyx
 
-**Forge performance. Own every kernel.**
+**Quantized intelligence. Engineered in Rust.**
 
-Kernforge is an experimental, Rust-native, CPU-first inference runtime for
+Qarnyx is an experimental, Rust-native, CPU-first inference runtime for
 [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) language
 models. It is being designed from scratch around quantized CPU kernels,
 explicit memory ownership, and predictable resource usage.
@@ -26,21 +26,21 @@ explicit memory ownership, and predictable resource usage.
   references and validate model outputs against independent implementations.
 
 Rust does not automatically make a program leak-free or faster than C/C++.
-Kernforge will use safe Rust by default, isolate required unsafe code, and
+Qarnyx will use safe Rust by default, isolate required unsafe code, and
 measure performance on the same hardware as its benchmarks.
 
 ## Planned architecture
 
 | Crate | Responsibility |
 |---|---|
-| kernforge-core | Tensor views, data types, backend contracts, shared errors |
-| kernforge-gguf | GGUF header, metadata, tensor directory, file mapping |
-| kernforge-quant | Quantization block layouts and reference decoders |
-| kernforge-cpu | Scalar CPU kernels, SIMD dispatch, CPU execution |
-| kernforge-tokenizer | Tokenizer metadata and tokenization |
-| kernforge-models | Transformer model definitions, starting with LLaMA-style models |
-| kernforge-runtime | Prefill, decode, KV cache, sampling, generation |
-| kernforge-cli | Command-line interface |
+| qarnyx-core | Tensor views, data types, backend contracts, shared errors |
+| qarnyx-gguf | GGUF header, metadata, tensor directory, file mapping |
+| qarnyx-quant | Quantization block layouts and reference decoders |
+| qarnyx-cpu | Scalar CPU kernels, SIMD dispatch, CPU execution |
+| qarnyx-tokenizer | Tokenizer metadata and tokenization |
+| qarnyx-models | Transformer model definitions, starting with LLaMA-style models |
+| qarnyx-runtime | Prefill, decode, KV cache, sampling, generation |
+| qarnyx-cli | Command-line interface |
 
 See [docs/architecture.md](docs/architecture.md) for the architecture,
 backend contract, memory strategy, and implementation roadmap.

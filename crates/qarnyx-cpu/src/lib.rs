@@ -4,7 +4,7 @@
 //! must be selected through runtime feature detection and tested against the
 //! scalar implementation.
 
-use kernforge_core::{Backend, BackendError, TensorView};
+use qarnyx_core::{Backend, BackendError, TensorView};
 use thiserror::Error;
 
 /// Errors raised while constructing the CPU backend.

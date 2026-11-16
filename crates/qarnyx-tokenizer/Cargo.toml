@@ -1,5 +1,5 @@
 [package]
-name = "kernforge-models"
+name = "qarnyx-tokenizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

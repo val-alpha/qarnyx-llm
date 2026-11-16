@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 
-/// Kernforge command-line interface.
+/// Qarnyx command-line interface.
 #[derive(Debug, Parser)]
 #[command(
-    name = "kernforge",
+    name = "qarnyx",
     version,
     about = "Rust-native CPU-first GGUF inference runtime"
 )]
@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Status) | None => {
-            println!("Kernforge 0.1.0 - early development scaffold");
+            println!("Qarnyx 0.1.0 - early development scaffold");
             println!("GGUF parsing, tensor kernels, and inference are not implemented yet.");
         }
     }
