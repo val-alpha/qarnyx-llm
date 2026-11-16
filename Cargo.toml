@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kernforge-core",
+    "crates/kernforge-gguf",
+    "crates/kernforge-quant",
+    "crates/kernforge-cpu",
+    "crates/kernforge-tokenizer",
+    "crates/kernforge-models",
+    "crates/kernforge-runtime",
+    "crates/kernforge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
