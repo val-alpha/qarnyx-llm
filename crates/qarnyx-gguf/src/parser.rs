@@ -1148,9 +1148,9 @@ mod tests {
 
         let out_of_bounds = vec![TensorFixture {
             name: "outside",
-            dimensions: &[4],
+            dimensions: &[4, 8],
             ggml_type: 0,
-            offset: 128,
+            offset: 96,
         }];
         let bytes = fixture(base_metadata(), &out_of_bounds, 128);
         assert!(matches!(
@@ -1182,6 +1182,70 @@ mod tests {
         assert!(matches!(
             GgufFile::parse_with_options(&bytes, &options),
             Err(GgufError::LimitExceeded { kind: "tensor", .. })
+        ));
+    }
+
+
+    #[test]
+    fn validates_k_quant_payload_length() {
+        let tensors = vec![TensorFixture {
+            name: "q4_k",
+            dimensions: &[256],
+            ggml_type: 12,
+            offset: 0,
+        }];
+        let bytes = fixture(base_metadata(), &tensors, 144);
+        let parsed = GgufFile::parse(&bytes).expect("valid Q4_K payload");
+        assert_eq!(parsed.tensors[0].byte_len, 144);
+    }
+
+    #[test]
+    fn rejects_unsupported_and_row_misaligned_tensor_types() {
+        let unsupported = vec![TensorFixture {
+            name: "unknown",
+            dimensions: &[256],
+            ggml_type: 15,
+            offset: 0,
+        }];
+        let bytes = fixture(base_metadata(), &unsupported, 256);
+        assert!(matches!(
+            GgufFile::parse(&bytes),
+            Err(GgufError::UnsupportedGgmlType { ggml_type: 15, .. })
+        ));
+
+        let misaligned = vec![TensorFixture {
+            name: "misaligned_q4_k",
+            dimensions: &[128, 2],
+            ggml_type: 12,
+            offset: 0,
+        }];
+        let bytes = fixture(base_metadata(), &misaligned, 144);
+        assert!(matches!(
+            GgufFile::parse(&bytes),
+            Err(GgufError::InvalidTensorEncoding { ggml_type: 12, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_payload_ranges() {
+        let tensors = vec![
+            TensorFixture {
+                name: "first",
+                dimensions: &[4, 8],
+                ggml_type: 0,
+                offset: 0,
+            },
+            TensorFixture {
+                name: "second",
+                dimensions: &[4, 8],
+                ggml_type: 0,
+                offset: 96,
+            },
+        ];
+        let bytes = fixture(base_metadata(), &tensors, 224);
+        assert!(matches!(
+            GgufFile::parse(&bytes),
+            Err(GgufError::OverlappingTensorRanges { .. })
         ));
     }
 
