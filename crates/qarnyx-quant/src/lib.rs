@@ -204,6 +204,64 @@ pub fn dequantize_into(
     Ok(())
 }
 
+/// Compute a dot product directly from one-dimensional Q4_K encoded weights.
+///
+/// This avoids materializing an intermediate F32 row. The input length must
+/// be a non-zero multiple of the Q4_K block size (256), and the encoded byte
+/// slice must contain exactly the corresponding blocks.
+pub fn dot_q4_k(encoded: &[u8], input: &[f32]) -> Result<f32, QuantError> {
+    let input_len = u64::try_from(input.len()).map_err(|_| QuantError::ShapeOverflow)?;
+    let (_, _, expected_bytes) = shape_layout(GgmlType::Q4_K as u32, &[input_len])?;
+    if encoded.len() as u64 != expected_bytes {
+        return Err(QuantError::InputLengthMismatch {
+            expected: expected_bytes,
+            actual: encoded.len(),
+        });
+    }
+
+    let mut total = 0.0_f32;
+    for (block_index, block) in encoded.chunks_exact(144).enumerate() {
+        let d = read_half(&block[..2]);
+        let min_scale = read_half(&block[2..4]);
+        let packed_scales = &block[4..16];
+        let quants = &block[16..144];
+        let input_base = block_index * 256;
+        let mut block_sum = 0.0_f32;
+
+        // Q4_K stores eight 32-value groups. Each pair of groups shares one
+        // 32-byte quant slice: low nibbles first, then high nibbles.
+        for group in 0..8 {
+            let pair = group / 2;
+            let half = group % 2;
+            let (local_scale, local_min) = get_scale_min_k4(group, packed_scales);
+            let scaled_d = d * f32::from(local_scale);
+            let scaled_min = min_scale * f32::from(local_min);
+            let quant_offset = pair * 32;
+            let input_offset = input_base + group * 32;
+            let mut quant_dot = 0.0_f32;
+            let mut input_sum = 0.0_f32;
+
+            for index in 0..32 {
+                let packed = quants[quant_offset + index];
+                let quant = if half == 0 {
+                    packed & 0x0f
+                } else {
+                    packed >> 4
+                };
+                let value = input[input_offset + index];
+                quant_dot += f32::from(quant) * value;
+                input_sum += value;
+            }
+
+            block_sum += scaled_d * quant_dot - scaled_min * input_sum;
+        }
+
+        total += block_sum;
+    }
+
+    Ok(total)
+}
+
 /// Allocate and return an F32 tensor decoded from its GGML storage format.
 ///
 /// Prefer dequantize_into when the caller manages reusable output buffers.
@@ -583,6 +641,55 @@ mod tests {
         let decoded = dequantize(14, &[256], &block).unwrap();
         assert_eq!(decoded[128], -26.0);
         assert_eq!(decoded[129], -64.0);
+    }
+
+    #[test]
+    fn fused_q4_k_dot_matches_dequantized_reference_across_blocks() {
+        let mut encoded = vec![0_u8; 144 * 3];
+        let d_bits = [0x3c00_u16, 0x3800, 0x4000];
+        let min_bits = [0x3400_u16, 0x3800, 0x3a00];
+
+        for (block_index, block) in encoded.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&d_bits[block_index].to_le_bytes());
+            block[2..4].copy_from_slice(&min_bits[block_index].to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 19 + block_index * 31) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 13 + block_index * 29) as u8;
+            }
+        }
+
+        let input = (0..768)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 51.0)
+            .collect::<Vec<_>>();
+        let decoded = dequantize(12, &[768], &encoded).unwrap();
+        let expected = decoded
+            .iter()
+            .zip(&input)
+            .map(|(weight, value)| weight * value)
+            .sum::<f32>();
+        let actual = dot_q4_k(&encoded, &input).unwrap();
+
+        assert!(
+            (actual - expected).abs() <= 5.0e-4 * (1.0 + expected.abs()),
+            "fused Q4_K dot mismatch: expected={expected}, actual={actual}"
+        );
+    }
+
+    #[test]
+    fn fused_q4_k_dot_rejects_invalid_shapes_and_encoded_lengths() {
+        assert!(matches!(
+            dot_q4_k(&[], &[0.0; 255]),
+            Err(QuantError::RowDimensionNotBlockAligned { .. })
+        ));
+        assert_eq!(
+            dot_q4_k(&[], &[0.0; 256]),
+            Err(QuantError::InputLengthMismatch {
+                expected: 144,
+                actual: 0
+            })
+        );
     }
 
     #[test]
