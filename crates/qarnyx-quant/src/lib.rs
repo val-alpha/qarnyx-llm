@@ -7,6 +7,10 @@
 use std::fmt;
 
 /// GGML tensor types currently understood by Qarnyx.
+///
+/// Variant spelling follows GGML's canonical quantization names (for example,
+/// Q4_K) rather than Rust's usual CamelCase convention.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum GgmlType {
@@ -445,7 +449,7 @@ mod tests {
             vec![1.0, -2.0]
         );
 
-        let f16_bytes = [0x3c_u8, 0x00, 0x00, 0xc0, 0x01, 0x00];
+        let f16_bytes = [0x00_u8, 0x3c, 0x00, 0xc0, 0x01, 0x00];
         let decoded = dequantize(1, &[3], &f16_bytes).unwrap();
         assert_eq!(decoded[0], 1.0);
         assert_eq!(decoded[1], -2.0);
