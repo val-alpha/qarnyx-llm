@@ -380,8 +380,27 @@ fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32
 
 fn ffn<B:Backend>(b:&B,c:&Qwen35Config,norm:&[f32],gate:TensorView<'_>,up:TensorView<'_>,down:TensorView<'_>,input:&[f32], profile:&mut Option<&mut Qwen35Profile>)->Result<Vec<f32>,ModelError>{
     let x=rms0(input,norm,c.rms_epsilon)?; let mut g=vec![0.0;FF]; let mut u=vec![0.0;FF];
-    b.matvec(gate,&x,&mut g)?; b.matvec(up,&x,&mut u)?; for i in 0..FF { g[i]=silu(g[i])*u[i]; }
-    let mut y=vec![0.0;H]; b.matvec(down,&g,&mut y)?; add(&mut y,input); Ok(y)
+    timed_matvec(b, gate, &x, &mut g, profile, "ffn_gate_matvec")?;
+    timed_matvec(b, up, &x, &mut u, profile, "ffn_up_matvec")?;
+    for i in 0..FF { g[i]=silu(g[i])*u[i]; }
+    let mut y=vec![0.0;H]; timed_matvec(b, down, &g, &mut y, profile, "ffn_down_matvec")?;
+    add(&mut y,input); Ok(y)
+}
+
+fn timed_matvec<B: Backend>(
+    b: &B,
+    weights: TensorView<'_>,
+    input: &[f32],
+    output: &mut [f32],
+    profile: &mut Option<&mut Qwen35Profile>,
+    label: &'static str,
+) -> Result<(), ModelError> {
+    let start = Instant::now();
+    b.matvec(weights, input, output)?;
+    if let Some(p) = profile.as_deref_mut() {
+        p.record(label, start.elapsed());
+    }
+    Ok(())
 }
 
 fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35Layer<'a>,TensorLoadError>{
