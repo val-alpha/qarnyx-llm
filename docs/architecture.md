@@ -132,13 +132,15 @@ selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
 remain future optimizations. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
 addition currently use scalar implementations.
 
-The `workers` setting now controls fork/join parallelism for large CPU matrix
-operations. Qarnyx uses scoped Rust threads so each operation joins before the
-next model operation begins; a persistent worker pool remains a follow-up
-optimization. Benchmark worker counts 1, 2, 4, 6, 8, and 10 on the target
-VPS because thread creation, scheduler contention, and memory bandwidth may
-make fewer workers faster. Run `cargo bench -p qarnyx-cpu --bench kernels` to
-compare scalar and runtime dispatch for each registered storage format.
+The `workers` setting controls a persistent Rayon thread pool owned by the CPU
+backend. The pool is created once during backend construction and reused for
+large matvec/matmul operations; each operation is synchronous and completes
+before returning to the model runtime. Cloned backends share the same pool.
+Small matrices remain on the single-threaded path to avoid scheduling overhead.
+Benchmark worker counts 1, 2, 4, 6, 8, and 10 on the target VPS because scheduler
+contention and memory bandwidth may make fewer workers faster. Run
+`cargo bench -p qarnyx-cpu --bench kernels` to compare scaling for F32 and Q4_K
+matvec in addition to the storage-format comparisons.
 
 The scalar implementation is the correctness oracle. SIMD implementations
 must be compared against it with documented tolerances and must pass
@@ -158,10 +160,11 @@ Do not compile the default release build with target-cpu=native. That setting
 can produce a binary that fails on a different CPU. Use it only for
 host-specific builds and benchmark it separately.
 
-Use a persistent worker pool rather than creating threads for each tensor
-operation. Partition large matvec/matmul work into chunks, avoid nested
-parallelism, and benchmark 1, 2, 4, 6, 8, and 10 workers. VPS CPU scheduling
-and memory bandwidth may make fewer workers faster than all available vCPUs.
+The CPU backend now uses a persistent Rayon worker pool rather than creating
+OS threads for each tensor operation. Partition large matvec/matmul work into
+independent output-row chunks, avoid nested parallelism, and benchmark 1, 2, 4,
+6, 8, and 10 workers. VPS CPU scheduling and memory bandwidth may make fewer
+workers faster than all available vCPUs.
 
 ## Memory policy
 
@@ -241,9 +244,9 @@ state against an independent reference before declaring model compatibility.
   against the default AVX2 plus dequantization path on the target VPS.
 - Add fused Q5_K/Q6_K matvec kernels and then evaluate fused SIMD arithmetic.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
-- Implemented first-stage worker parallelism across independent matvec/matmul
-  output rows using scoped Rust threads; a persistent pool is still planned to
-  remove per-operation thread creation overhead.
+- Implemented persistent Rayon scheduling across independent matvec/matmul
+  output rows; the pool is created once per backend and reused across calls.
+  Worker-count scaling is covered by the CPU microbenchmark harness.
 - Add Qwen3.5 execution profiling for linear-attention projections,
   full-attention projections, FFN projections, recurrent/attention core work,
   and final logits projection before choosing the next kernel optimization.

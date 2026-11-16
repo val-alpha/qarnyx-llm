@@ -80,9 +80,10 @@ rows into reusable F32 scratch before the dot product. An experimental
 `fused-q4k` mode computes Q4_K matvec directly from packed blocks without
 creating an F32 scratch row; that fused dot currently uses scalar arithmetic.
 Other quantized matrix operations still decode one row at a time, and the full
-weight matrix is never expanded.
-Worker scheduling is not active yet, so `--workers` does not currently create
-parallel threads.
+weight matrix is never expanded. Large matvec and matmul operations partition
+independent output rows across a persistent Rayon worker pool. The pool is
+created when the CPU backend is constructed and reused across kernel calls;
+small matrix operations remain single-threaded.
 
 Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
 The harness compares the scalar reference, default runtime dispatch, and
@@ -138,9 +139,9 @@ portable binaries without an appropriate dispatch/build strategy.
    bounded KV cache, stopping rules, and sampling.
 7. **M6 - CPU optimization:** initial x86_64 AVX2/FMA matvec and matmul kernels
    are implemented with scalar fallbacks and scalar-vs-runtime benchmarks.
-   An opt-in mode provides direct fused Q4_K matvec; fused Q5_K/Q6_K kernels,
-   fused SIMD implementations, NEON, and a persistent worker pool remain
-   planned.
+   An opt-in mode provides direct fused Q4_K matvec. Large matrix operations
+   now reuse a persistent Rayon worker pool; fused Q5_K/Q6_K kernels, fused
+   SIMD implementations, and NEON remain planned.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
 
