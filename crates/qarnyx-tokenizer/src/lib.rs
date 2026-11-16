@@ -339,12 +339,27 @@ mod tests {
                 "hello".into(),
             ],
             scores: vec![0.0; 7],
-            merges: vec!["h e".into(), "he l".into(), "l l".into(), "hel lo".into()],
+            merges: vec!["h e".into(), "he l".into(), "l o".into(), "hel lo".into()],
             bos_token_id: None,
             eos_token_id: None,
         };
 
         assert_eq!(tokenizer.encode("hello").unwrap(), [6]);
+    }
+
+    #[test]
+    fn pre_tokenizes_sentencepiece_words() {
+        let tokenizer = GgufTokenizer {
+            model: "test-bpe".into(),
+            pre: Some("sentencepiece".into()),
+            tokens: vec!["▁hello".into(), "▁world".into()],
+            scores: vec![0.0; 2],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        assert_eq!(tokenizer.encode("hello world").unwrap(), [0, 1]);
     }
 
     #[test]
