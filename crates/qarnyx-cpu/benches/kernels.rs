@@ -153,6 +153,7 @@ fn benchmark_matmul(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let scalar_backend = CpuBackend::new_scalar(1)?;
+    let simd_dequant_backend = CpuBackend::new_simd_dequant(1)?;
     let auto_backend = CpuBackend::new(1)?;
     let features = auto_backend.features();
     println!(
@@ -226,6 +227,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         benchmark_matvec(&scalar_backend, "scalar", label, dtype, raw_type)?;
         benchmark_matvec(&auto_backend, "auto", label, dtype, raw_type)?;
     }
+
+    println!("\nQ4_K fused matvec comparison (same SIMD dot backend):");
+    benchmark_matvec(
+        &simd_dequant_backend,
+        "simd-dequant",
+        "Q4_K",
+        DType::Q4K,
+        12,
+    )?;
+    benchmark_matvec(
+        &auto_backend,
+        "auto-fused",
+        "Q4_K",
+        DType::Q4K,
+        12,
+    )?;
+
     println!("\nMatmul storage-format comparison (scalar vs runtime dispatch):");
     for (label, dtype, raw_type) in formats {
         benchmark_matmul(&scalar_backend, "scalar", label, dtype, raw_type)?;
