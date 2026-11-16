@@ -73,9 +73,11 @@ pub struct CpuBackend {
 }
 
 impl CpuBackend {
-    /// Creates the automatic backend: runtime SIMD plus fused Q4_K matvec.
+    /// Creates the default backend with runtime SIMD dispatch.
+    ///
+    /// Quantized rows use the reference dequantization path before the F32 dot.
     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, true)
+        Self::with_options(worker_count, true, false)
     }
 
     /// Creates a scalar-only backend for reference testing and benchmarks.
@@ -83,12 +85,12 @@ impl CpuBackend {
         Self::with_options(worker_count, false, false)
     }
 
-    /// Creates a SIMD backend that dequantizes Q4_K rows before the F32 dot.
+    /// Creates a runtime-SIMD backend with the experimental fused Q4_K matvec.
     ///
-    /// This provides an apples-to-apples benchmark baseline for the fused
-    /// Q4_K matvec path while retaining AVX2/FMA dispatch where available.
-    pub fn new_simd_dequant(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, false)
+    /// Q4_K rows are dotted directly from packed blocks using scalar arithmetic;
+    /// other eligible F32 kernels retain their AVX2/FMA dispatch.
+    pub fn new_fused_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, true)
     }
 
     fn with_options(
@@ -795,8 +797,8 @@ mod tests {
             .map(|index| ((index * 7 % 41) as f32 - 20.0) / 23.0)
             .collect::<Vec<_>>();
         let scalar = CpuBackend::new_scalar(1).unwrap();
-        let simd_dequant = CpuBackend::new_simd_dequant(1).unwrap();
-        let fused = CpuBackend::new(1).unwrap();
+        let simd_dequant = CpuBackend::new(1).unwrap();
+        let fused = CpuBackend::new_fused_q4k(1).unwrap();
         let mut expected = [0.0_f32; 2];
         let mut dequant_output = [0.0_f32; 2];
         let mut fused_output = [0.0_f32; 2];
