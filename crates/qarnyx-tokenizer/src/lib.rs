@@ -67,7 +67,7 @@ impl GgufTokenizer {
             .unwrap_or_default();
 
         Ok(Self {
-            model,
+            model: model.to_owned(),
             pre,
             tokens,
             scores,
