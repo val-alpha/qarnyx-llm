@@ -100,31 +100,41 @@ impl GgufTokenizer {
             return Ok(Vec::new());
         }
 
+        let pieces = self.pre_tokenize(text);
         let mut tokens = Vec::new();
-        let mut cursor = 0;
-        while cursor < text.len() {
-            let tail = &text[cursor..];
-            let mut best: Option<(usize, usize)> = None;
 
-            for (token_id, token) in self.tokens.iter().enumerate() {
-                if token.is_empty() || !tail.starts_with(token) {
-                    continue;
-                }
-                let token_len = token.len();
-                if best.map(|(_, len)| token_len > len).unwrap_or(true) {
-                    best = Some((token_id, token_len));
-                }
+        for (offset, piece) in pieces {
+            if let Some(token_id) = self.tokens.iter().position(|token| token == &piece) {
+                tokens.push(token_id);
+                continue;
             }
 
-            let Some((token_id, token_len)) = best else {
-                return Err(TokenizerError::InvalidMetadata {
-                    key: "tokenizer.ggml.tokens",
-                    expected: "vocabulary covering the input text",
-                });
-            };
+            // Some simple vocabularies contain raw text pieces rather than
+            // SentencePiece-style whitespace markers. Preserve the original
+            // longest-prefix fallback for those vocabularies.
+            let raw = piece.strip_prefix('▁').unwrap_or(&piece);
+            let mut cursor = 0;
+            while cursor < raw.len() {
+                let tail = &raw[cursor..];
+                let mut best: Option<(usize, usize)> = None;
 
-            tokens.push(token_id);
-            cursor += token_len;
+                for (token_id, token) in self.tokens.iter().enumerate() {
+                    if token.is_empty() || !tail.starts_with(token) {
+                        continue;
+                    }
+                    let token_len = token.len();
+                    if best.map(|(_, len)| token_len > len).unwrap_or(true) {
+                        best = Some((token_id, token_len));
+                    }
+                }
+
+                let Some((token_id, token_len)) = best else {
+                    return Err(TokenizerError::Unencodable { offset });
+                };
+
+                tokens.push(token_id);
+                cursor += token_len;
+            }
         }
 
         Ok(tokens)
