@@ -7,7 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 qarnyx-core = { path = "../qarnyx-core" }
+qarnyx-quant = { path = "../qarnyx-quant" }
 thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false
