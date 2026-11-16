@@ -295,7 +295,6 @@ pub fn forward_block_with_cache<B: Backend>(
     layer_index: usize,
 ) -> Result<Vec<f32>, ModelError> {
     validate_layer_shapes(config, weights, input)?;
-    cache.validate(config)?;
     if position != cache.sequence_len() {
         return Err(ModelError::InvalidConfig(
             "token position must equal the current KV cache sequence length",
