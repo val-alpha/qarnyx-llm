@@ -101,11 +101,21 @@ pub enum QuantError {
     UnsupportedType(u32),
     EmptyShape,
     ZeroDimension,
-    RowDimensionNotBlockAligned { ggml_type: u32, row_elements: u64, block_size: u64 },
+    RowDimensionNotBlockAligned {
+        ggml_type: u32,
+        row_elements: u64,
+        block_size: u64,
+    },
     ShapeOverflow,
     ByteLengthOverflow,
-    InputLengthMismatch { expected: u64, actual: usize },
-    OutputLengthMismatch { expected: u64, actual: usize },
+    InputLengthMismatch {
+        expected: u64,
+        actual: usize,
+    },
+    OutputLengthMismatch {
+        expected: u64,
+        actual: usize,
+    },
     AllocationFailed,
 }
 
