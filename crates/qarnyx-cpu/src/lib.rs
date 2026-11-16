@@ -61,8 +61,9 @@ impl CpuFeatures {
 
 /// CPU backend configuration.
 ///
-/// The first kernels are scalar and single-threaded. The worker count and
-/// detected features are retained for later scheduling and SIMD dispatch.
+/// Kernels dispatch at runtime to AVX2/FMA on supported x86_64 hosts and
+/// otherwise use the scalar reference implementation. Worker scheduling is
+/// not active yet; worker_count is currently informational.
 #[derive(Debug, Clone)]
 pub struct CpuBackend {
     worker_count: usize,
@@ -108,7 +109,7 @@ impl CpuBackend {
 
     /// Returns whether runtime SIMD dispatch was requested and AVX2 is usable.
     pub const fn uses_avx2(&self) -> bool {
-        self.simd_enabled && self.features.avx2
+        cfg!(target_arch = "x86_64") && self.simd_enabled && self.features.avx2
     }
 
     fn dot_product(&self, lhs: &[f32], rhs: &[f32]) -> f32 {
