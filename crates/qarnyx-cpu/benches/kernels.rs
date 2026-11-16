@@ -20,11 +20,7 @@ fn encode_f32(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
 
 /// Builds finite, deterministic row-major storage without allocating an F32
 /// copy for quantized matrix formats.
-fn matrix_fixture(
-    raw_type: u32,
-    rows: usize,
-    columns: usize,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+fn matrix_fixture(raw_type: u32, rows: usize, columns: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     let columns_u64 = u64::try_from(columns)?;
     let row_bytes = usize::try_from(encoded_len(raw_type, &[columns_u64])?)?;
     let info = type_info(raw_type).ok_or("unsupported benchmark tensor type")?;
@@ -83,13 +79,21 @@ fn benchmark_matvec(
     let mut output = vec![0.0_f32; m];
 
     for _ in 0..3 {
-        backend.matvec(black_box(weights), black_box(&input), black_box(&mut output))?;
+        backend.matvec(
+            black_box(weights),
+            black_box(&input),
+            black_box(&mut output),
+        )?;
     }
 
     let iterations = 20;
     let start = Instant::now();
     for _ in 0..iterations {
-        backend.matvec(black_box(weights), black_box(&input), black_box(&mut output))?;
+        backend.matvec(
+            black_box(weights),
+            black_box(&input),
+            black_box(&mut output),
+        )?;
     }
     let elapsed = start.elapsed();
     black_box(&output);
