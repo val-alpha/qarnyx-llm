@@ -148,16 +148,19 @@ fn matrix_row_layout(
         .map_err(|error| shape_mismatch(operation, error.to_string()))?;
 
     let columns_u64 = u64::try_from(columns).map_err(|_| {
-        shape_mismatch(operation, "input feature count cannot be represented as u64")
+        shape_mismatch(
+            operation,
+            "input feature count cannot be represented as u64",
+        )
     })?;
     let raw_type = dtype_id(weights.dtype);
     let row_bytes_u64 = encoded_len(raw_type, &[columns_u64])
         .map_err(|error| shape_mismatch(operation, error.to_string()))?;
     let row_bytes = usize::try_from(row_bytes_u64)
         .map_err(|_| shape_mismatch(operation, "encoded row length exceeds address space"))?;
-    let expected_bytes = row_bytes.checked_mul(rows).ok_or_else(|| {
-        shape_mismatch(operation, "encoded matrix byte length overflowed usize")
-    })?;
+    let expected_bytes = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| shape_mismatch(operation, "encoded matrix byte length overflowed usize"))?;
 
     if weights.data.len() != expected_bytes {
         return Err(shape_mismatch(
@@ -196,14 +199,17 @@ fn decode_weight_row(
     weights: &TensorView<'_>,
     scratch: &mut [f32],
 ) -> Result<(), BackendError> {
-    let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
-        shape_mismatch(operation, "encoded row offset overflowed usize")
-    })?;
-    let end = start.checked_add(row_bytes).ok_or_else(|| {
-        shape_mismatch(operation, "encoded row end overflowed usize")
-    })?;
+    let start = row_index
+        .checked_mul(row_bytes)
+        .ok_or_else(|| shape_mismatch(operation, "encoded row offset overflowed usize"))?;
+    let end = start
+        .checked_add(row_bytes)
+        .ok_or_else(|| shape_mismatch(operation, "encoded row end overflowed usize"))?;
     let encoded_row = weights.data.get(start..end).ok_or_else(|| {
-        shape_mismatch(operation, "encoded weight row is outside the tensor byte range")
+        shape_mismatch(
+            operation,
+            "encoded weight row is outside the tensor byte range",
+        )
     })?;
 
     dequantize_into(raw_type, &[columns], encoded_row, scratch)
@@ -221,8 +227,7 @@ impl Backend for CpuBackend {
         input: &[f32],
         output: &mut [f32],
     ) -> Result<(), BackendError> {
-        let Some((&out_features, &in_features)) =
-            weights.shape.first().zip(weights.shape.get(1))
+        let Some((&out_features, &in_features)) = weights.shape.first().zip(weights.shape.get(1))
         else {
             return Err(shape_mismatch(
                 "matvec",
@@ -233,10 +238,7 @@ impl Backend for CpuBackend {
         if input.len() != in_features {
             return Err(shape_mismatch(
                 "matvec",
-                format!(
-                    "input has {} elements; expected {in_features}",
-                    input.len()
-                ),
+                format!("input has {} elements; expected {in_features}", input.len()),
             ));
         }
         if output.len() != out_features {
@@ -255,13 +257,7 @@ impl Backend for CpuBackend {
 
         for (row_index, output_value) in output.iter_mut().enumerate() {
             decode_weight_row(
-                "matvec",
-                raw_type,
-                columns,
-                row_bytes,
-                row_index,
-                &weights,
-                &mut row,
+                "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
             )?;
             *output_value = row
                 .iter()
@@ -298,7 +294,10 @@ impl Backend for CpuBackend {
         if input.len() != input_len {
             return Err(shape_mismatch(
                 "matmul",
-                format!("B has {} elements; expected {input_len} for [{k}, {n}]", input.len()),
+                format!(
+                    "B has {} elements; expected {input_len} for [{k}, {n}]",
+                    input.len()
+                ),
             ));
         }
         if output.len() != output_len {
@@ -316,13 +315,7 @@ impl Backend for CpuBackend {
 
         for row_index in 0..m {
             decode_weight_row(
-                "matmul",
-                raw_type,
-                columns,
-                row_bytes,
-                row_index,
-                &weights,
-                &mut row,
+                "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
             )?;
 
             for column in 0..n {
@@ -369,8 +362,7 @@ impl Backend for CpuBackend {
         let mean_square = square_sum / input.len() as f64;
         let inverse_rms = (mean_square + f64::from(epsilon)).sqrt().recip();
 
-        for ((output_value, input_value), weight_value) in
-            output.iter_mut().zip(input).zip(weight)
+        for ((output_value, input_value), weight_value) in output.iter_mut().zip(input).zip(weight)
         {
             *output_value =
                 (f64::from(*input_value) * inverse_rms * f64::from(*weight_value)) as f32;
@@ -404,7 +396,7 @@ impl Backend for CpuBackend {
 
         let half_dim = head_dim / 2;
         for index in 0..half_dim {
-            let exponent = -(2 * index) as f64 / head_dim as f64;
+            let exponent = -((2 * index) as f64) / head_dim as f64;
             let frequency = f64::from(theta).powf(exponent);
             let angle = position as f64 * frequency;
             let cosine = angle.cos() as f32;
