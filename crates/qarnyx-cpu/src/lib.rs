@@ -630,8 +630,10 @@ mod tests {
         let expected_third = 1.0_f32 * 1.0_f32.sin() + 3.0 * 1.0_f32.cos();
         assert!((input[0] - expected_first).abs() < 1.0e-6);
         assert!((input[2] - expected_third).abs() < 1.0e-6);
-        assert!((input[1] - 1.959_899_9).abs() < 1.0e-5);
-        assert!((input[3] - 4.019_899_4).abs() < 1.0e-5);
+        let expected_second = 2.0_f32 * 0.01_f32.cos() - 4.0 * 0.01_f32.sin();
+        let expected_fourth = 2.0_f32 * 0.01_f32.sin() + 4.0 * 0.01_f32.cos();
+        assert!((input[1] - expected_second).abs() < 1.0e-6);
+        assert!((input[3] - expected_fourth).abs() < 1.0e-6);
     }
 
     #[test]
