@@ -124,6 +124,69 @@ pub struct LlamaLayerWeights<'a> {
     pub down_proj: TensorView<'a>,
 }
 
+/// Mutable key/value cache used by incremental LLaMA decoding.
+#[derive(Debug, Clone)]
+pub struct LlamaKvCache {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    sequence_len: usize,
+}
+
+impl LlamaKvCache {
+    pub fn new(config: &LlamaConfig) -> Self {
+        let key_width = config.attention_head_count_kv * config.attention_key_length;
+        let value_width = config.attention_head_count_kv * config.attention_value_length;
+        Self {
+            keys: vec![Vec::with_capacity(key_width); config.block_count],
+            values: vec![Vec::with_capacity(value_width); config.block_count],
+            sequence_len: 0,
+        }
+    }
+
+    pub fn sequence_len(&self) -> usize {
+        self.sequence_len
+    }
+
+    pub fn clear(&mut self) {
+        for values in &mut self.keys {
+            values.clear();
+        }
+        for values in &mut self.values {
+            values.clear();
+        }
+        self.sequence_len = 0;
+    }
+
+    pub(crate) fn validate(&self, config: &LlamaConfig) -> Result<(), ModelError> {
+        if self.keys.len() != config.block_count || self.values.len() != config.block_count {
+            return Err(ModelError::InvalidConfig("KV cache layer count does not match model"));
+        }
+        let key_width = config.attention_head_count_kv * config.attention_key_length;
+        let value_width = config.attention_head_count_kv * config.attention_value_length;
+        for layer in 0..config.block_count {
+            if self.keys[layer].len() != self.sequence_len * key_width
+                || self.values[layer].len() != self.sequence_len * value_width
+            {
+                return Err(ModelError::InvalidConfig("KV cache tensor length is inconsistent"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_layer(&mut self, layer: usize, key: &[f32], value: &[f32]) {
+        self.keys[layer].extend_from_slice(key);
+        self.values[layer].extend_from_slice(value);
+    }
+
+    pub(crate) fn layer(&self, layer: usize) -> (&[f32], &[f32]) {
+        (&self.keys[layer], &self.values[layer])
+    }
+
+    pub(crate) fn advance(&mut self) {
+        self.sequence_len += 1;
+    }
+}
+
 /// Executes one LLaMA-style decoder block.
 ///
 /// M4 intentionally supports a single-token sequence. KV caching and
@@ -222,6 +285,100 @@ pub fn forward_block<B: Backend>(
 
     Ok(output)
 }
+pub fn forward_block_with_cache<B: Backend>(
+    backend: &B,
+    config: &LlamaConfig,
+    weights: &LlamaLayerWeights<'_>,
+    input: &[f32],
+    position: usize,
+    cache: &mut LlamaKvCache,
+    layer_index: usize,
+) -> Result<Vec<f32>, ModelError> {
+    validate_layer_shapes(config, weights, input)?;
+    cache.validate(config)?;
+    if position != cache.sequence_len() {
+        return Err(ModelError::InvalidConfig(
+            "token position must equal the current KV cache sequence length",
+        ));
+    }
+
+    let hidden = config.embedding_length;
+    let q_len = config.attention_head_count * config.attention_key_length;
+    let kv_len = config.attention_head_count_kv * config.attention_key_length;
+    let value_len = config.attention_head_count_kv * config.attention_value_length;
+
+    let mut norm = vec![0.0_f32; hidden];
+    backend.rms_norm(input, weights.attention_norm, &mut norm,
+        config.attention_layer_norm_rms_epsilon)?;
+
+    let mut q = vec![0.0_f32; q_len];
+    let mut k = vec![0.0_f32; kv_len];
+    let mut v = vec![0.0_f32; value_len];
+    backend.matvec(weights.q_proj, &norm, &mut q)?;
+    backend.matvec(weights.k_proj, &norm, &mut k)?;
+    backend.matvec(weights.v_proj, &norm, &mut v)?;
+
+    for head in 0..config.attention_head_count {
+        let start = head * config.attention_key_length;
+        backend.rope(&mut q[start..start + config.attention_key_length], position,
+            config.attention_key_length, config.rope_freq_base)?;
+    }
+    for head in 0..config.attention_head_count_kv {
+        let start = head * config.attention_key_length;
+        backend.rope(&mut k[start..start + config.attention_key_length], position,
+            config.attention_key_length, config.rope_freq_base)?;
+    }
+
+    cache.append_layer(layer_index, &k, &v);
+    let (cached_keys, cached_values) = cache.layer(layer_index);
+    let sequence_len = cache.sequence_len() + 1;
+    let heads_per_kv = config.attention_head_count / config.attention_head_count_kv;
+    let scale = (config.attention_key_length as f32).sqrt().recip();
+    let mut attention_output = vec![0.0_f32; hidden];
+
+    for q_head in 0..config.attention_head_count {
+        let kv_head = q_head / heads_per_kv;
+        let q_start = q_head * config.attention_key_length;
+        let mut scores = vec![0.0_f32; sequence_len];
+
+        for token in 0..sequence_len {
+            let k_start = token * kv_len + kv_head * config.attention_key_length;
+            scores[token] = q[q_start..q_start + config.attention_key_length]
+                .iter()
+                .zip(&cached_keys[k_start..k_start + config.attention_key_length])
+                .map(|(a, b)| a * b)
+                .sum::<f32>() * scale;
+        }
+
+        backend.softmax(&mut scores)?;
+        let output_start = q_head * config.attention_value_length;
+        for token in 0..sequence_len {
+            let v_start = token * value_len + kv_head * config.attention_value_length;
+            for index in 0..config.attention_value_length {
+                attention_output[output_start + index] +=
+                    scores[token] * cached_values[v_start + index];
+            }
+        }
+    }
+
+    let mut projected = vec![0.0_f32; hidden];
+    backend.matvec(weights.o_proj, &attention_output, &mut projected)?;
+    backend.residual_add(&mut projected, input)?;
+    backend.rms_norm(&projected, weights.ffn_norm, &mut norm,
+        config.attention_layer_norm_rms_epsilon)?;
+
+    let mut gate = vec![0.0_f32; config.feed_forward_length];
+    let mut up = vec![0.0_f32; config.feed_forward_length];
+    backend.matvec(weights.gate_proj, &norm, &mut gate)?;
+    backend.matvec(weights.up_proj, &norm, &mut up)?;
+    backend.silu_mul(&mut gate, &up)?;
+
+    let mut output = vec![0.0_f32; hidden];
+    backend.matvec(weights.down_proj, &gate, &mut output)?;
+    backend.residual_add(&mut output, &projected)?;
+    Ok(output)
+}
+
 
 fn validate_layer_shapes(
     config: &LlamaConfig,
