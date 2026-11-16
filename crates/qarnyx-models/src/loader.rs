@@ -3,7 +3,7 @@ use qarnyx_gguf::{GgufFile, TensorInfo};
 use qarnyx_quant::{dequantize, GgmlType};
 use thiserror::Error;
 
-use crate::{forward_block, LlamaConfig, LlamaLayerWeights, ModelError};
+use crate::{forward_block, forward_block_with_cache, LlamaConfig, LlamaKvCache, LlamaLayerWeights, ModelError};
 
 /// Errors raised while mapping a parsed GGUF tensor directory onto a
 /// LLaMA-style model.
@@ -115,27 +115,51 @@ impl<'a> LlamaModel<'a> {
         Ok(Self { config, layers })
     }
 
-    /// Run every decoder block for one token.
-    ///
-    /// Token embedding, final RMSNorm, output projection, KV cache, and
-    /// multi-token causal attention remain outside this M4 checkpoint.
+    /// Run every decoder block for one token without retaining a KV cache.
     pub fn forward<B: qarnyx_core::Backend>(
         &self,
         backend: &B,
         input: &[f32],
         position: usize,
     ) -> Result<Vec<f32>, ModelError> {
+        let mut cache = LlamaKvCache::new(&self.config);
+        self.forward_with_cache(backend, input, position, &mut cache)
+    }
+
+    /// Run one token through the full decoder stack and append its K/V states.
+    pub fn forward_with_cache<B: qarnyx_core::Backend>(
+        &self,
+        backend: &B,
+        input: &[f32],
+        position: usize,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Vec<f32>, ModelError> {
         if self.layers.len() != self.config.block_count {
             return Err(ModelError::InvalidConfig(
                 "model layer count does not match configuration",
             ));
         }
+        cache.validate(&self.config)?;
+        if cache.sequence_len() != position {
+            return Err(ModelError::InvalidConfig(
+                "token position must equal the current KV cache sequence length",
+            ));
+        }
 
         let mut hidden = input.to_vec();
-        for layer in &self.layers {
+        for (layer_index, layer) in self.layers.iter().enumerate() {
             let weights = layer.weights();
-            hidden = forward_block(backend, &self.config, &weights, &hidden, position)?;
+            hidden = forward_block_with_cache(
+                backend,
+                &self.config,
+                &weights,
+                &hidden,
+                position,
+                cache,
+                layer_index,
+            )?;
         }
+        cache.advance();
         Ok(hidden)
     }
 }
