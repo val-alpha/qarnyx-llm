@@ -538,18 +538,20 @@ mod tests {
     }
 
     #[test]
-    fn computes_quantized_q4_0_matvec_without_full_matrix_expansion() {
-        let mut bytes = vec![0_u8; 18];
+    fn computes_quantized_q4_0_matvec_row_by_row() {
+        let mut bytes = vec![0_u8; 36];
         bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
-        bytes[2..].fill(0x98);
-        let shape = [1, 32];
+        bytes[2..18].fill(0x98);
+        bytes[18..20].copy_from_slice(&0x3800_u16.to_le_bytes());
+        bytes[20..].fill(0x89);
+        let shape = [2, 32];
         let weights = TensorView::new(&bytes, &shape, DType::Q4_0);
         let input = [1.0; 32];
-        let mut output = [0.0; 1];
+        let mut output = [0.0; 2];
 
         backend().matvec(weights, &input, &mut output).unwrap();
 
-        assert_eq!(output, [16.0]);
+        assert_eq!(output, [16.0, 8.0]);
     }
 
     #[test]
