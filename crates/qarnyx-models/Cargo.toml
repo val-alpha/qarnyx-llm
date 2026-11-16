@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+qarnyx-core = { path = "../qarnyx-core" }
+qarnyx-gguf = { path = "../qarnyx-gguf" }
+thiserror.workspace = true
+
 [lints]
 workspace = true
