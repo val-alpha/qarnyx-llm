@@ -547,6 +547,109 @@ mod tests {
     }
 
     #[test]
+    fn computes_f16_and_q8_0_matvec() {
+        let mut f16_bytes = Vec::new();
+        for value in [1.0_f32, -2.0, 2.0, 3.0] {
+            let bits = match value {
+                1.0 => 0x3c00_u16,
+                -2.0 => 0xc000_u16,
+                2.0 => 0x4000_u16,
+                3.0 => 0x4200_u16,
+                _ => unreachable!(),
+            };
+            f16_bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        let shape = [2, 2];
+        let weights = TensorView::new(&f16_bytes, &shape, DType::F16);
+        let mut output = [0.0; 2];
+
+        backend()
+            .matvec(weights, &[2.0, 1.0], &mut output)
+            .unwrap();
+
+        assert_eq!(output, [0.0, 7.0]);
+
+        let mut q8_bytes = vec![0_u8; 68];
+        q8_bytes[..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q8_bytes[2..34].fill(2);
+        q8_bytes[34..36].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q8_bytes[36..68].fill((-2_i8) as u8);
+        let shape = [2, 32];
+        let weights = TensorView::new(&q8_bytes, &shape, DType::Q8_0);
+        let mut output = [0.0; 2];
+
+        backend()
+            .matvec(weights, &[1.0; 32], &mut output)
+            .unwrap();
+
+        assert_eq!(output, [32.0, -32.0]);
+    }
+
+    #[test]
+    fn computes_k_quant_matvec_row_by_row() {
+        let input = [1.0; 256];
+        let shape = [2, 256];
+
+        let mut q4_k = vec![0_u8; 144 * 2];
+        for (row, scale, quant) in [(0, 1_u16, 0x11), (1, 1_u16, 0x22)] {
+            let base = row * 144;
+            q4_k[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+            q4_k[base + 4] = if row == 0 { 1 } else { 2 };
+            q4_k[base + 5] = if row == 0 { 1 } else { 2 };
+            q4_k[base + 16..base + 48].fill(quant);
+        }
+        let weights = TensorView::new(&q4_k, &shape, DType::Q4K);
+        let mut output = [0.0; 2];
+        backend().matvec(weights, &input, &mut output).unwrap();
+        assert_eq!(output, [64.0, 256.0]);
+
+        let mut q5_k = vec![0_u8; 176 * 2];
+        for row in 0..2 {
+            let base = row * 176;
+            q5_k[base..base + 2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            q5_k[base + 4] = if row == 0 { 1 } else { 2 };
+            q5_k[base + 5] = if row == 0 { 1 } else { 2 };
+            q5_k[base + 48..base + 80].fill(if row == 0 { 0x11 } else { 0x22 });
+        }
+        let weights = TensorView::new(&q5_k, &shape, DType::Q5K);
+        let mut output = [0.0; 2];
+        backend().matvec(weights, &input, &mut output).unwrap();
+        assert_eq!(output, [64.0, 256.0]);
+
+        let mut q6_k = vec![0_u8; 210 * 2];
+        for row in 0..2 {
+            let base = row * 210;
+            q6_k[base..base + 32].fill(if row == 0 { 0x01 } else { 0x02 });
+            q6_k[base + 128..base + 160].fill(0xaa);
+            q6_k[base + 192..base + 208].fill(1);
+            q6_k[base + 208..base + 210].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        }
+        let weights = TensorView::new(&q6_k, &shape, DType::Q6K);
+        let mut output = [0.0; 2];
+        backend().matvec(weights, &input, &mut output).unwrap();
+        assert_eq!(output, [32.0, 64.0]);
+    }
+
+    #[test]
+    fn computes_quantized_q4_0_matmul() {
+        let mut bytes = vec![0_u8; 36];
+        bytes[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        bytes[2..18].fill(0x98);
+        bytes[18..20].copy_from_slice(&0x3800_u16.to_le_bytes());
+        bytes[20..36].fill(0x89);
+        let shape = [2, 32];
+        let weights = TensorView::new(&bytes, &shape, DType::Q4_0);
+        let input = [1.0; 64];
+        let mut output = [0.0; 4];
+
+        backend()
+            .matmul(weights, &input, &mut output, 2, 2, 32)
+            .unwrap();
+
+        assert_eq!(output, [16.0, 16.0, 8.0, 8.0]);
+    }
+
+    #[test]
     fn computes_row_major_f32_matmul() {
         let bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
         let shape = [2, 2];
