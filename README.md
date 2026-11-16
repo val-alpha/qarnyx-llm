@@ -85,6 +85,17 @@ parallel threads.
 Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
 The harness compares the scalar reference backend with runtime dispatch.
 
+To compare end-to-end generation using the same model and prompt, select a
+kernel mode explicitly:
+
+```bash
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
+```
+
+The `auto` mode uses AVX2/FMA where supported; otherwise it falls back to
+scalar kernels.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
