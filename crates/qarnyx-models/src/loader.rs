@@ -434,9 +434,9 @@ mod tests {
                 vec![4, 4],
             ),
             ("blk.0.ffn_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4]),
-            ("blk.0.ffn_gate.weight", vec![0.0; 32], vec![8, 4]),
-            ("blk.0.ffn_up.weight", vec![0.0; 32], vec![8, 4]),
-            ("blk.0.ffn_down.weight", vec![0.0; 32], vec![4, 8]),
+            ("blk.0.ffn_gate.weight", vec![0.0; 32], vec![4, 8]),
+            ("blk.0.ffn_up.weight", vec![0.0; 32], vec![4, 8]),
+            ("blk.0.ffn_down.weight", vec![0.0; 32], vec![8, 4]),
         ];
 
         let mut bytes = Vec::new();
