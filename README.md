@@ -93,8 +93,9 @@ portable binaries without an appropriate dispatch/build strategy.
    establish repeatable kernel and end-to-end benchmarks.
 2. **M1 - GGUF reader:** implemented for GGUF v3 metadata and tensor directory.
    Streaming file parsing and malformed-input tests are included.
-3. **M2 - Quantization reference:** add F32/F16 handling and scalar Q8_0,
-   Q4_0, and K-quant decoders with exact per-tensor byte-range validation.
+3. **M2 - Quantization reference:** initial supported set implemented for
+   F32/F16, Q4_0/Q8_0, Q4_K/Q5_K/Q6_K, with exact payload-range and overlap
+   validation.
 4. **M3 - Scalar tensor engine:** implement matvec, matmul, RMSNorm, RoPE,
    softmax, SiLU, and residual operations.
 5. **M4 - First model forward pass:** implement and validate one LLaMA-style
