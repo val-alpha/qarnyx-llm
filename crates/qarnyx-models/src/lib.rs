@@ -611,6 +611,45 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_accumulates_incremental_tokens() {
+        let config = config();
+        let identity = identity_bytes(4);
+        let k_zero = vec![0_u8; 2 * 4 * 4];
+        let v_zero = vec![0_u8; 2 * 4 * 4];
+        let zero_8x4 = vec![0_u8; 8 * 4 * 4];
+        let zero_4x8 = vec![0_u8; 4 * 8 * 4];
+        let norm = [1.0_f32; 4];
+
+        let weights = LlamaLayerWeights {
+            attention_norm: &norm,
+            q_proj: f32_view(&identity, 4, 4),
+            k_proj: f32_view(&k_zero, 2, 4),
+            v_proj: f32_view(&v_zero, 2, 4),
+            o_proj: f32_view(&identity, 4, 4),
+            ffn_norm: &norm,
+            gate_proj: f32_view(&zero_8x4, 8, 4),
+            up_proj: f32_view(&zero_8x4, 8, 4),
+            down_proj: f32_view(&zero_4x8, 4, 8),
+        };
+
+        let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
+        let mut cache = LlamaKvCache::new(&config);
+        let first = forward_block_with_cache(
+            &backend, &config, &weights, &[1.0, 2.0, 3.0, 4.0], 0, &mut cache, 0,
+        ).unwrap();
+        cache.advance();
+        let second = forward_block_with_cache(
+            &backend, &config, &weights, &[4.0, 3.0, 2.0, 1.0], 1, &mut cache, 0,
+        ).unwrap();
+
+        assert_eq!(first, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(second, [4.0, 3.0, 2.0, 1.0]);
+        assert_eq!(cache.sequence_len(), 1);
+        assert_eq!(cache.keys[0].len(), 2 * config.attention_key_length);
+        assert_eq!(cache.values[0].len(), 2 * config.attention_value_length);
+    }
+
+    #[test]
     fn forward_block_identity_weights() {
         let config = config();
         let identity = identity_bytes(4);
