@@ -67,6 +67,7 @@ fn matrix_fixture(raw_type: u32, rows: usize, columns: usize) -> Result<Vec<u8>,
 
 fn benchmark_matvec(
     backend: &CpuBackend,
+    mode: &str,
     label: &str,
     dtype: DType,
     raw_type: u32,
@@ -98,7 +99,7 @@ fn benchmark_matvec(
     let elapsed = start.elapsed();
     black_box(&output);
     println!(
-        "scalar {label} matvec [{m}, {k}]: {iterations} iterations ({:.2} us/op)",
+        "{mode} {label} matvec [{m}, {k}]: {iterations} iterations ({:.2} us/op)",
         elapsed.as_secs_f64() * 1.0e6 / iterations as f64
     );
     Ok(())
@@ -106,6 +107,7 @@ fn benchmark_matvec(
 
 fn benchmark_matmul(
     backend: &CpuBackend,
+    mode: &str,
     label: &str,
     dtype: DType,
     raw_type: u32,
@@ -143,14 +145,24 @@ fn benchmark_matmul(
     let elapsed = start.elapsed();
     black_box(&output);
     println!(
-        "scalar {label} matmul [{m}, {k}] x [{k}, {n}]: {iterations} iterations ({:.2} ms/op)",
+        "{mode} {label} matmul [{m}, {k}] x [{k}, {n}]: {iterations} iterations ({:.2} ms/op)",
         elapsed.as_secs_f64() * 1.0e3 / iterations as f64
     );
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let backend = CpuBackend::new(1)?;
+    let scalar_backend = CpuBackend::new_scalar(1)?;
+    let auto_backend = CpuBackend::new(1)?;
+    let features = auto_backend.features();
+    println!(
+        "CPU features: avx2={} fma={} avx512f={} neon={} (AVX2 active: {})",
+        features.avx2,
+        features.fma,
+        features.avx512f,
+        features.neon,
+        auto_backend.uses_avx2()
+    );
 
     // Keep the original F32 fixtures as a baseline comparable to earlier runs.
     let (m, k) = (256, 512);
@@ -163,7 +175,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let iterations = 30;
     let start = Instant::now();
     for _ in 0..iterations {
-        backend.matvec(black_box(view), black_box(&input), black_box(&mut output))?;
+        scalar_backend.matvec(black_box(view), black_box(&input), black_box(&mut output))?;
     }
     let elapsed = start.elapsed();
     black_box(&output);
@@ -182,7 +194,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let iterations = 10;
     let start = Instant::now();
     for _ in 0..iterations {
-        backend.matmul(
+        scalar_backend.matmul(
             black_box(view),
             black_box(&input),
             black_box(&mut output),
@@ -209,13 +221,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("Q6_K", DType::Q6K, 14),
     ];
 
-    println!("\nScalar storage-format comparison (single worker):");
+    println!("\nMatvec storage-format comparison (scalar vs runtime dispatch):");
     for (label, dtype, raw_type) in formats {
-        benchmark_matvec(&backend, label, dtype, raw_type)?;
+        benchmark_matvec(&scalar_backend, "scalar", label, dtype, raw_type)?;
+        benchmark_matvec(&auto_backend, "auto", label, dtype, raw_type)?;
     }
-    println!();
+    println!("\nMatmul storage-format comparison (scalar vs runtime dispatch):");
     for (label, dtype, raw_type) in formats {
-        benchmark_matmul(&backend, label, dtype, raw_type)?;
+        benchmark_matmul(&scalar_backend, "scalar", label, dtype, raw_type)?;
+        benchmark_matmul(&auto_backend, "auto", label, dtype, raw_type)?;
     }
 
     Ok(())
