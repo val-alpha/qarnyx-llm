@@ -10,8 +10,10 @@ explicit memory ownership, and predictable resource usage.
 > **Project status: early development.** The GGUF v3 reader streams metadata
 > and tensor descriptors and validates complete tensor byte ranges without
 > loading weight payloads into memory. Scalar reference decoding is implemented
-> for F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. Transformer execution,
-> tokenization, and text generation are not implemented yet.
+> for F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The initial scalar CPU tensor
+> engine now includes matvec, matmul, RMSNorm, split-half RoPE, softmax,
+> SiLU-times-up, and residual add. Transformer execution, tokenization, and
+> text generation are not implemented yet.
 
 ## Design goals
 
@@ -71,6 +73,16 @@ Q5_K, and Q6_K. Unknown GGML types are rejected rather than assigned guessed
 sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
+The scalar CPU backend executes matrix-vector and matrix-matrix operations
+with all currently registered storage types. Quantized matrices are decoded
+one row at a time into a reusable F32 scratch buffer; the full weight matrix is
+not expanded. RMSNorm, split-half LLaMA-style RoPE, stable softmax, SiLU-times-
+up, and residual addition are also available as scalar reference operations.
+The initial kernels are single-threaded; runtime SIMD dispatch and persistent
+worker scheduling remain later milestones.
+
+Run the dependency-free scalar microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
@@ -96,8 +108,10 @@ portable binaries without an appropriate dispatch/build strategy.
 3. **M2 - Quantization reference:** initial supported set implemented for
    F32/F16, Q4_0/Q8_0, Q4_K/Q5_K/Q6_K, with exact payload-range and overlap
    validation.
-4. **M3 - Scalar tensor engine:** implement matvec, matmul, RMSNorm, RoPE,
-   softmax, SiLU, and residual operations.
+4. **M3 - Scalar tensor engine:** initial scalar kernels implemented for
+   matvec, matmul, RMSNorm, split-half RoPE, softmax, SiLU-times-up, and
+   residual addition. Shape/numerical tests and a dependency-free microbenchmark
+   harness are included.
 5. **M4 - First model forward pass:** implement and validate one LLaMA-style
    model against an independent reference.
 6. **M5 - Tokenization and generation:** add prefill, incremental decode,
