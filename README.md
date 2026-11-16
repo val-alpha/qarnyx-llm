@@ -49,6 +49,7 @@ measure performance on the same hardware as its benchmarks.
 
 See [docs/architecture.md](docs/architecture.md) for the architecture,
 backend contract, memory strategy, and implementation roadmap.
+See [Kimi K3 in C research and CPU optimization notes](docs/research/kimi-k3-in-c-lessons-and-m6-plan.md) for the external implementation study, current benchmark record, and proposed follow-up experiments.
 
 ## Current capabilities
 
