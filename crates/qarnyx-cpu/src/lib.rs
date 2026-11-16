@@ -734,7 +734,10 @@ mod tests {
         let scalar = CpuBackend::new_scalar(1).expect("scalar backend");
         let automatic = CpuBackend::new(1).expect("automatic backend");
         assert!(!scalar.uses_avx2());
-        assert_eq!(automatic.uses_avx2(), automatic.features().avx2);
+        assert_eq!(
+            automatic.uses_avx2(),
+            cfg!(target_arch = "x86_64") && automatic.features().avx2
+        );
     }
 
     #[test]
