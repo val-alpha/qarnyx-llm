@@ -10,8 +10,8 @@ explicit memory ownership, and predictable resource usage.
 > **Project status: early development.** The GGUF v3 reader validates tensor
 > descriptors and payload ranges without loading weights during inspection.
 > Scalar decoders support F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The CPU
-> backend provides a fused direct-block Q4_K matvec path plus runtime-dispatched
-> AVX2/FMA matvec dot products and matmul output tiles on supported x86_64 hosts.
+> backend retains runtime-dispatched AVX2/FMA matvec dot products and matmul
+> output tiles, and includes an opt-in fused direct-block Q4_K matvec path.
 > Experimental Qwen3.5 2B GGUF loading and text generation are implemented;
 > numerical validation, quantized-kernel fusion, and worker-pool scheduling
 > remain in progress.
@@ -75,12 +75,12 @@ sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
 The CPU backend executes matrix-vector and matrix-matrix operations with all
-currently registered storage types. For Q4_K matvec, the automatic backend
-computes dot products directly from packed blocks without creating an F32
-scratch row. Other quantized matrix operations still decode one row at a time
-into reusable F32 scratch; the full weight matrix is never expanded. On
-supported x86_64 hosts, AVX2/FMA accelerates the remaining F32 dot products
-and matmul output tiles.
+currently registered storage types. The default automatic backend keeps the AVX2/FMA path and dequantizes Q4_K
+rows into reusable F32 scratch before the dot product. An experimental
+`fused-q4k` mode computes Q4_K matvec directly from packed blocks without
+creating an F32 scratch row; that fused dot currently uses scalar arithmetic.
+Other quantized matrix operations still decode one row at a time, and the full
+weight matrix is never expanded.
 Worker scheduling is not active yet, so `--workers` does not currently create
 parallel threads.
 
@@ -92,14 +92,14 @@ kernel mode explicitly:
 
 ```bash
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
-./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel simd-dequant
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-q4k
 ```
 
-The `auto` mode enables fused Q4_K matvec and uses AVX2/FMA for supported
-remaining kernels. `simd-dequant` keeps AVX2/FMA but forces Q4_K through the
-F32 row-dequantization path, making it useful for isolating the fusion gain.
-`scalar` remains the non-SIMD correctness reference.
+The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
+`fused-q4k` enables the experimental direct-block Q4_K matvec while retaining
+AVX2/FMA for other eligible kernels. `scalar` remains the non-SIMD
+correctness reference.
 
 ## Development
 
@@ -137,9 +137,9 @@ portable binaries without an appropriate dispatch/build strategy.
    bounded KV cache, stopping rules, and sampling.
 7. **M6 - CPU optimization:** initial x86_64 AVX2/FMA matvec and matmul kernels
    are implemented with scalar fallbacks and scalar-vs-runtime benchmarks.
-   The automatic backend now has a direct fused Q4_K matvec path; fused
-   Q5_K/Q6_K kernels, fused SIMD implementations, NEON, and a persistent
-   worker pool remain planned.
+   An opt-in mode provides direct fused Q4_K matvec; fused Q5_K/Q6_K kernels,
+   fused SIMD implementations, NEON, and a persistent worker pool remain
+   planned.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
 
