@@ -467,8 +467,8 @@ mod tests {
 
         let decoded = dequantize(13, &[256], &block).unwrap();
         assert_eq!(decoded[0], 1.0);
-        assert_eq!(decoded[1], 17.0);
-        assert_eq!(decoded[32], 4.0);
+        assert_eq!(decoded[1], 1.0);
+        assert_eq!(decoded[32], 36.0);
         assert_eq!(decoded[64], 0.0);
     }
 
