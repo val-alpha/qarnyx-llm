@@ -440,7 +440,7 @@ mod tests {
         let f32_bytes = [1.0_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat();
         assert_eq!(dequantize(0, &[2], &f32_bytes).unwrap(), [1.0, -2.0]);
 
-        let f16_bytes = [0x3c_u8, 0x00, 0xc0, 0x00, 0x01, 0x00];
+        let f16_bytes = [0x3c_u8, 0x00, 0x00, 0xc0, 0x01, 0x00];
         let decoded = dequantize(1, &[3], &f16_bytes).unwrap();
         assert_eq!(decoded[0], 1.0);
         assert_eq!(decoded[1], -2.0);
