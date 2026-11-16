@@ -180,7 +180,7 @@ impl<'a> Qwen35Model<'a> {
         for (i, layer) in self.layers.iter().enumerate() {
             h = match layer {
                 Qwen35Layer::Linear(w) => linear(b, &self.config, w, &h, &mut cache.recurrent[i], &mut cache.conv[i])?,
-                Qwen35Layer::Attention(w) => attention(b, &self.config, w, &h, &mut cache.keys[i], &mut cache.values[i])?,
+                Qwen35Layer::Attention(w) => attention(b, &self.config, w, &h, pos, &mut cache.keys[i], &mut cache.values[i])?,
             };
         }
         cache.sequence_len += 1;
@@ -222,7 +222,9 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
     k.copy_from_slice(&conv[LIN..2*LIN]);
     v.copy_from_slice(&conv[2*LIN..3*LIN]);
     for h in 0..LH {
-        l2(&mut q[h*LD..(h+1)*LD]); l2(&mut k[h*LD..(h+1)*LD]);
+        l2(&mut q[h*LD..(h+1)*LD]);
+        for v in &mut q[h*LD..(h+1)*LD] { *v /= (LD as f32).sqrt(); }
+        l2(&mut k[h*LD..(h+1)*LD]);
         let sb = h*LD*LD;
         let decay = (-w.a[h].exp() * softplus(alpha[h] + w.dt[h])).exp();
         let beta = sigmoid(beta[h]);
@@ -248,14 +250,14 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
     ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y)
 }
 
-fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32],
+fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32],pos:usize,
     keys:&mut Vec<f32>,values:&mut Vec<f32>) -> Result<Vec<f32>,ModelError> {
     let x=rms0(input,w.attn_norm,c.rms_epsilon)?;
     let mut qg=vec![0.0;Q*2]; let mut k=vec![0.0;KV]; let mut v=vec![0.0;KV];
     b.matvec(w.q,&x,&mut qg)?; b.matvec(w.k,&x,&mut k)?; b.matvec(w.v,&x,&mut v)?;
     let mut q=qg[..Q].to_vec();
-    for h in 0..FH { headnorm(&mut q[h*FHD..(h+1)*FHD],w.q_norm,c.rms_epsilon); rope(&mut q[h*FHD..h*FHD+ROPE],c.rope_theta,0); }
-    for h in 0..2 { headnorm(&mut k[h*FHD..(h+1)*FHD],w.k_norm,c.rms_epsilon); rope(&mut k[h*FHD..h*FHD+ROPE],c.rope_theta,0); }
+    for h in 0..FH { headnorm(&mut q[h*FHD..(h+1)*FHD],w.q_norm,c.rms_epsilon); rope(&mut q[h*FHD..h*FHD+ROPE],c.rope_theta,pos); }
+    for h in 0..2 { headnorm(&mut k[h*FHD..(h+1)*FHD],w.k_norm,c.rms_epsilon); rope(&mut k[h*FHD..h*FHD+ROPE],c.rope_theta,pos); }
     keys.extend_from_slice(&k); values.extend_from_slice(&v);
     let seq=keys.len()/KV; let mut a=vec![0.0;Q];
     for qh in 0..FH {
