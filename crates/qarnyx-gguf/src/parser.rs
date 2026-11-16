@@ -1123,6 +1123,9 @@ mod tests {
         let parsed = GgufFile::parse_reader(&mut cursor).expect("seekable GGUF reader");
 
         assert_eq!(parsed.tensors.len(), 1);
-        assert_eq!(parsed.metadata_string("general.architecture"), Some("llama"));
+        assert_eq!(
+            parsed.metadata_string("general.architecture"),
+            Some("llama")
+        );
     }
 }
