@@ -1,0 +1,16 @@
+[package]
+name = "kernforge-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kernforge-core = { path = "../kernforge-core" }
+kernforge-cpu = { path = "../kernforge-cpu" }
+kernforge-gguf = { path = "../kernforge-gguf" }
+kernforge-models = { path = "../kernforge-models" }
+kernforge-tokenizer = { path = "../kernforge-tokenizer" }
+
+[lints]
+workspace = true
