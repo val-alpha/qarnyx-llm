@@ -49,9 +49,24 @@ impl GgmlType {
             Self::F16 => GgmlTypeInfo { kind: self, name: "F16", block_size: 1, type_size: 2 },
             Self::Q4_0 => GgmlTypeInfo { kind: self, name: "Q4_0", block_size: 32, type_size: 18 },
             Self::Q8_0 => GgmlTypeInfo { kind: self, name: "Q8_0", block_size: 32, type_size: 34 },
-            Self::Q4_K => GgmlTypeInfo { kind: self, name: "Q4_K", block_size: 256, type_size: 144 },
-            Self::Q5_K => GgmlTypeInfo { kind: self, name: "Q5_K", block_size: 256, type_size: 176 },
-            Self::Q6_K => GgmlTypeInfo { kind: self, name: "Q6_K", block_size: 256, type_size: 210 },
+            Self::Q4_K => GgmlTypeInfo {
+                kind: self,
+                name: "Q4_K",
+                block_size: 256,
+                type_size: 144,
+            },
+            Self::Q5_K => GgmlTypeInfo {
+                kind: self,
+                name: "Q5_K",
+                block_size: 256,
+                type_size: 176,
+            },
+            Self::Q6_K => GgmlTypeInfo {
+                kind: self,
+                name: "Q6_K",
+                block_size: 256,
+                type_size: 210,
+            },
         }
     }
 }
@@ -73,10 +88,17 @@ pub enum QuantError {
 impl fmt::Display for QuantError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedType(raw) => write!(f, "GGML tensor type {raw} is not supported by Qarnyx yet"),
+            Self::UnsupportedType(raw) => write!(
+                f,
+                "GGML tensor type {raw} is not supported by Qarnyx yet"
+            ),
             Self::EmptyShape => write!(f, "tensor shape must contain at least one dimension"),
             Self::ZeroDimension => write!(f, "tensor shape contains a zero-sized dimension"),
-            Self::RowDimensionNotBlockAligned { ggml_type, row_elements, block_size } => write!(
+            Self::RowDimensionNotBlockAligned {
+                ggml_type,
+                row_elements,
+                block_size,
+            } => write!(
                 f,
                 "GGML type {ggml_type} row length {row_elements} is not divisible by block size {block_size}"
             ),
@@ -128,7 +150,10 @@ pub fn dequantize_into(
         return Err(QuantError::InputLengthMismatch { expected: byte_len, actual: encoded.len() });
     }
     if output.len() as u64 != element_count {
-        return Err(QuantError::OutputLengthMismatch { expected: element_count, actual: output.len() });
+        return Err(QuantError::OutputLengthMismatch {
+            expected: element_count,
+            actual: output.len(),
+        });
     }
 
     match info.kind {
