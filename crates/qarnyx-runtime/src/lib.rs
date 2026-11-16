@@ -1,7 +1,7 @@
 //! Autoregressive generation orchestration for Qarnyx model execution.
 
 use qarnyx_core::Backend;
-use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError};
+use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model};
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use thiserror::Error;
 
@@ -325,5 +325,115 @@ impl LlamaGenerator {
         x ^= x << 17;
         self.rng_state = x;
         (x as f64) / (u64::MAX as f64)
+    }
+}
+
+
+/// Autoregressive generator for the Qwen3.5 hybrid decoder.
+pub struct Qwen35Generator {
+    rng_state: u64,
+}
+
+impl Qwen35Generator {
+    pub fn new(seed: u64) -> Self {
+        Self { rng_state: if seed == 0 { 1 } else { seed } }
+    }
+
+    pub fn generate_ids<B: Backend>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+    ) -> Result<GenerationResult, GenerationError> {
+        config.validate()?;
+        if prompt.is_empty() {
+            return Err(GenerationError::EmptyPrompt);
+        }
+        let mut cache = Qwen35Cache::new(&model.config);
+        let mut generated = prompt.to_vec();
+        let mut logits = Vec::new();
+
+        for (position, &token_id) in prompt.iter().enumerate() {
+            logits = model.forward_logits(backend, token_id, position, &mut cache)?;
+        }
+
+        for _ in 0..config.max_new_tokens {
+            let next = self.sample(&logits, config)?;
+            generated.push(next);
+            if tokenizer.eos_token_id == Some(next) {
+                break;
+            }
+            let position = cache.sequence_len;
+            logits = model.forward_logits(backend, next, position, &mut cache)?;
+        }
+
+        Ok(GenerationResult {
+            token_ids: generated.clone(),
+            text: tokenizer.decode(&generated)?,
+        })
+    }
+
+    pub fn generate<B: Backend>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &str,
+        config: GenerationConfig,
+    ) -> Result<GenerationResult, GenerationError> {
+        let ids = tokenizer.encode(prompt)?;
+        self.generate_ids(model, tokenizer, backend, &ids, config)
+    }
+
+    fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
+        if logits.is_empty() || logits.iter().any(|v| !v.is_finite()) {
+            return Err(GenerationError::NonFiniteLogits);
+        }
+        let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        if config.temperature == 0.0 {
+            return candidates.into_iter().max_by(|a,b| a.1.total_cmp(&b.1))
+                .map(|(id,_)| id).ok_or(GenerationError::NonFiniteLogits);
+        }
+        candidates.sort_by(|a,b| b.1.total_cmp(&a.1));
+        if config.top_k > 0 && config.top_k < candidates.len() {
+            candidates.truncate(config.top_k);
+        }
+        let max = candidates[0].1;
+        let mut sum = 0.0f64;
+        let mut weights = Vec::with_capacity(candidates.len());
+        for &(_, logit) in &candidates {
+            let w = f64::from((logit - max) / config.temperature).exp();
+            sum += w;
+            weights.push(w);
+        }
+        let mut probs: Vec<(usize,f64)> = candidates.iter().zip(weights)
+            .map(|(&(id,_),w)|(id,w/sum)).collect();
+        if config.top_p < 1.0 {
+            let mut cumulative = 0.0;
+            let mut keep = 0;
+            for &(_, p) in &probs {
+                cumulative += p;
+                keep += 1;
+                if cumulative >= f64::from(config.top_p) { break; }
+            }
+            probs.truncate(keep.max(1));
+        }
+        let total = probs.iter().map(|(_,p)| *p).sum::<f64>();
+        let threshold = self.next_unit() * total;
+        let mut cumulative = 0.0;
+        for (id,p) in probs {
+            cumulative += p;
+            if cumulative >= threshold { return Ok(id); }
+        }
+        Ok(candidates[0].0)
+    }
+
+    fn next_unit(&mut self) -> f64 {
+        let mut x = self.rng_state;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.rng_state = x;
+        x as f64 / u64::MAX as f64
     }
 }
