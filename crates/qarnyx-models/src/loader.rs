@@ -562,7 +562,7 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         push_u32(&mut bytes, 3);
         push_u64(&mut bytes, tensors.len() as u64);
-        push_u64(&mut bytes, 12);
+        push_u64(&mut bytes, 10);
         push_metadata_string(&mut bytes, "general.architecture", "llama");
         push_metadata_u32(&mut bytes, "general.alignment", 32);
         push_metadata_u32(&mut bytes, "llama.block_count", 1);
