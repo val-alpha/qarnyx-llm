@@ -284,25 +284,25 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
     let fd=matrix(g,d,&format!("{p}.ffn_down.weight"),&[H,FF])?;
     if c.recurrent_layers[i] {
         Ok(Qwen35Layer::Linear(Qwen35Linear{
-            attn_norm:an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*3,H])?,
+            attn_norm:&an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*3,H])?,
             gate:matrix(g,d,&format!("{p}.attn_gate.weight"),&[LIN,H])?,
             conv:matrix(g,d,&format!("{p}.ssm_conv1d.weight"),&[LIN,CONV])?,
-            dt:vector(g,d,&format!("{p}.ssm_dt.bias"),&[LH])?,
-            a:vector(g,d,&format!("{p}.ssm_a"),&[LH])?,
+            dt:&vector(g,d,&format!("{p}.ssm_dt.bias"),&[LH])?,
+            a:&vector(g,d,&format!("{p}.ssm_a"),&[LH])?,
             beta:matrix(g,d,&format!("{p}.ssm_beta.weight"),&[LH,H])?,
             alpha:matrix(g,d,&format!("{p}.ssm_alpha.weight"),&[LH,H])?,
-            ssm_norm:vector(g,d,&format!("{p}.ssm_norm.weight"),&[LD])?,
+            ssm_norm:&vector(g,d,&format!("{p}.ssm_norm.weight"),&[LD])?,
             out:matrix(g,d,&format!("{p}.ssm_out.weight"),&[H,LIN])?,
-            ffn_norm:fnorm,ffn_gate:fg,ffn_up:fu,ffn_down:fd,
+            ffn_norm:&fnorm,ffn_gate:fg,ffn_up:fu,ffn_down:fd,
         }))
     } else {
         Ok(Qwen35Layer::Attention(Qwen35Attention{
-            attn_norm:an,q:matrix(g,d,&format!("{p}.attn_q.weight"),&[Q*2,H])?,
+            attn_norm:&an,q:matrix(g,d,&format!("{p}.attn_q.weight"),&[Q*2,H])?,
             k:matrix(g,d,&format!("{p}.attn_k.weight"),&[KV,H])?,
             v:matrix(g,d,&format!("{p}.attn_v.weight"),&[KV,H])?,
             out:matrix(g,d,&format!("{p}.attn_output.weight"),&[H,Q])?,
-            q_norm:vector(g,d,&format!("{p}.attn_q_norm.weight"),&[FHD])?,
-            k_norm:vector(g,d,&format!("{p}.attn_k_norm.weight"),&[FHD])?,
+            q_norm:&vector(g,d,&format!("{p}.attn_q_norm.weight"),&[FHD])?,
+            k_norm:&vector(g,d,&format!("{p}.attn_k_norm.weight"),&[FHD])?,
             ffn_norm:fnorm,ffn_gate:fg,ffn_up:fu,ffn_down:fd,
         }))
     }
@@ -322,7 +322,7 @@ fn add(a:&mut[f32],b:&[f32]){for(i,x)in a.iter_mut().enumerate(){*x+=b[i];}}
 fn softmax(x:&mut[f32]){let m=x.iter().copied().fold(f32::NEG_INFINITY,f32::max);let mut s=0.0f64;for v in x.iter_mut(){*v=(*v-m).exp();s+=f64::from(*v);}for v in x{*v=(f64::from(*v)/s)as f32;}}
 fn silu(x:f32)->f32{if x>=0.0{x/(1.0+(-x).exp())}else{let e=x.exp();x*e/(1.0+e)}}
 fn sigmoid(x:f32)->f32{if x>=0.0{1.0/(1.0+(-x).exp())}else{let e=x.exp();e/(1.0+e)}}
-fn softplus(x:f32)->f32{if x>20.0{x}else if x<-20.0{x.exp()}else{(1.0+x.exp()).ln()}}
+fn softplus(x:f32)->f32{if x>20.0{x}else if x< -20.0{x.exp()}else{(1.0+x.exp()).ln()}}
 
 fn row(t:TensorView<'_>,r:usize,n:usize)->Result<Vec<f32>,ModelError>{let mut o=vec![0.0;n];decode_into(t,r,&mut o)?;Ok(o)}
 fn decode_into(t:TensorView<'_>,r:usize,o:&mut[f32])->Result<(),ModelError>{
