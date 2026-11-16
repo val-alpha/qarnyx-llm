@@ -134,42 +134,68 @@ impl GgufTokenizer {
         let mut merge_rank = std::collections::HashMap::with_capacity(self.merges.len());
         for (rank, merge) in self.merges.iter().enumerate() {
             let mut parts = merge.split_whitespace();
-            let left = parts.next();
-            let right = parts.next();
-            if let (Some(left), Some(right)) = (left, right) {
-                merge_rank.insert((left.to_owned(), right.to_owned()), rank);
-            }
+            let (Some(left), Some(right)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            merge_rank.insert((left.to_owned(), right.to_owned()), rank);
         }
 
+        let pieces = self.pre_tokenize(text);
         let mut output = Vec::new();
-        for (byte_offset, piece) in text.split_inclusive(char::is_whitespace).enumerate() {
-            let _ = byte_offset;
+
+        for (offset, piece) in pieces {
             let mut symbols: Vec<String> = piece.chars().map(|ch| ch.to_string()).collect();
             if symbols.is_empty() {
                 continue;
             }
 
+            // Standard BPE repeatedly applies the lowest-rank merge that is
+            // present in the current symbol sequence.
             loop {
                 let mut best: Option<(usize, usize)> = None;
                 for i in 0..symbols.len().saturating_sub(1) {
-                    if let Some(&rank) = merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
-                        if best.map(|(_, r)| rank < r).unwrap_or(true) {
-                            best = Some((i, rank));
-                        }
+                    if let Some(&rank) = merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                        && best.map(|(_, current)| rank < current).unwrap_or(true)
+                    {
+                        best = Some((i, rank));
                     }
                 }
+
                 let Some((index, _)) = best else { break };
                 let merged = format!("{}{}", symbols[index], symbols[index + 1]);
                 symbols.splice(index..=index + 1, [merged]);
             }
 
             for symbol in symbols {
-                let id = self.tokens.iter().position(|token| token == &symbol)
-                    .ok_or(TokenizerError::Unencodable { offset: text.find(&symbol).unwrap_or(0) })?;
+                let Some(id) = self.tokens.iter().position(|token| token == &symbol) else {
+                    return Err(TokenizerError::Unencodable { offset });
+                };
                 output.push(id);
             }
         }
+
         Ok(output)
+    }
+
+    fn pre_tokenize(&self, text: &str) -> Vec<(usize, String)> {
+        let mut pieces = Vec::new();
+
+        match self.pre.as_deref() {
+            Some(pre) if pre.contains("llama") || pre.contains("sentencepiece") => {
+                for (index, word) in text.split_whitespace().enumerate() {
+                    let offset = text.find(word).unwrap_or(index);
+                    pieces.push((offset, format!("▁{word}")));
+                }
+            }
+            _ => {
+                for (offset, word) in text.split_whitespace() {
+                    let prefix = if offset == 0 { "" } else { "Ġ" };
+                    pieces.push((offset, format!("{prefix}{word}")));
+                }
+            }
+        }
+
+        pieces
     }
 
     /// Converts generated token IDs back to their GGUF token strings.
