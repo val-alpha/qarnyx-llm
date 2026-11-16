@@ -44,12 +44,14 @@ The current qarnyx-gguf reader:
   metadata keys/tensor names/tensor offsets, invalid dimensions, overflowing
   shapes, invalid alignment, non-zero alignment padding, and tensor data start
   offsets outside the file.
-- Preserves numeric ggml tensor type identifiers for forward compatibility.
+- Uses the qarnyx-quant registry to calculate exact encoded payload lengths
+  for supported GGML types and validates complete tensor byte ranges.
+- Rejects unknown tensor types, invalid quantized row dimensions, payload
+  ranges extending beyond the file, and overlapping tensor ranges.
 
-The reader validates the beginning of each tensor payload, not its complete
-byte extent. Correct payload lengths depend on the ggml type's block size and
-encoded block size. M2 will add a single authoritative type registry and use it
-to validate each tensor's full byte range before any tensor view is exposed.
+The supported registry currently includes F32, F16, Q4_0, Q8_0, Q4_K, Q5_K,
+and Q6_K. Tensor payload bytes remain unread during inspection; only their
+shape-derived extents are validated.
 
 The reader currently rejects big-endian files. This limitation is explicit;
 the initial deployment target is little-endian x86_64/aarch64.
@@ -171,14 +173,15 @@ end-to-end correctness tests.
   duplicate entries, and tensor data start offsets.
 - Parse from a seekable reader without loading tensor payloads into memory.
 - Add malformed-file and resource-limit tests.
-- Defer exact tensor payload byte lengths to M2, where quantization block sizes
-  are registered and validated.
 
-### M2 - Quantization reference
-- Add F32/F16 handling and scalar Q8_0, Q4_0 decoders.
-- Add K-quant decoders only after validating their exact block layouts.
-- Add type-aware tensor extent validation and test known blocks against
-  independent reference data.
+### M2 - Quantization reference (initial supported set implemented)
+- Register F32/F16, Q4_0/Q8_0, and K-quant Q4_K/Q5_K/Q6_K block layouts.
+- Add safe scalar reference decoders that write into caller-owned F32 buffers.
+- Calculate exact per-tensor encoded lengths using per-row block alignment.
+- Validate complete tensor byte ranges and reject overlaps without reading
+  tensor payload bytes.
+- Add type, size, row-alignment, decoder, truncation, and overlap tests.
+- Expand the registry only when a new GGML layout has a verified reference.
 
 ### M3 - Scalar tensor engine
 - Implement matvec, matmul, RMSNorm, RoPE, softmax, SiLU, and residual ops.
