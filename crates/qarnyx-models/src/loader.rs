@@ -562,7 +562,7 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         push_u32(&mut bytes, 3);
         push_u64(&mut bytes, tensors.len() as u64);
-        push_u64(&mut bytes, 10);
+        push_u64(&mut bytes, 11);
         push_metadata_string(&mut bytes, "general.architecture", "llama");
         push_metadata_u32(&mut bytes, "general.alignment", 32);
         push_metadata_u32(&mut bytes, "llama.block_count", 1);
@@ -578,7 +578,7 @@ mod tests {
             1.0e-5,
         );
 
-        let directory_start = bytes.len();
+        push_metadata_f32(&mut bytes, "llama.rope.freq_base", 10000.0);\n\n        let directory_start = bytes.len();
         let mut offsets = Vec::with_capacity(tensors.len());
         let mut payload_offset = 0_u64;
 
