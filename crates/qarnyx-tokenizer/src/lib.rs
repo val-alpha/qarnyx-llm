@@ -188,9 +188,13 @@ impl GgufTokenizer {
                 }
             }
             _ => {
-                for (offset, word) in text.split_whitespace() {
-                    let prefix = if offset == 0 { "" } else { "Ġ" };
+                let mut search_from = 0;
+                for (index, word) in text.split_whitespace().enumerate() {
+                    let relative = text[search_from..].find(word).unwrap_or(0);
+                    let offset = search_from + relative;
+                    let prefix = if index == 0 { "" } else { "Ġ" };
                     pieces.push((offset, format!("{prefix}{word}")));
+                    search_from = offset + word.len();
                 }
             }
         }
