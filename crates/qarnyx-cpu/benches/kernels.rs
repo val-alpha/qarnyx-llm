@@ -1,4 +1,4 @@
-//! Scalar kernel microbenchmarks for F32 and GGUF storage formats.
+//! Scalar-versus-runtime-dispatch microbenchmarks for F32 and GGUF formats.
 //!
 //! Run with: cargo bench -p qarnyx-cpu --bench kernels
 
