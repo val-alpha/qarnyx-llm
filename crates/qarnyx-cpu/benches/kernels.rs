@@ -153,8 +153,8 @@ fn benchmark_matmul(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let scalar_backend = CpuBackend::new_scalar(1)?;
-    let simd_dequant_backend = CpuBackend::new_simd_dequant(1)?;
     let auto_backend = CpuBackend::new(1)?;
+    let fused_q4k_backend = CpuBackend::new_fused_q4k(1)?;
     let features = auto_backend.features();
     println!(
         "CPU features: avx2={} fma={} avx512f={} neon={} (AVX2 active: {})",
@@ -228,17 +228,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         benchmark_matvec(&auto_backend, "auto", label, dtype, raw_type)?;
     }
 
-    println!("\nQ4_K fused matvec comparison (same SIMD dot backend):");
+    println!("\nQ4_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
     benchmark_matvec(
-        &simd_dequant_backend,
-        "simd-dequant",
+        &auto_backend,
+        "auto-dequant",
         "Q4_K",
         DType::Q4K,
         12,
     )?;
     benchmark_matvec(
-        &auto_backend,
-        "auto-fused",
+        &fused_q4k_backend,
+        "fused-q4k",
         "Q4_K",
         DType::Q4K,
         12,
