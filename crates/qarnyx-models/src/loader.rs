@@ -578,7 +578,9 @@ mod tests {
             1.0e-5,
         );
 
-        push_metadata_f32(&mut bytes, "llama.rope.freq_base", 10000.0);\n\n        let directory_start = bytes.len();
+        push_metadata_f32(&mut bytes, "llama.rope.freq_base", 10000.0);
+
+        let directory_start = bytes.len();
         let mut offsets = Vec::with_capacity(tensors.len());
         let mut payload_offset = 0_u64;
 
