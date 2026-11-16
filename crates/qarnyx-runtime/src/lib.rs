@@ -1,7 +1,7 @@
 //! Autoregressive generation orchestration for Qarnyx model execution.
 
 use qarnyx_core::Backend;
-use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model};
+use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model, Qwen35Profile};
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use thiserror::Error;
 
@@ -352,9 +352,17 @@ impl Qwen35Generator {
         let mut cache = Qwen35Cache::new(&model.config);
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
+        let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
+        let mut profile = Qwen35Profile::default();
 
         for (position, &token_id) in prompt.iter().enumerate() {
-            logits = model.forward_logits(backend, token_id, position, &mut cache)?;
+            if profiling {
+                logits = model.forward_logits_profiled(
+                    backend, token_id, position, &mut cache, &mut profile,
+                )?;
+            } else {
+                logits = model.forward_logits(backend, token_id, position, &mut cache)?;
+            }
         }
 
         for _ in 0..config.max_new_tokens {
@@ -364,7 +372,17 @@ impl Qwen35Generator {
                 break;
             }
             let position = cache.sequence_len;
-            logits = model.forward_logits(backend, next, position, &mut cache)?;
+            if profiling {
+                logits = model.forward_logits_profiled(
+                    backend, next, position, &mut cache, &mut profile,
+                )?;
+            } else {
+                logits = model.forward_logits(backend, next, position, &mut cache)?;
+            }
+        }
+
+        if profiling {
+            eprintln!("{}", profile.report());
         }
 
         Ok(GenerationResult {
