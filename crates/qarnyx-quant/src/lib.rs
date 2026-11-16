@@ -397,7 +397,9 @@ mod tests {
     fn encoded_len_uses_row_block_alignment() {
         assert_eq!(encoded_len(12, &[2048, 2048]), Ok(2_359_296));
         assert_eq!(encoded_len(13, &[256]), Ok(176));
+        assert_eq!(encoded_len(13, &[2048, 6144]), Ok(8_650_752));
         assert_eq!(encoded_len(14, &[512, 3]), Ok(1_260));
+        assert_eq!(encoded_len(14, &[2048, 248_320]), Ok(417_177_600));
         assert_eq!(
             encoded_len(12, &[128, 2]),
             Err(QuantError::RowDimensionNotBlockAligned {
