@@ -140,27 +140,35 @@ impl GgufTokenizer {
             merge_rank.insert((left.to_owned(), right.to_owned()), rank);
         }
 
+        let byte_level = self.model == "gpt2" && self.pre.as_deref() == Some("qwen35");
         let pieces = self.pre_tokenize(text);
         let mut output = Vec::new();
 
         for (offset, piece) in pieces {
-            let mut symbols: Vec<String> = piece.chars().map(|ch| ch.to_string()).collect();
+            let symbols = if byte_level {
+                byte_to_unicode(&piece)
+                    .chars()
+                    .map(|ch| ch.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                piece.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            };
+
             if symbols.is_empty() {
                 continue;
             }
 
-            // Standard BPE repeatedly applies the lowest-rank merge that is
-            // present in the current symbol sequence.
+            let mut symbols = symbols;
             loop {
                 let mut best: Option<(usize, usize)> = None;
                 for i in 0..symbols.len().saturating_sub(1) {
-                    if let Some(&rank) = merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                    if let Some(&rank) =
+                        merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone()))
                         && best.map(|(_, current)| rank < current).unwrap_or(true)
                     {
                         best = Some((i, rank));
                     }
                 }
-
                 let Some((index, _)) = best else { break };
                 let merged = format!("{}{}", symbols[index], symbols[index + 1]);
                 symbols.splice(index..=index + 1, [merged]);
@@ -178,8 +186,11 @@ impl GgufTokenizer {
     }
 
     fn pre_tokenize(&self, text: &str) -> Vec<(usize, String)> {
-        let mut pieces = Vec::new();
+        if self.model == "gpt2" && self.pre.as_deref() == Some("qwen35") {
+            return qwen35_pre_tokenize(text);
+        }
 
+        let mut pieces = Vec::new();
         match self.pre.as_deref() {
             Some(pre) if pre.contains("llama") || pre.contains("sentencepiece") => {
                 for (index, word) in text.split_whitespace().enumerate() {
@@ -198,10 +209,33 @@ impl GgufTokenizer {
                 }
             }
         }
-
         pieces
     }
 
+    /// Converts generated token IDs back to text.
+    pub fn decode(&self, token_ids: &[usize]) -> Result<String, TokenizerError> {
+        if self.model != "gpt2" || self.pre.as_deref() != Some("qwen35") {
+            let mut output = String::new();
+            for &token_id in token_ids {
+                output.push_str(
+                    self.tokens
+                        .get(token_id)
+                        .ok_or(TokenizerError::TokenIdOutOfRange(token_id))?,
+                );
+            }
+            return Ok(output);
+        }
+
+        let mut bytes = Vec::new();
+        for &token_id in token_ids {
+            let token = self
+                .tokens
+                .get(token_id)
+                .ok_or(TokenizerError::TokenIdOutOfRange(token_id))?;
+            bytes.extend_from_slice(&unicode_to_bytes(token));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
     /// Converts generated token IDs back to their GGUF token strings.
     pub fn decode(&self, token_ids: &[usize]) -> Result<String, TokenizerError> {
         let mut output = String::new();
@@ -214,6 +248,119 @@ impl GgufTokenizer {
         }
         Ok(output)
     }
+}
+
+
+fn byte_to_unicode(text: &str) -> String {
+    let map = gpt2_byte_map();
+    text.as_bytes()
+        .iter()
+        .map(|byte| char::from_u32(map[*byte as usize]).expect("GPT-2 byte map is Unicode"))
+        .collect()
+}
+
+fn unicode_to_bytes(token: &str) -> Vec<u8> {
+    let reverse = gpt2_reverse_map();
+    let mut bytes = Vec::with_capacity(token.len());
+    for ch in token.chars() {
+        if let Some(&byte) = reverse.get(&(ch as u32)) {
+            bytes.push(byte);
+        } else {
+            bytes.extend_from_slice(ch.to_string().as_bytes());
+        }
+    }
+    bytes
+}
+
+fn gpt2_byte_map() -> [u32; 256] {
+    let mut map = [0u32; 256];
+    let mut bs = Vec::new();
+    for b in 33u8..=126 { bs.push(b); }
+    for b in 161u8..=172 { bs.push(b); }
+    for b in 174u8..=255 { bs.push(b); }
+    let mut n = 0u32;
+    for b in 0u16..=255 {
+        let byte = b as u8;
+        if bs.contains(&byte) {
+            map[b as usize] = b as u32;
+        } else {
+            map[b as usize] = 256 + n;
+            n += 1;
+        }
+    }
+    map
+}
+
+fn gpt2_reverse_map() -> std::collections::HashMap<u32, u8> {
+    let map = gpt2_byte_map();
+    let mut reverse = std::collections::HashMap::with_capacity(256);
+    for (byte, codepoint) in map.into_iter().enumerate() {
+        reverse.insert(codepoint, byte as u8);
+    }
+    reverse
+}
+
+fn qwen35_pre_tokenize(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut pieces = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let start = chars[i].0;
+        let mut j = i;
+        let mut piece = String::new();
+
+        if chars[j].1.is_whitespace() {
+            if chars[j].1 == '\\n' || chars[j].1 == '\\r' {
+                while j < chars.len() && (chars[j].1 == '\\n' || chars[j].1 == '\\r') {
+                    piece.push(chars[j].1);
+                    j += 1;
+                }
+                pieces.push((start, piece));
+                i = j;
+                continue;
+            }
+
+            piece.push(chars[j].1);
+            j += 1;
+            if j == chars.len() {
+                pieces.push((start, piece));
+                break;
+            }
+        }
+
+        let ch = chars[j].1;
+        if ch.is_alphabetic() || ch.is_mark() {
+            while j < chars.len() && (chars[j].1.is_alphabetic() || chars[j].1.is_mark()) {
+                piece.push(chars[j].1);
+                j += 1;
+            }
+        } else if ch.is_numeric() {
+            piece.push(ch);
+            j += 1;
+        } else if !ch.is_whitespace() {
+            while j < chars.len() {
+                let c = chars[j].1;
+                if c.is_whitespace() || c.is_alphabetic() || c.is_mark() || c.is_numeric() {
+                    break;
+                }
+                piece.push(c);
+                j += 1;
+            }
+        } else {
+            while j < chars.len() && chars[j].1.is_whitespace() {
+                piece.push(chars[j].1);
+                j += 1;
+            }
+        }
+
+        if !piece.is_empty() {
+            pieces.push((start, piece));
+        }
+        i = j.max(i + 1);
+    }
+
+    pieces
 }
 
 fn required_string<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a str, TokenizerError> {
