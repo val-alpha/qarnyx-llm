@@ -73,11 +73,7 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
         for tensor in &gguf.tensors {
             println!(
                 "  {:<36} shape={:?} ggml_type={} offset={} file_offset={}",
-                tensor.name,
-                tensor.dimensions,
-                tensor.ggml_type,
-                tensor.offset,
-                tensor.file_offset
+                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.offset, tensor.file_offset
             );
         }
     } else if !gguf.tensors.is_empty() {

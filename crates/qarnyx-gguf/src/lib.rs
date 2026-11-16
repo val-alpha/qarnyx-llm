@@ -8,6 +8,5 @@
 mod parser;
 
 pub use parser::{
-    GgufError, GgufFile, MetadataEntry, MetadataValue, MetadataValueType, ParseOptions,
-    TensorInfo,
+    GgufError, GgufFile, MetadataEntry, MetadataValue, MetadataValueType, ParseOptions, TensorInfo,
 };

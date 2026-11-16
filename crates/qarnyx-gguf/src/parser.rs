@@ -109,7 +109,10 @@ impl fmt::Display for GgufError {
                 write!(f, "invalid GGUF magic: expected GGUF, found {found:?}")
             }
             Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported GGUF version {version}; this reader supports v3")
+                write!(
+                    f,
+                    "unsupported GGUF version {version}; this reader supports v3"
+                )
             }
             Self::BigEndianUnsupported => {
                 write!(f, "big-endian GGUF is not supported by this reader yet")
@@ -122,7 +125,10 @@ impl fmt::Display for GgufError {
             }
             Self::InvalidUtf8(context) => write!(f, "{context} is not valid UTF-8"),
             Self::InvalidMetadataKey(key) => {
-                write!(f, "invalid metadata key {key}; keys must be non-empty ASCII")
+                write!(
+                    f,
+                    "invalid metadata key {key}; keys must be non-empty ASCII"
+                )
             }
             Self::DuplicateMetadataKey(key) => {
                 write!(f, "duplicate GGUF metadata key {key}")
@@ -146,16 +152,25 @@ impl fmt::Display for GgufError {
                 kind,
                 actual,
                 limit,
-            } => write!(f, "{kind} count {actual} exceeds the configured limit {limit}"),
+            } => write!(
+                f,
+                "{kind} count {actual} exceeds the configured limit {limit}"
+            ),
             Self::MetadataTooLarge { actual, limit } => write!(
                 f,
                 "metadata region is {actual} bytes, exceeding the configured limit {limit}"
             ),
             Self::ArrayDepthExceeded { limit } => {
-                write!(f, "metadata array nesting exceeds the configured depth {limit}")
+                write!(
+                    f,
+                    "metadata array nesting exceeds the configured depth {limit}"
+                )
             }
             Self::InvalidDimensionCount(count) => {
-                write!(f, "invalid tensor dimension count {count}; expected 1..={MAX_TENSOR_DIMS}")
+                write!(
+                    f,
+                    "invalid tensor dimension count {count}; expected 1..={MAX_TENSOR_DIMS}"
+                )
             }
             Self::ZeroDimension(name) => {
                 write!(f, "tensor {name} contains a zero-sized dimension")
@@ -187,7 +202,10 @@ impl fmt::Display for GgufError {
                 "tensor {tensor} begins at byte {absolute_offset}, outside file size {file_size}"
             ),
             Self::NonZeroPadding { offset } => {
-                write!(f, "GGUF alignment padding contains a non-zero byte at {offset}")
+                write!(
+                    f,
+                    "GGUF alignment padding contains a non-zero byte at {offset}"
+                )
             }
             Self::Overflow(context) => write!(f, "integer overflow while computing {context}"),
             Self::AllocationFailed(context) => {
@@ -420,7 +438,10 @@ impl GgufFile {
             }
         }
 
-        let alignment = match metadata.iter().find(|entry| entry.key == "general.alignment") {
+        let alignment = match metadata
+            .iter()
+            .find(|entry| entry.key == "general.alignment")
+        {
             Some(entry) => match &entry.value {
                 MetadataValue::Uint32(value) => *value,
                 _ => return Err(GgufError::InvalidAlignmentMetadataType),
@@ -598,14 +619,10 @@ fn minimum_encoded_value_size(value_type: MetadataValueType) -> u64 {
     match value_type {
         MetadataValueType::Uint8 | MetadataValueType::Int8 | MetadataValueType::Bool => 1,
         MetadataValueType::Uint16 | MetadataValueType::Int16 => 2,
-        MetadataValueType::Uint32
-        | MetadataValueType::Int32
-        | MetadataValueType::Float32 => 4,
+        MetadataValueType::Uint32 | MetadataValueType::Int32 | MetadataValueType::Float32 => 4,
         MetadataValueType::String => 8,
         MetadataValueType::Array => 12,
-        MetadataValueType::Uint64
-        | MetadataValueType::Int64
-        | MetadataValueType::Float64 => 8,
+        MetadataValueType::Uint64 | MetadataValueType::Int64 | MetadataValueType::Float64 => 8,
     }
 }
 
@@ -707,36 +724,24 @@ fn read_metadata_value<R: Read + Seek>(
     depth: u32,
 ) -> Result<MetadataValue, GgufError> {
     Ok(match value_type {
-        MetadataValueType::Uint8 => MetadataValue::Uint8(read_u8(
-            reader,
-            file_size,
-            "UINT8 metadata value",
-        )?),
-        MetadataValueType::Int8 => MetadataValue::Int8(read_u8(
-            reader,
-            file_size,
-            "INT8 metadata value",
-        )? as i8),
-        MetadataValueType::Uint16 => MetadataValue::Uint16(read_u16(
-            reader,
-            file_size,
-            "UINT16 metadata value",
-        )?),
-        MetadataValueType::Int16 => MetadataValue::Int16(read_u16(
-            reader,
-            file_size,
-            "INT16 metadata value",
-        )? as i16),
-        MetadataValueType::Uint32 => MetadataValue::Uint32(read_u32(
-            reader,
-            file_size,
-            "UINT32 metadata value",
-        )?),
-        MetadataValueType::Int32 => MetadataValue::Int32(read_u32(
-            reader,
-            file_size,
-            "INT32 metadata value",
-        )? as i32),
+        MetadataValueType::Uint8 => {
+            MetadataValue::Uint8(read_u8(reader, file_size, "UINT8 metadata value")?)
+        }
+        MetadataValueType::Int8 => {
+            MetadataValue::Int8(read_u8(reader, file_size, "INT8 metadata value")? as i8)
+        }
+        MetadataValueType::Uint16 => {
+            MetadataValue::Uint16(read_u16(reader, file_size, "UINT16 metadata value")?)
+        }
+        MetadataValueType::Int16 => {
+            MetadataValue::Int16(read_u16(reader, file_size, "INT16 metadata value")? as i16)
+        }
+        MetadataValueType::Uint32 => {
+            MetadataValue::Uint32(read_u32(reader, file_size, "UINT32 metadata value")?)
+        }
+        MetadataValueType::Int32 => {
+            MetadataValue::Int32(read_u32(reader, file_size, "INT32 metadata value")? as i32)
+        }
         MetadataValueType::Float32 => MetadataValue::Float32(f32::from_bits(read_u32(
             reader,
             file_size,
@@ -795,16 +800,12 @@ fn read_metadata_value<R: Read + Seek>(
                 values,
             }
         }
-        MetadataValueType::Uint64 => MetadataValue::Uint64(read_u64(
-            reader,
-            file_size,
-            "UINT64 metadata value",
-        )?),
-        MetadataValueType::Int64 => MetadataValue::Int64(read_u64(
-            reader,
-            file_size,
-            "INT64 metadata value",
-        )? as i64),
+        MetadataValueType::Uint64 => {
+            MetadataValue::Uint64(read_u64(reader, file_size, "UINT64 metadata value")?)
+        }
+        MetadataValueType::Int64 => {
+            MetadataValue::Int64(read_u64(reader, file_size, "INT64 metadata value")? as i64)
+        }
         MetadataValueType::Float64 => MetadataValue::Float64(f64::from_bits(read_u64(
             reader,
             file_size,
@@ -941,7 +942,10 @@ mod tests {
 
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.alignment, 32);
-        assert_eq!(parsed.metadata_string("general.architecture"), Some("llama"));
+        assert_eq!(
+            parsed.metadata_string("general.architecture"),
+            Some("llama")
+        );
         assert_eq!(parsed.tensors.len(), 1);
         assert_eq!(parsed.tensors[0].name, "token_embd.weight");
         assert_eq!(parsed.tensors[0].dimensions, [4, 8]);
@@ -960,7 +964,11 @@ mod tests {
         push_string(&mut array, "world");
 
         let mut metadata = base_metadata();
-        metadata.push(("tokenizer.ggml.tokens", MetadataValueType::Array as u32, array));
+        metadata.push((
+            "tokenizer.ggml.tokens",
+            MetadataValueType::Array as u32,
+            array,
+        ));
         let bytes = fixture(metadata, &one_tensor(), 128);
         let parsed = GgufFile::parse(&bytes).expect("valid array metadata");
 
