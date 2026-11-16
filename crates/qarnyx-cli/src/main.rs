@@ -55,7 +55,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         workers: usize,
         /// CPU kernel implementation: automatic SIMD dispatch or scalar reference.
-        #[arg(long, value_enum, default_value_t = CpuKernelMode::Auto)]
+        #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.
         #[arg(long, default_value_t = 0x51_4e_52_59_58)]
