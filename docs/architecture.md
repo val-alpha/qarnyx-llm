@@ -122,12 +122,13 @@ a positive finite epsilon. RoPE pairs the first and second halves of one head
 vector, matching the split-half convention used by LLaMA-style rotary
 embeddings. Softmax rejects empty or non-finite inputs.
 
-Q4_K matvec has a fused direct-block dot product in the automatic backend,
-which avoids F32 row materialization but currently uses scalar arithmetic.
-The `simd-dequant` backend mode preserves AVX2/FMA while forcing Q4_K through
-the dequantize-then-dot path so benchmarks can isolate the fusion gain.
-Other quantized formats still use the scalar reference decoder followed by
-the selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
+Q4_K matvec has an opt-in fused direct-block dot product, which avoids F32
+row materialization but currently uses scalar arithmetic. The default
+`auto` backend remains the AVX2/FMA plus row-dequantization baseline.
+Benchmark `auto` against `fused-q4k` to measure the combined impact of
+removing the F32 temporary and changing the Q4_K dot implementation. Other
+quantized formats still use the scalar reference decoder followed by the
+selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
 remain future optimizations. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
 addition currently use scalar implementations.
 
@@ -145,8 +146,8 @@ correctness tests before dispatch is enabled.
 Keep the scalar backend as the correctness reference and dispatch by runtime
 feature detection:
 - x86_64: initial AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: direct fused Q4_K matvec is enabled; fused SIMD arithmetic and
-  fused Q5_K/Q6_K matvec remain to be evaluated;
+- x86_64: opt-in direct fused Q4_K matvec is available; fused SIMD arithmetic
+  and fused Q5_K/Q6_K matvec remain to be evaluated;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
@@ -233,8 +234,8 @@ state against an independent reference before declaring model compatibility.
   output tiles, with scalar fallbacks and differential tests.
 - Benchmark scalar versus runtime dispatch for the supported GGUF storage
   formats on the target VPS.
-- Q4_K direct fused matvec is implemented; benchmark it against SIMD plus
-  dequantization on the target VPS.
+- Q4_K direct fused matvec is implemented as an opt-in mode; benchmark it
+  against the default AVX2 plus dequantization path on the target VPS.
 - Add fused Q5_K/Q6_K matvec kernels and then evaluate fused SIMD arithmetic.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
 - Implement a persistent worker pool, avoid nested scheduling, and measure
