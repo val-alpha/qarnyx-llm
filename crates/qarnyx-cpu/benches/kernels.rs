@@ -250,5 +250,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         benchmark_matmul(&auto_backend, "auto", label, dtype, raw_type)?;
     }
 
+    println!("\nPersistent worker-pool matvec scaling (steady-state, F32 and Q4_K):");
+    for (label, dtype, raw_type) in [("F32", DType::F32, 0), ("Q4_K", DType::Q4K, 12)] {
+        for workers in [1, 2, 4, 6, 8, 10] {
+            let backend = CpuBackend::new(workers)?;
+            benchmark_matvec(
+                &backend,
+                &format!("workers={workers}"),
+                label,
+                dtype,
+                raw_type,
+            )?;
+        }
+    }
+
     Ok(())
 }
