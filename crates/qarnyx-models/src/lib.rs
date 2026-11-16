@@ -8,7 +8,7 @@ mod loader;
 mod qwen35;
 
 pub use loader::{LlamaLayerStorage, LlamaModel, TensorLoadError};
-pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Layer, Qwen35Model};
+pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Layer, Qwen35Model, Qwen35Profile};
 
 use qarnyx_core::{Backend, BackendError, TensorView};
 use qarnyx_gguf::{GgufFile, MetadataValue};
