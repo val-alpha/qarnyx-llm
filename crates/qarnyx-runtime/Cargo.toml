@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+qarnyx-core = { path = "../qarnyx-core" }
+qarnyx-models = { path = "../qarnyx-models" }
+qarnyx-tokenizer = { path = "../qarnyx-tokenizer" }
+thiserror.workspace = true
+
 [lints]
 workspace = true
