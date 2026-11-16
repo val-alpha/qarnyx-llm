@@ -97,7 +97,8 @@ naive bits-per-element multiplication.
 ## Backend contract
 
 Models call backend operations and do not select AVX intrinsics themselves.
-The CPU backend selects a kernel once per operation or kernel family based on
+The current CPU backend uses scalar kernels. Once optimized implementations
+are added, it will select a kernel per operation or kernel family based on
 runtime CPU feature detection.
 
 The scalar CPU backend implements:
