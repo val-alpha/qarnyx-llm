@@ -75,8 +75,8 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Status) | None => {
             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
-            println!("GGUF v3 parsing, scalar quantization, LLaMA forward/KV cache, and generation are implemented.");
-            println!("Use 'qarnyx generate <model.gguf> <prompt>' for LLaMA-compatible GGUF generation.");
+            println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
+            println!("Use 'qarnyx generate <model.gguf> <prompt> --cpu-kernel auto|scalar' to select CPU kernels.");
         }
         Some(Command::Inspect {
             model,
