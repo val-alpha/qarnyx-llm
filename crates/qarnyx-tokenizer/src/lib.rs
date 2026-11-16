@@ -295,6 +295,29 @@ mod tests {
     use qarnyx_gguf::{MetadataEntry, MetadataValue};
 
     #[test]
+    fn encodes_merge_based_vocabulary() {
+        let tokenizer = GgufTokenizer {
+            model: "test-bpe".into(),
+            pre: None,
+            tokens: vec![
+                "h".into(),
+                "e".into(),
+                "l".into(),
+                "o".into(),
+                "he".into(),
+                "ll".into(),
+                "hello".into(),
+            ],
+            scores: vec![0.0; 7],
+            merges: vec!["h e".into(), "l l".into(), "he l".into(), "hel lo".into()],
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        assert_eq!(tokenizer.encode("hello").unwrap(), [6]);
+    }
+
+    #[test]
     fn loads_vocab_and_special_tokens() {
         let gguf = GgufFile {
             version: 3,
