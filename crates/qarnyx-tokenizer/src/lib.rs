@@ -75,6 +75,47 @@ impl GgufTokenizer {
         self.tokens.len()
     }
 
+    /// Encodes text using a deterministic longest-vocabulary-piece matcher.
+    ///
+    /// This is intentionally a baseline M5 encoder. It is suitable for
+    /// vocabularies whose token strings directly represent input pieces; a
+    /// model-specific BPE/SentencePiece pre-tokenizer will replace this path
+    /// before production compatibility work.
+    pub fn encode(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tokens = Vec::new();
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let tail = &text[cursor..];
+            let mut best: Option<(usize, usize)> = None;
+
+            for (token_id, token) in self.tokens.iter().enumerate() {
+                if token.is_empty() || !tail.starts_with(token) {
+                    continue;
+                }
+                let token_len = token.len();
+                if best.map(|(_, len)| token_len > len).unwrap_or(true) {
+                    best = Some((token_id, token_len));
+                }
+            }
+
+            let Some((token_id, token_len)) = best else {
+                return Err(TokenizerError::InvalidMetadata {
+                    key: "tokenizer.ggml.tokens",
+                    expected: "vocabulary covering the input text",
+                });
+            };
+
+            tokens.push(token_id);
+            cursor += token_len;
+        }
+
+        Ok(tokens)
+    }
+
     /// Converts generated token IDs back to their GGUF token strings.
     pub fn decode(&self, token_ids: &[usize]) -> Result<String, TokenizerError> {
         let mut output = String::new();
