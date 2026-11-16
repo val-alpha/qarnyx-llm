@@ -1,9 +1,13 @@
 use std::fs::File;
 use std::io::BufReader;
+use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use qarnyx_gguf::GgufFile;
+use qarnyx_models::LlamaModel;
+use qarnyx_runtime::{GenerationConfig, LlamaGenerator};
+use qarnyx_tokenizer::GgufTokenizer;
 
 /// Qarnyx command-line interface.
 #[derive(Debug, Parser)]
@@ -29,6 +33,31 @@ enum Command {
         #[arg(long)]
         list_tensors: bool,
     },
+    /// Run CPU autoregressive generation from a LLaMA-compatible GGUF.
+    Generate {
+        /// Path to a GGUF v3 LLaMA model.
+        model: PathBuf,
+        /// Prompt text.
+        prompt: String,
+        /// Maximum number of generated tokens.
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+        /// Sampling temperature; zero selects greedy decoding.
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f32,
+        /// Top-k sampling cutoff; zero disables top-k.
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// Nucleus sampling cutoff.
+        #[arg(long, default_value_t = 0.95)]
+        top_p: f32,
+        /// Worker count for the CPU backend.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
+        /// RNG seed.
+        #[arg(long, default_value_t = 0x51_4e_52_59_58)]
+        seed: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -36,14 +65,24 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Status) | None => {
-            println!("Qarnyx 0.1.0 - GGUF v3 reader and M2 quantization reference implemented");
-            println!("Scalar F32/F16, Q4_0/Q8_0, Q4_K/Q5_K/Q6_K decoding is available.");
-            println!("Transformer inference and text generation are not implemented yet.");
+            println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
+            println!("GGUF v3 parsing, scalar quantization, LLaMA forward/KV cache, and generation are implemented.");
+            println!("Use 'qarnyx generate <model.gguf> <prompt>' for LLaMA-compatible GGUF generation.");
         }
         Some(Command::Inspect {
             model,
             list_tensors,
         }) => inspect_model(&model, list_tensors)?,
+        Some(Command::Generate {
+            model,
+            prompt,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            workers,
+            seed,
+        }) => generate_model(&model, &prompt, max_new_tokens, temperature, top_k, top_p, workers, seed)?,
     }
 
     Ok(())
@@ -92,5 +131,40 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
 
     println!();
     println!("Tensor payloads were not read into memory.");
+    Ok(())
+}
+
+fn generate_model(
+    path: &std::path::Path,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    workers: usize,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let data = fs::read(path)?;
+    let gguf = GgufFile::parse(&data)?;
+    let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
+    let model = LlamaModel::from_gguf(&gguf, &data)?;
+    let backend = qarnyx_cpu::CpuBackend::new(workers)?;
+    let mut generator = LlamaGenerator::new(seed);
+
+    let result = generator.generate(
+        &model,
+        &tokenizer,
+        &backend,
+        prompt,
+        GenerationConfig {
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        },
+    )?;
+
+    println!("{}", result.text);
     Ok(())
 }
