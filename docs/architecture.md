@@ -114,17 +114,21 @@ The CPU backend implements:
 Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
-remains specific to the tensor type. Matrix kernels validate exact encoded
-storage lengths and decode only the active weight row into a reusable F32
-scratch buffer; they do not materialize a full F32 matrix. RMSNorm requires a
-positive finite epsilon. RoPE pairs the first and second halves of one head
+remains specific to the tensor type. Matrix kernels validate exact encoded storage lengths and do not materialize
+a full F32 matrix. The automatic Q4_K matvec path evaluates each packed block
+directly and avoids the temporary F32 row; other quantized matvec/matmul paths
+decode only the active weight row into reusable F32 scratch. RMSNorm requires
+a positive finite epsilon. RoPE pairs the first and second halves of one head
 vector, matching the split-half convention used by LLaMA-style rotary
 embeddings. Softmax rejects empty or non-finite inputs.
 
-Quantized matrix rows are still dequantized by the scalar reference decoder
-into one reusable F32 scratch row before the SIMD dot product. This avoids
-expanding a complete quantized matrix, but fused quantized SIMD kernels remain
-a future optimization. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
+Q4_K matvec has a fused direct-block dot product in the automatic backend,
+which avoids F32 row materialization but currently uses scalar arithmetic.
+The `simd-dequant` backend mode preserves AVX2/FMA while forcing Q4_K through
+the dequantize-then-dot path so benchmarks can isolate the fusion gain.
+Other quantized formats still use the scalar reference decoder followed by
+the selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
+remain future optimizations. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
 addition currently use scalar implementations.
 
 The `workers` setting is currently retained as configuration only; it does
@@ -141,7 +145,8 @@ correctness tests before dispatch is enabled.
 Keep the scalar backend as the correctness reference and dispatch by runtime
 feature detection:
 - x86_64: initial AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: fused quantized matvec and AVX-512 remain to be evaluated;
+- x86_64: direct fused Q4_K matvec is enabled; fused SIMD arithmetic and
+  fused Q5_K/Q6_K matvec remain to be evaluated;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
@@ -228,7 +233,9 @@ state against an independent reference before declaring model compatibility.
   output tiles, with scalar fallbacks and differential tests.
 - Benchmark scalar versus runtime dispatch for the supported GGUF storage
   formats on the target VPS.
-- Add fused Q4_K/Q5_K/Q6_K matvec kernels to remove the scalar F32 row decode.
+- Q4_K direct fused matvec is implemented; benchmark it against SIMD plus
+  dequantization on the target VPS.
+- Add fused Q5_K/Q6_K matvec kernels and then evaluate fused SIMD arithmetic.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
 - Implement a persistent worker pool, avoid nested scheduling, and measure
   worker scaling rather than assuming more workers are faster.
