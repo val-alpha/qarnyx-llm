@@ -100,18 +100,28 @@ Models call backend operations and do not select AVX intrinsics themselves.
 The CPU backend selects a kernel once per operation or kernel family based on
 runtime CPU feature detection.
 
-The initial contract covers:
+The scalar CPU backend implements:
 - matrix-vector multiplication for decode;
 - matrix multiplication for prompt prefill;
 - RMSNorm;
-- RoPE;
-- softmax;
-- SiLU and elementwise multiply.
+- split-half LLaMA-style RoPE;
+- numerically stable softmax;
+- SiLU multiplied by the up projection;
+- in-place residual addition.
 
-Document tensor layout and dimensions for every operation. For example,
-matvec weights use [out_features, in_features] row-major logical shape and
-produce out_features values. The physical quantized block layout remains
-specific to the tensor type.
+Matvec weights use [out_features, in_features] row-major logical shape and
+produce out_features values. Matmul weights are [m, k], the row-major input is
+[k, n], and the row-major output is [m, n]. The physical quantized block layout
+remains specific to the tensor type. Matrix kernels validate exact encoded
+storage lengths and decode only the active weight row into a reusable F32
+scratch buffer; they do not materialize a full F32 matrix. RMSNorm requires a
+positive finite epsilon. RoPE pairs the first and second halves of one head
+vector, matching the split-half convention used by LLaMA-style rotary
+embeddings. Softmax rejects empty or non-finite inputs.
+
+The first implementation is scalar and single-threaded even when a worker
+count greater than one is configured. The CPU microbenchmark target is run
+with `cargo bench -p qarnyx-cpu --bench kernels`.
 
 The scalar implementation is the correctness oracle. SIMD implementations
 must be compared against it with documented tolerances. Do not enable a SIMD
@@ -183,10 +193,15 @@ end-to-end correctness tests.
 - Add type, size, row-alignment, decoder, truncation, and overlap tests.
 - Expand the registry only when a new GGML layout has a verified reference.
 
-### M3 - Scalar tensor engine
-- Implement matvec, matmul, RMSNorm, RoPE, softmax, SiLU, and residual ops.
-- Test shape errors and numerical behavior.
-- Add benchmarks before SIMD work.
+### M3 - Scalar tensor engine (initial implementation)
+- Implement scalar matvec and matmul with row-at-a-time dequantization for
+  registered F32/F16 and Q4_0/Q8_0/Q4_K/Q5_K/Q6_K weight types.
+- Implement RMSNorm, split-half LLaMA-style RoPE, stable softmax, SiLU-times-up,
+  and residual addition.
+- Test shape errors, invalid scalar parameters, and numerical behavior.
+- Add dependency-free scalar matvec/matmul microbenchmarks before SIMD work.
+- Keep kernels single-threaded and use them as the correctness reference for
+  later SIMD implementations.
 
 ### M4 - First model forward pass
 - Load one supported LLaMA-style GGUF model.
