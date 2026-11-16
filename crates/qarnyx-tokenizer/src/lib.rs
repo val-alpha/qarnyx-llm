@@ -331,7 +331,7 @@ fn qwen35_pre_tokenize(text: &str) -> Vec<(usize, String)> {
 
         let ch = chars[j].1;
         if ch.is_alphabetic() || ch.is_mark() {
-            while j < chars.len() && (chars[j].1.is_alphabetic() || chars[j].1.is_mark()) {
+            while j < chars.len() && (chars[j].1.is_alphabetic()) {
                 piece.push(chars[j].1);
                 j += 1;
             }
@@ -341,7 +341,7 @@ fn qwen35_pre_tokenize(text: &str) -> Vec<(usize, String)> {
         } else if !ch.is_whitespace() {
             while j < chars.len() {
                 let c = chars[j].1;
-                if c.is_whitespace() || c.is_alphabetic() || c.is_mark() || c.is_numeric() {
+                if c.is_whitespace() || c.is_alphabetic() || c.is_numeric() {
                     break;
                 }
                 piece.push(c);
