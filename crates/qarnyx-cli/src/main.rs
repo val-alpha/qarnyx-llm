@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use qarnyx_gguf::GgufFile;
-use qarnyx_models::LlamaModel;
-use qarnyx_runtime::{GenerationConfig, LlamaGenerator};
+use qarnyx_models::{LlamaModel, Qwen35Model};
+use qarnyx_runtime::{GenerationConfig, LlamaGenerator, Qwen35Generator};
 use qarnyx_tokenizer::GgufTokenizer;
 
 /// Qarnyx command-line interface.
@@ -33,7 +33,7 @@ enum Command {
         #[arg(long)]
         list_tensors: bool,
     },
-    /// Run CPU autoregressive generation from a LLaMA-compatible GGUF.
+    /// Run CPU autoregressive generation from a supported GGUF architecture.
     Generate {
         /// Path to a GGUF v3 LLaMA model.
         model: PathBuf,
@@ -147,24 +147,31 @@ fn generate_model(
     let data = fs::read(path)?;
     let gguf = GgufFile::parse(&data)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
-    let model = LlamaModel::from_gguf(&gguf, &data)?;
     let backend = qarnyx_cpu::CpuBackend::new(workers)?;
-    let mut generator = LlamaGenerator::new(seed);
+    let config = GenerationConfig {
+        max_new_tokens,
+        temperature,
+        top_k,
+        top_p,
+        seed,
+    };
 
-    let result = generator.generate(
-        &model,
-        &tokenizer,
-        &backend,
-        prompt,
-        GenerationConfig {
-            max_new_tokens,
-            temperature,
-            top_k,
-            top_p,
-            seed,
-        },
-    )?;
+    match gguf.metadata_string("general.architecture") {
+        Some("qwen35") => {
+            let model = Qwen35Model::from_gguf(&gguf, &data)?;
+            let mut generator = Qwen35Generator::new(seed);
+            let result = generator.generate(&model, &tokenizer, &backend, prompt, config)?;
+            println!("{}", result.text);
+        }
+        Some("llama") => {
+            let model = LlamaModel::from_gguf(&gguf, &data)?;
+            let mut generator = LlamaGenerator::new(seed);
+            let result = generator.generate(&model, &tokenizer, &backend, prompt, config)?;
+            println!("{}", result.text);
+        }
+        Some(other) => anyhow::bail!("unsupported model architecture: {other}"),
+        None => anyhow::bail!("GGUF is missing general.architecture metadata"),
+    }
 
-    println!("{}", result.text);
     Ok(())
 }
