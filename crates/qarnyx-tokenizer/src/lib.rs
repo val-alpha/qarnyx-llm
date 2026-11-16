@@ -310,35 +310,36 @@ fn qwen35_pre_tokenize(text: &str) -> Vec<(usize, String)> {
         let mut j = i;
         let mut piece = String::new();
 
-        if chars[j].1.is_whitespace() {
-            if chars[j].1 == '\\n' || chars[j].1 == '\\r' {
-                while j < chars.len() && (chars[j].1 == '\\n' || chars[j].1 == '\\r') {
-                    piece.push(chars[j].1);
-                    j += 1;
-                }
-                pieces.push((start, piece));
-                i = j;
-                continue;
-            }
-
-            piece.push(chars[j].1);
-            j += 1;
-            if j == chars.len() {
-                pieces.push((start, piece));
-                break;
-            }
-        }
-
-        let ch = chars[j].1;
-        if ch.is_alphabetic() || ch.is_mark() {
-            while j < chars.len() && (chars[j].1.is_alphabetic()) {
+        if chars[j].1 == '\n' || chars[j].1 == '\r' {
+            while j < chars.len() && (chars[j].1 == '\n' || chars[j].1 == '\r') {
                 piece.push(chars[j].1);
                 j += 1;
             }
-        } else if ch.is_numeric() {
-            piece.push(ch);
+            pieces.push((start, piece));
+            i = j;
+            continue;
+        }
+
+        if chars[j].1 == ' ' && j + 1 < chars.len() {
+            let next = chars[j + 1].1;
+            if next.is_alphabetic() {
+                piece.push(' ');
+                j += 1;
+            } else if !next.is_whitespace() && !next.is_alphabetic() && !next.is_numeric() {
+                piece.push(' ');
+                j += 1;
+            }
+        }
+
+        if j < chars.len() && (chars[j].1.is_alphabetic()) {
+            while j < chars.len() && chars[j].1.is_alphabetic() {
+                piece.push(chars[j].1);
+                j += 1;
+            }
+        } else if j < chars.len() && chars[j].1.is_numeric() {
+            piece.push(chars[j].1);
             j += 1;
-        } else if !ch.is_whitespace() {
+        } else if j < chars.len() && !chars[j].1.is_whitespace() {
             while j < chars.len() {
                 let c = chars[j].1;
                 if c.is_whitespace() || c.is_alphabetic() || c.is_numeric() {
@@ -347,7 +348,7 @@ fn qwen35_pre_tokenize(text: &str) -> Vec<(usize, String)> {
                 piece.push(c);
                 j += 1;
             }
-        } else {
+        } else if j < chars.len() {
             while j < chars.len() && chars[j].1.is_whitespace() {
                 piece.push(chars[j].1);
                 j += 1;
