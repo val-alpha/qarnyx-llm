@@ -47,7 +47,7 @@ pub enum TensorLoadError {
 }
 
 impl TensorLoadError {
-    fn expected_shape(name: &str, actual: &[u64], expected: &[usize]) -> Self {
+    pub(crate) fn expected_shape(name: &str, actual: &[u64], expected: &[usize]) -> Self {
         Self::ShapeMismatch {
             name: name.into(),
             actual: actual.to_vec(),
