@@ -11,5 +11,8 @@ qarnyx-models = { path = "../qarnyx-models" }
 qarnyx-tokenizer = { path = "../qarnyx-tokenizer" }
 thiserror.workspace = true
 
+[dev-dependencies]
+qarnyx-cpu = { path = "../qarnyx-cpu" }
+
 [lints]
 workspace = true
