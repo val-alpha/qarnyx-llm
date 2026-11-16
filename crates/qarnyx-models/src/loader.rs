@@ -240,11 +240,28 @@ fn load_weight<'a>(
     expected: &[usize],
 ) -> Result<TensorView<'a>, TensorLoadError> {
     let tensor = find_tensor(gguf, name)?;
-    validate_shape(tensor, expected)?;
+    validate_matrix_shape(tensor, expected)?;
     let dtype = dtype_from_ggml(tensor)?;
     let bytes = tensor_bytes(tensor, data)?;
 
+    // GGUF stores ggml matrix dimensions as [columns, rows]. The CPU
+    // backend exposes the logical matrix as [rows, columns].
     Ok(TensorView::new(bytes, leaked_shape(expected), dtype))
+}
+
+fn validate_matrix_shape(tensor: &TensorInfo, expected: &[usize]) -> Result<(), TensorLoadError> {
+    if expected.len() != 2
+        || tensor.dimensions.len() != 2
+        || tensor.dimensions[0] != expected[1] as u64
+        || tensor.dimensions[1] != expected[0] as u64
+    {
+        return Err(TensorLoadError::expected_shape(
+            &tensor.name,
+            &tensor.dimensions,
+            &[expected[1], expected[0]],
+        ));
+    }
+    Ok(())
 }
 
 fn load_f32_tensor(
@@ -401,12 +418,12 @@ mod tests {
             (
                 "blk.0.attn_k.weight",
                 vec![0.0; 8],
-                vec![2, 4],
+                vec![4, 2],
             ),
             (
                 "blk.0.attn_v.weight",
                 vec![0.0; 8],
-                vec![2, 4],
+                vec![4, 2],
             ),
             (
                 "blk.0.attn_output.weight",
