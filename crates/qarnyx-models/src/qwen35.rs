@@ -325,11 +325,18 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
 
 fn rms0(x:&[f32],w:&[f32],eps:f32)->Result<Vec<f32>,ModelError>{
     if x.len()!=w.len(){return Err(ModelError::ShapeMismatch("Qwen3.5 RMSNorm shape mismatch".into()));}
+    // Qwen3.5 GGUF stores the effective RMSNorm scale. The +1 offset used
+    // by the source model is folded into the GGUF norm weights, so runtime
+    // inference must apply the weight directly (matching llama.cpp).
     let m=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>()/x.len() as f64;
     let inv=(m+f64::from(eps)).sqrt().recip() as f32;
-    Ok(x.iter().zip(w).map(|(a,b)|a*inv*(1.0+b)).collect())
+    Ok(x.iter().zip(w).map(|(a,b)|a*inv*b).collect())
 }
-fn headnorm(x:&mut[f32],w:&[f32],eps:f32){let m=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>()/x.len() as f64;let inv=(m+f64::from(eps)).sqrt().recip() as f32;for(i,a)in x.iter_mut().enumerate(){*a*=inv*(1.0+w[i]);}}
+fn headnorm(x:&mut[f32],w:&[f32],eps:f32){
+    let m=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>()/x.len() as f64;
+    let inv=(m+f64::from(eps)).sqrt().recip() as f32;
+    for(i,a)in x.iter_mut().enumerate(){*a*=inv*w[i];}
+}
 fn l2(x:&mut[f32]){let s=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>();let inv=(s+1e-6).sqrt().recip() as f32;for v in x{*v*=inv;}}
 fn rope(x:&mut[f32],theta:f32,pos:usize){\n    // Qwen3.5 uses the standard split-half rotate_half operation on its\n    // 64-dimensional rotary slice. The MRoPE frequency layout is\n    // interleaved, but the vector rotation itself is not adjacent-pair RoPE.\n    let half=ROPE/2;\n    for i in 0..half {\n        let a=(pos as f32)*theta.powf(-((2*i)as f32)/ROPE as f32);\n        let(c,s)=(a.cos(),a.sin());\n        let u=x[i];\n        let v=x[i+half];\n        x[i]=u*c-v*s;\n        x[i+half]=u*s+v*c;\n    }\n}
 fn dot(a:&[f32],b:&[f32])->f32{a.iter().zip(b).map(|(x,y)|x*y).sum()}
