@@ -7,13 +7,14 @@ Qarnyx is an experimental, Rust-native, CPU-first inference runtime for
 models. It is being designed from scratch around quantized CPU kernels,
 explicit memory ownership, and predictable resource usage.
 
-> **Project status: early development.** The GGUF v3 reader streams metadata
-> and tensor descriptors and validates complete tensor byte ranges without
-> loading weight payloads into memory. Scalar reference decoding is implemented
-> for F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The initial scalar CPU tensor
-> engine now includes matvec, matmul, RMSNorm, split-half RoPE, softmax,
-> SiLU-times-up, and residual add. Transformer execution, tokenization, and
-> text generation are not implemented yet.
+> **Project status: early development.** The GGUF v3 reader validates tensor
+> descriptors and payload ranges without loading weights during inspection.
+> Scalar decoders support F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The CPU
+> backend provides scalar reference kernels plus runtime-dispatched AVX2/FMA
+> matvec dot products and matmul output tiles on supported x86_64 hosts.
+> Experimental Qwen3.5 2B GGUF loading and text generation are implemented;
+> numerical validation, quantized-kernel fusion, and worker-pool scheduling
+> remain in progress.
 
 ## Design goals
 
@@ -40,9 +41,9 @@ measure performance on the same hardware as its benchmarks.
 | qarnyx-core | Tensor views, data types, backend contracts, shared errors |
 | qarnyx-gguf | GGUF v3 header, metadata, tensor directory, structural validation |
 | qarnyx-quant | Quantization block layouts and reference decoders |
-| qarnyx-cpu | Scalar CPU kernels, SIMD dispatch, CPU execution |
+| qarnyx-cpu | Scalar/SIMD CPU kernels, feature detection, CPU execution |
 | qarnyx-tokenizer | Tokenizer metadata and tokenization |
-| qarnyx-models | Transformer model definitions, starting with LLaMA-style models |
+| qarnyx-models | Model definitions, including the experimental Qwen3.5 path |
 | qarnyx-runtime | Prefill, decode, KV cache, sampling, generation |
 | qarnyx-cli | Command-line interface |
 
@@ -73,16 +74,16 @@ Q5_K, and Q6_K. Unknown GGML types are rejected rather than assigned guessed
 sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
-The scalar CPU backend executes matrix-vector and matrix-matrix operations
-with all currently registered storage types. Quantized matrices are decoded
-one row at a time into a reusable F32 scratch buffer; the full weight matrix is
-not expanded. RMSNorm, split-half LLaMA-style RoPE, stable softmax,
-SiLU-times-up, and residual addition are also available as scalar reference
-operations.
-The initial kernels are single-threaded; runtime SIMD dispatch and persistent
-worker scheduling remain later milestones.
+The CPU backend executes matrix-vector and matrix-matrix operations with all
+currently registered storage types. Quantized matrices are decoded one row at
+a time into a reusable F32 scratch buffer; the full weight matrix is not
+expanded. On supported x86_64 hosts, AVX2/FMA accelerates matvec dot products
+and matmul output tiles; all other operations retain scalar reference paths.
+Worker scheduling is not active yet, so `--workers` does not currently create
+parallel threads.
 
-Run the dependency-free scalar microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
+Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
+The harness compares the scalar reference backend with runtime dispatch.
 
 ## Development
 
@@ -113,12 +114,14 @@ portable binaries without an appropriate dispatch/build strategy.
    matvec, matmul, RMSNorm, split-half RoPE, softmax, SiLU-times-up, and
    residual addition. Shape/numerical tests and a dependency-free microbenchmark
    harness are included.
-5. **M4 - First model forward pass:** implement and validate one LLaMA-style
-   model against an independent reference.
+5. **M4 - Model forward pass:** implement and validate the experimental
+   Qwen3.5 hybrid path against an independent reference; retain the legacy
+   LLaMA path separately.
 6. **M5 - Tokenization and generation:** add prefill, incremental decode,
    bounded KV cache, stopping rules, and sampling.
-7. **M6 - CPU optimization:** add runtime-dispatched SIMD kernels and a
-   persistent worker pool.
+7. **M6 - CPU optimization:** initial x86_64 AVX2/FMA matvec and matmul kernels
+   are implemented with scalar fallbacks and scalar-vs-runtime benchmarks.
+   Quantized fused kernels, NEON, and a persistent worker pool remain planned.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
 
