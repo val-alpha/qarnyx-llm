@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-kernforge-runtime = { path = "../kernforge-runtime" }
 
 [lints]
 workspace = true
