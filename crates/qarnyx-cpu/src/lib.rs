@@ -729,6 +729,72 @@ mod tests {
     }
 
     #[test]
+    fn scalar_backend_disables_simd_dispatch() {
+        let scalar = CpuBackend::new_scalar(1).expect("scalar backend");
+        let automatic = CpuBackend::new(1).expect("automatic backend");
+        assert!(!scalar.uses_avx2());
+        assert_eq!(automatic.uses_avx2(), automatic.features().avx2);
+    }
+
+    #[test]
+    fn avx2_matvec_and_matmul_match_scalar_reference() {
+        let (m, k, n) = (17, 65, 13);
+        let weight_values = (0..m * k)
+            .map(|index| ((index % 37) as f32 - 18.0) / 23.0)
+            .collect::<Vec<_>>();
+        let weight_bytes = f32_bytes(&weight_values);
+        let shape = [m, k];
+        let weights = TensorView::new(&weight_bytes, &shape, DType::F32);
+        let vector = (0..k)
+            .map(|index| ((index % 19) as f32 - 9.0) / 17.0)
+            .collect::<Vec<_>>();
+        let matrix = (0..k * n)
+            .map(|index| ((index % 29) as f32 - 14.0) / 31.0)
+            .collect::<Vec<_>>();
+
+        let scalar = CpuBackend::new_scalar(1).expect("scalar backend");
+        let automatic = CpuBackend::new(1).expect("automatic backend");
+
+        let mut scalar_vector_output = vec![0.0; m];
+        let mut automatic_vector_output = vec![0.0; m];
+        scalar
+            .matvec(weights, &vector, &mut scalar_vector_output)
+            .unwrap();
+        automatic
+            .matvec(weights, &vector, &mut automatic_vector_output)
+            .unwrap();
+
+        for (expected, actual) in scalar_vector_output
+            .iter()
+            .zip(&automatic_vector_output)
+        {
+            assert!(
+                (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
+                "matvec mismatch: scalar={expected}, automatic={actual}"
+            );
+        }
+
+        let mut scalar_matrix_output = vec![0.0; m * n];
+        let mut automatic_matrix_output = vec![0.0; m * n];
+        scalar
+            .matmul(weights, &matrix, &mut scalar_matrix_output, m, n, k)
+            .unwrap();
+        automatic
+            .matmul(weights, &matrix, &mut automatic_matrix_output, m, n, k)
+            .unwrap();
+
+        for (expected, actual) in scalar_matrix_output
+            .iter()
+            .zip(&automatic_matrix_output)
+        {
+            assert!(
+                (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
+                "matmul mismatch: scalar={expected}, automatic={actual}"
+            );
+        }
+    }
+
+    #[test]
     fn computes_f32_matvec() {
         let bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let shape = [2, 3];
