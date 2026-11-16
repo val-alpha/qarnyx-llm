@@ -10,5 +10,8 @@ qarnyx-core = { path = "../qarnyx-core" }
 qarnyx-gguf = { path = "../qarnyx-gguf" }
 thiserror.workspace = true
 
+[dev-dependencies]
+qarnyx-cpu = { path = "../qarnyx-cpu" }
+
 [lints]
 workspace = true
