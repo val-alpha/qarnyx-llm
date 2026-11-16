@@ -548,17 +548,12 @@ mod tests {
 
     #[test]
     fn computes_f16_and_q8_0_matvec() {
-        let mut f16_bytes = Vec::new();
-        for value in [1.0_f32, -2.0, 2.0, 3.0] {
-            let bits = match value {
-                1.0 => 0x3c00_u16,
-                -2.0 => 0xc000_u16,
-                2.0 => 0x4000_u16,
-                3.0 => 0x4200_u16,
-                _ => unreachable!(),
-            };
-            f16_bytes.extend_from_slice(&bits.to_le_bytes());
-        }
+        let f16_bytes = [
+            0x00_u8, 0x3c, // 1.0
+            0x00, 0xc0, // -2.0
+            0x00, 0x40, // 2.0
+            0x00, 0x42, // 3.0
+        ];
         let shape = [2, 2];
         let weights = TensorView::new(&f16_bytes, &shape, DType::F16);
         let mut output = [0.0; 2];
