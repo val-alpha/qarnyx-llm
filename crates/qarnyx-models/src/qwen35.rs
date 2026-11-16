@@ -255,9 +255,22 @@ fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32
     let x=rms0(input,w.attn_norm,c.rms_epsilon)?;
     let mut qg=vec![0.0;Q*2]; let mut k=vec![0.0;KV]; let mut v=vec![0.0;KV];
     b.matvec(w.q,&x,&mut qg)?; b.matvec(w.k,&x,&mut k)?; b.matvec(w.v,&x,&mut v)?;
-    let mut q=qg[..Q].to_vec();
-    for h in 0..FH { headnorm(&mut q[h*FHD..(h+1)*FHD],w.q_norm,c.rms_epsilon); rope(&mut q[h*FHD..h*FHD+ROPE],c.rope_theta,pos); }
-    for h in 0..2 { headnorm(&mut k[h*FHD..(h+1)*FHD],w.k_norm,c.rms_epsilon); rope(&mut k[h*FHD..h*FHD+ROPE],c.rope_theta,pos); }
+    // GGUF q_proj stores each attention head as [query | gate], not
+    // [all queries | all gates]. Deinterleave before applying q_norm/RoPE.
+    let mut q = vec![0.0; Q];
+    let mut gate = vec![0.0; Q];
+    for h in 0..FH {
+        let src = h * FHD * 2;
+        let dst = h * FHD;
+        q[dst..dst + FHD].copy_from_slice(&qg[src..src + FHD]);
+        gate[dst..dst + FHD].copy_from_slice(&qg[src + FHD..src + FHD * 2]);
+        headnorm(&mut q[dst..dst + FHD], w.q_norm, c.rms_epsilon);
+        rope(&mut q[dst..dst + ROPE], c.rope_theta, pos);
+    }
+    for h in 0..2 {
+        headnorm(&mut k[h*FHD..(h+1)*FHD], w.k_norm, c.rms_epsilon);
+        rope(&mut k[h*FHD..h*FHD+ROPE], c.rope_theta, pos);
+    }
     keys.extend_from_slice(&k); values.extend_from_slice(&v);
     let seq=keys.len()/KV; let mut a=vec![0.0;Q];
     for qh in 0..FH {
@@ -266,7 +279,7 @@ fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32
         softmax(&mut s);
         for t in 0..seq { let vb=t*KV+kh*FHD; for j in 0..FHD { a[qb+j]+=s[t]*values[vb+j]; } }
     }
-    for i in 0..Q { a[i]*=sigmoid(qg[Q+i]); }
+    for i in 0..Q { a[i] *= sigmoid(gate[i]); }
     let mut y=vec![0.0;H]; b.matvec(w.out,&a,&mut y)?; add(&mut y,input);
     ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y)
 }
