@@ -437,8 +437,13 @@ mod tests {
 
     #[test]
     fn decodes_f32_and_f16_values() {
-        let f32_bytes = [1.0_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat();
-        assert_eq!(dequantize(0, &[2], &f32_bytes).unwrap(), [1.0, -2.0]);
+        let mut f32_bytes = Vec::new();
+        f32_bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        f32_bytes.extend_from_slice(&(-2.0_f32).to_le_bytes());
+        assert_eq!(
+            dequantize(0, &[2], &f32_bytes).unwrap(),
+            vec![1.0, -2.0]
+        );
 
         let f16_bytes = [0x3c_u8, 0x00, 0x00, 0xc0, 0x01, 0x00];
         let decoded = dequantize(1, &[3], &f16_bytes).unwrap();
