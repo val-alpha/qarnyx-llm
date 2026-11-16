@@ -558,9 +558,7 @@ mod tests {
         let weights = TensorView::new(&f16_bytes, &shape, DType::F16);
         let mut output = [0.0; 2];
 
-        backend()
-            .matvec(weights, &[2.0, 1.0], &mut output)
-            .unwrap();
+        backend().matvec(weights, &[2.0, 1.0], &mut output).unwrap();
 
         assert_eq!(output, [0.0, 7.0]);
 
@@ -573,9 +571,7 @@ mod tests {
         let weights = TensorView::new(&q8_bytes, &shape, DType::Q8_0);
         let mut output = [0.0; 2];
 
-        backend()
-            .matvec(weights, &[1.0; 32], &mut output)
-            .unwrap();
+        backend().matvec(weights, &[1.0; 32], &mut output).unwrap();
 
         assert_eq!(output, [32.0, -32.0]);
     }
@@ -586,7 +582,7 @@ mod tests {
         let shape = [2, 256];
 
         let mut q4_k = vec![0_u8; 144 * 2];
-        for (row, scale, quant) in [(0, 1_u16, 0x11), (1, 1_u16, 0x22)] {
+        for (row, scale, quant) in [(0, 0x3c00_u16, 0x11), (1, 0x3c00_u16, 0x22)] {
             let base = row * 144;
             q4_k[base..base + 2].copy_from_slice(&scale.to_le_bytes());
             q4_k[base + 4] = if row == 0 { 1 } else { 2 };
