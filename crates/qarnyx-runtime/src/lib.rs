@@ -153,8 +153,6 @@ mod tests {
     }
 
 
-    use super::*;
-
     #[test]
     fn greedy_sampling_is_deterministic() {
         let mut generator = LlamaGenerator::new(7);
