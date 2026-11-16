@@ -3,7 +3,7 @@ use std::io::BufReader;
 use std::fs;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use qarnyx_gguf::GgufFile;
 use qarnyx_models::{LlamaModel, Qwen35Model};
 use qarnyx_runtime::{GenerationConfig, LlamaGenerator, Qwen35Generator};
@@ -54,10 +54,19 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
+        /// CPU kernel implementation: automatic SIMD dispatch or scalar reference.
+        #[arg(long, value_enum, default_value_t = CpuKernelMode::Auto)]
+        cpu_kernel: CpuKernelMode,
         /// RNG seed.
         #[arg(long, default_value_t = 0x51_4e_52_59_58)]
         seed: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CpuKernelMode {
+    Auto,
+    Scalar,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -81,8 +90,19 @@ fn main() -> anyhow::Result<()> {
             top_k,
             top_p,
             workers,
+            cpu_kernel,
             seed,
-        }) => generate_model(&model, &prompt, max_new_tokens, temperature, top_k, top_p, workers, seed)?,
+        }) => generate_model(
+            &model,
+            &prompt,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            workers,
+            cpu_kernel,
+            seed,
+        )?,
     }
 
     Ok(())
@@ -142,12 +162,16 @@ fn generate_model(
     top_k: usize,
     top_p: f32,
     workers: usize,
+    cpu_kernel: CpuKernelMode,
     seed: u64,
 ) -> anyhow::Result<()> {
     let data = fs::read(path)?;
     let gguf = GgufFile::parse(&data)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
-    let backend = qarnyx_cpu::CpuBackend::new(workers)?;
+    let backend = match cpu_kernel {
+        CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
+        CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
+    };
     let config = GenerationConfig {
         max_new_tokens,
         temperature,
