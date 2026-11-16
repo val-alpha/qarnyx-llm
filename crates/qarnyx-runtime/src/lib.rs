@@ -71,6 +71,51 @@ pub struct LlamaGenerator {
     rng_state: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_sampling_is_deterministic() {
+        let mut generator = LlamaGenerator::new(7);
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 7,
+        };
+        assert_eq!(generator.sample(&[1.0, 4.0, 2.0], config).unwrap(), 1);
+    }
+
+    #[test]
+    fn seeded_sampling_repeats() {
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 1.0,
+            seed: 42,
+        };
+        let logits = [0.0, 1.0, 2.0];
+        let mut a = LlamaGenerator::new(config.seed);
+        let mut b = LlamaGenerator::new(config.seed);
+        let first_a = a.sample(&logits, config).unwrap();
+        let first_b = b.sample(&logits, config).unwrap();
+        assert_eq!(first_a, first_b);
+    }
+
+    #[test]
+    fn rejects_invalid_generation_config() {
+        let config = GenerationConfig {
+            max_new_tokens: 0,
+            ..GenerationConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+}
+
+
 impl LlamaGenerator {
     pub fn new(seed: u64) -> Self {
         Self {
