@@ -79,9 +79,11 @@ mod tests {
     use qarnyx_tokenizer::GgufTokenizer;
 
     fn matrix(data: &[f32], rows: usize, cols: usize) -> TensorView<'_> {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for value in data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         TensorView::new(bytes, Box::leak(vec![rows, cols].into_boxed_slice()), DType::F32)
     }
 
