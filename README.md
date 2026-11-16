@@ -76,8 +76,9 @@ during inspection.
 The scalar CPU backend executes matrix-vector and matrix-matrix operations
 with all currently registered storage types. Quantized matrices are decoded
 one row at a time into a reusable F32 scratch buffer; the full weight matrix is
-not expanded. RMSNorm, split-half LLaMA-style RoPE, stable softmax, SiLU-times-
-up, and residual addition are also available as scalar reference operations.
+not expanded. RMSNorm, split-half LLaMA-style RoPE, stable softmax,
+SiLU-times-up, and residual addition are also available as scalar reference
+operations.
 The initial kernels are single-threaded; runtime SIMD dispatch and persistent
 worker scheduling remain later milestones.
 
