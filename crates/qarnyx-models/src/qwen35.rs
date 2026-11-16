@@ -12,15 +12,12 @@ const N: usize = 24;
 const LH: usize = 16;
 const LD: usize = 128;
 const LIN: usize = LH * LD;
-const KH: usize = 16;
 const FH: usize = 8;
 const FHD: usize = 256;
 const KV: usize = 2 * FHD;
 const Q: usize = FH * FHD;
 const ROPE: usize = 64;
 const VOCAB: usize = 248_320;
-const EPS: f32 = 1e-6;
-const THETA: f32 = 1e7;
 const CONV: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
