@@ -97,11 +97,12 @@ naive bits-per-element multiplication.
 ## Backend contract
 
 Models call backend operations and do not select AVX intrinsics themselves.
-The current CPU backend uses scalar kernels. Once optimized implementations
-are added, it will select a kernel per operation or kernel family based on
-runtime CPU feature detection.
+The CPU backend selects kernels using runtime CPU feature detection. On
+x86_64 hosts with AVX2, matrix-vector dot products and matrix-multiplication
+output tiles use AVX2; FMA is used when available. Scalar implementations
+remain available as the correctness reference and portable fallback.
 
-The scalar CPU backend implements:
+The CPU backend implements:
 - matrix-vector multiplication for decode;
 - matrix multiplication for prompt prefill;
 - RMSNorm;
@@ -120,20 +121,28 @@ positive finite epsilon. RoPE pairs the first and second halves of one head
 vector, matching the split-half convention used by LLaMA-style rotary
 embeddings. Softmax rejects empty or non-finite inputs.
 
-The first implementation is scalar and single-threaded even when a worker
-count greater than one is configured. The CPU microbenchmark target is run
-with `cargo bench -p qarnyx-cpu --bench kernels`.
+Quantized matrix rows are still dequantized by the scalar reference decoder
+into one reusable F32 scratch row before the SIMD dot product. This avoids
+expanding a complete quantized matrix, but fused quantized SIMD kernels remain
+a future optimization. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
+addition currently use scalar implementations.
+
+The `workers` setting is currently retained as configuration only; it does
+not create threads. The persistent worker pool is a remaining M6 task. Run
+`cargo bench -p qarnyx-cpu --bench kernels` to compare scalar and runtime
+dispatch for each registered storage format.
 
 The scalar implementation is the correctness oracle. SIMD implementations
-must be compared against it with documented tolerances. Do not enable a SIMD
-path merely because it is faster; it must also pass correctness tests.
+must be compared against it with documented tolerances and must pass
+correctness tests before dispatch is enabled.
 
 ## CPU execution strategy
 
-Start with a scalar backend and establish benchmarks before introducing SIMD.
-Then add runtime-dispatched kernels for the actual VPS CPU features:
-- x86_64: AVX2/FMA first; AVX-512 only when supported and measured to help;
-- aarch64: NEON where applicable;
+Keep the scalar backend as the correctness reference and dispatch by runtime
+feature detection:
+- x86_64: initial AVX2/FMA matvec and matmul kernels are implemented;
+- x86_64: fused quantized matvec and AVX-512 remain to be evaluated;
+- aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
 Do not compile the default release build with target-cpu=native. That setting
@@ -162,13 +171,12 @@ It must be tested for numerical stability and supported cache layouts.
 
 ## Initial model scope
 
-Start with a LLaMA-style decoder-only Transformer with grouped-query attention
-support. Do not claim broad compatibility with all models labelled LLaMA-like.
-Validate the metadata keys, tensor names, RoPE parameters, normalization
-epsilon, vocabulary, and tokenizer behavior for each supported model variant.
-
-Additional architectures should be added only after the first model family has
-end-to-end correctness tests.
+The current experimental target is Qwen3.5 2B, a hybrid architecture with
+Gated DeltaNet recurrent layers and full-attention layers. Keep architecture-
+specific recurrence, RoPE, and tensor mapping inside qarnyx-models. The legacy
+LLaMA path remains separate and is not the target for Qwen3.5 validation.
+Validate tensor layouts, numerical outputs, tokenizer behavior, and recurrent
+state against an independent reference before declaring model compatibility.
 
 ## Implementation roadmap
 
@@ -204,10 +212,10 @@ end-to-end correctness tests.
 - Keep kernels single-threaded and use them as the correctness reference for
   later SIMD implementations.
 
-### M4 - First model forward pass
-- Load one supported LLaMA-style GGUF model.
-- Implement embedding, attention, GQA, feed-forward, residuals, and logits.
-- Compare logits against an independent reference runtime.
+### M4 - Model forward pass
+- Implement the experimental Qwen3.5 hybrid forward path.
+- Keep the legacy LLaMA implementation as a separate compatibility path.
+- Compare logits and token IDs against an independent reference runtime.
 
 ### M5 - Tokenization and generation
 - Read tokenizer metadata and special tokens.
@@ -215,11 +223,16 @@ end-to-end correctness tests.
 - Add KV cache, stopping rules, and sampling.
 - Verify generated token IDs, not only rendered text.
 
-### M6 - CPU optimization
-- Add runtime feature detection and AVX2/FMA kernels.
-- Add other SIMD paths only when the host warrants them.
-- Implement a persistent worker pool and avoid nested scheduling.
-- Benchmark prefill tokens/s, decode tokens/s, latency, and peak RSS.
+### M6 - CPU optimization (in progress)
+- Implemented runtime AVX2/FMA dispatch for matvec dot products and matmul
+  output tiles, with scalar fallbacks and differential tests.
+- Benchmark scalar versus runtime dispatch for the supported GGUF storage
+  formats on the target VPS.
+- Add fused Q4_K/Q5_K/Q6_K matvec kernels to remove the scalar F32 row decode.
+- Evaluate AVX-512 and add NEON where the target hardware warrants it.
+- Implement a persistent worker pool, avoid nested scheduling, and measure
+  worker scaling rather than assuming more workers are faster.
+- Benchmark prefill/decode tokens per second, latency, and peak RSS.
 
 ### M7 - Operational hardening
 - Add context and memory limits, cancellation, session isolation, and stress tests.
