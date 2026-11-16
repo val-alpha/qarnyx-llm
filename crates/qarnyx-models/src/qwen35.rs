@@ -189,7 +189,7 @@ impl<'a> Qwen35Model<'a> {
 fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f32],
     state: &mut [f32], conv_state: &mut [f32]) -> Result<Vec<f32>, ModelError> {
     let x = rms0(input, w.attn_norm, c.rms_epsilon)?;
-    let mut qkv = vec![0.0; LIN*2 + 0];
+    let mut qkv = vec![0.0; LIN*3];
     let mut z = vec![0.0; LIN];
     let mut beta = vec![0.0; LH];
     let mut alpha = vec![0.0; LH];
@@ -198,14 +198,10 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
     b.matvec(w.beta, &x, &mut beta)?;
     b.matvec(w.alpha, &x, &mut alpha)?;
 
-    let mut mix = vec![0.0; LIN*2 + LIN];
-    mix[..LIN*2].copy_from_slice(&qkv[..LIN*2]);
-    mix[LIN*2..].fill(0.0);
-    // qkv tensor is [key*2 + value] = 4096; the gate projection is separate.
-    // The storage layout is q(2048), k(2048), v(2048).
-    let mut conv = vec![0.0; LIN*2 + LIN];
+    let mut conv = vec![0.0; LIN*3];
+    // GGUF layout is q(2048), k(2048), v(2048) for the 16x128 linear heads.
     let mut kernel = vec![0.0; CONV];
-    for ch in 0..mix.len() {
+    for ch in 0..qkv.len() {
         decode_into(w.conv, ch, &mut kernel)?;
         let base = ch * (CONV-1);
         let current = qkv[ch];
@@ -343,4 +339,4 @@ fn dtype_id(d:DType)->Option<u32>{match d{DType::F32=>Some(GgmlType::F32 as u32)
 fn token_count(g:&GgufFile)->Result<usize,TensorLoadError>{let t=find(g,"token_embd.weight")?;usize::try_from(*t.dimensions.get(1).ok_or(TensorLoadError::Config("token embedding must be rank 2".into()))?).map_err(|_|TensorLoadError::Config("vocab exceeds usize".into()))}
 fn u(g:&GgufFile,k:&'static str)->Result<usize,TensorLoadError>{let v=g.metadata_value(k).ok_or(TensorLoadError::MissingMetadata(k))?;let n=match v{MetadataValue::Uint32(x)=>u64::from(*x),MetadataValue::Uint64(x)=>*x,MetadataValue::Int32(x)if*x>=0=>*x as u64,MetadataValue::Int64(x)if*x>=0=>*x as u64,_=>return Err(TensorLoadError::Config(format!("{k} is not an integer")))};usize::try_from(n).map_err(|_|TensorLoadError::Config(format!("{k} exceeds usize")))}
 fn f(g:&GgufFile,k:&'static str)->Result<f32,TensorLoadError>{match g.metadata_value(k){Some(MetadataValue::Float32(x))=>Ok(*x),Some(MetadataValue::Float64(x))=>Ok(*x as f32),_=>Err(TensorLoadError::MissingMetadata(k))}}
-fn bools(g:&GgufFile,k:&'static str)->Result<Vec<bool>,TensorLoadError>{let MetadataValue::Array{values,..}=g.metadata_value(k).ok_or(TensorLoadError::MissingMetadata(k))?else{return Err(TensorLoadError::Config(format!("{k} is not an array")))};values.iter().map(|v|match v{MetadataValue::Bool(x)=>Ok(*x),_= >Err(TensorLoadError::Config(format!("{k} is not BOOL[]")))}).collect()}
+fn bools(g:&GgufFile,k:&'static str)->Result<Vec<bool>,TensorLoadError>{let MetadataValue::Array{values,..}=g.metadata_value(k).ok_or(TensorLoadError::MissingMetadata(k))?else{return Err(TensorLoadError::Config(format!("{k} is not an array")))};values.iter().map(|v|match v{MetadataValue::Bool(x)=>Ok(*x),_=>Err(TensorLoadError::Config(format!("{k} is not BOOL[]")))}).collect()}
