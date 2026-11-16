@@ -2,7 +2,11 @@ use clap::{Parser, Subcommand};
 
 /// Kernforge command-line interface.
 #[derive(Debug, Parser)]
-#[command(name = "kernforge", version, about = "Rust-native CPU-first GGUF inference runtime")]
+#[command(
+    name = "kernforge",
+    version,
+    about = "Rust-native CPU-first GGUF inference runtime"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
