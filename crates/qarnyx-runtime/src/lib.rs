@@ -74,6 +74,84 @@ pub struct LlamaGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qarnyx_core::{DType, TensorView};
+    use qarnyx_models::{LlamaConfig, LlamaLayerStorage, LlamaModel};
+    use qarnyx_tokenizer::GgufTokenizer;
+
+    fn matrix(data: &[f32], rows: usize, cols: usize) -> TensorView<'_> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        TensorView::new(bytes, Box::leak(vec![rows, cols].into_boxed_slice()), DType::F32)
+    }
+
+    #[test]
+    fn end_to_end_greedy_generation_uses_kv_cache() {
+        let identity = [1.0_f32, 0.0, 0.0, 1.0];
+        let zero_2x2 = [0.0_f32; 4];
+        let zero_4x2 = [0.0_f32; 8];
+        let zero_2x4 = [0.0_f32; 8];
+
+        let layer = LlamaLayerStorage {
+            attention_norm: vec![1.0, 1.0],
+            q_proj: matrix(&identity, 2, 2),
+            k_proj: matrix(&zero_2x2, 2, 2),
+            v_proj: matrix(&zero_2x2, 2, 2),
+            o_proj: matrix(&identity, 2, 2),
+            ffn_norm: vec![1.0, 1.0],
+            gate_proj: matrix(&zero_4x2, 4, 2),
+            up_proj: matrix(&zero_4x2, 4, 2),
+            down_proj: matrix(&zero_2x4, 2, 4),
+        };
+
+        let embedding = matrix(&identity, 2, 2);
+        let output = matrix(&identity, 2, 2);
+        let model = LlamaModel {
+            config: LlamaConfig {
+                block_count: 1,
+                embedding_length: 2,
+                feed_forward_length: 4,
+                attention_head_count: 1,
+                attention_head_count_kv: 1,
+                attention_key_length: 2,
+                attention_value_length: 2,
+                attention_layer_norm_rms_epsilon: 1.0e-5,
+                rope_freq_base: 10_000.0,
+            },
+            layers: vec![layer],
+            token_embedding: embedding,
+            output_norm: vec![1.0, 1.0],
+            output,
+        };
+
+        let tokenizer = GgufTokenizer {
+            model: "test".into(),
+            pre: None,
+            tokens: vec!["a".into(), "b".into()],
+            scores: vec![0.0, 0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
+        let mut generator = LlamaGenerator::new(123);
+
+        let result = generator
+            .generate(&model, &tokenizer, &backend, "a", GenerationConfig {
+                max_new_tokens: 3,
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 123,
+            })
+            .unwrap();
+
+        assert_eq!(result.token_ids, [0, 0, 0, 0]);
+        assert_eq!(result.text, "aaaa");
+    }
+
+
+    use super::*;
 
     #[test]
     fn greedy_sampling_is_deterministic() {
