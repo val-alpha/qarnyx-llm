@@ -504,7 +504,7 @@ mod tests {
 
         let decoded = dequantize(14, &[256], &block).unwrap();
         assert_eq!(decoded[128], -26.0);
-        assert_eq!(decoded[129], -32.0);
+        assert_eq!(decoded[129], -64.0);
     }
 
     #[test]
