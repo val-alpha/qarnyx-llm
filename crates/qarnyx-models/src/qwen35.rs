@@ -284,7 +284,7 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
     let fd=matrix(g,d,&format!("{p}.ffn_down.weight"),&[H,FF])?;
     if c.recurrent_layers[i] {
         Ok(Qwen35Layer::Linear(Qwen35Linear{
-            attn_norm:&an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*3,H])?,
+            attn_norm:an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*3,H])?,
             gate:matrix(g,d,&format!("{p}.attn_gate.weight"),&[LIN,H])?,
             conv:matrix(g,d,&format!("{p}.ssm_conv1d.weight"),&[LIN,CONV])?,
             dt:Box::leak(vector(g,d,&format!("{p}.ssm_dt.bias"),&[LH])?.into_boxed_slice()),
@@ -297,7 +297,7 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
         }))
     } else {
         Ok(Qwen35Layer::Attention(Qwen35Attention{
-            attn_norm:&an,q:matrix(g,d,&format!("{p}.attn_q.weight"),&[Q*2,H])?,
+            attn_norm:an,q:matrix(g,d,&format!("{p}.attn_q.weight"),&[Q*2,H])?,
             k:matrix(g,d,&format!("{p}.attn_k.weight"),&[KV,H])?,
             v:matrix(g,d,&format!("{p}.attn_v.weight"),&[KV,H])?,
             out:matrix(g,d,&format!("{p}.attn_output.weight"),&[H,Q])?,
