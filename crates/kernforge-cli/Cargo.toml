@@ -1,0 +1,18 @@
+[package]
+name = "kernforge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kernforge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+kernforge-runtime = { path = "../kernforge-runtime" }
+
+[lints]
+workspace = true
