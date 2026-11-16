@@ -7,9 +7,10 @@ Qarnyx is an experimental, Rust-native, CPU-first inference runtime for
 models. It is being designed from scratch around quantized CPU kernels,
 explicit memory ownership, and predictable resource usage.
 
-> **Project status: early development.** The GGUF v3 reader can stream the
-> header, metadata, and tensor directory from a seekable file without loading
-> tensor weights into memory. Quantized tensor decoding, transformer execution,
+> **Project status: early development.** The GGUF v3 reader streams metadata
+> and tensor descriptors and validates complete tensor byte ranges without
+> loading weight payloads into memory. Scalar reference decoding is implemented
+> for F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. Transformer execution,
 > tokenization, and text generation are not implemented yet.
 
 ## Design goals
@@ -62,10 +63,13 @@ cargo run --release -p qarnyx-cli -- inspect /path/to/model.gguf --list-tensors
 
 The parser handles GGUF metadata scalar types and nested arrays, validates
 UTF-8 strings, metadata keys, unique tensor names, tensor dimensions, alignment,
-directory padding, and tensor data start offsets. The current reader is
-little-endian only. Exact tensor payload lengths are intentionally deferred
-until the quantization type registry is implemented, so this reader does not
-yet certify complete tensor byte ranges.
+directory padding, and complete tensor payload byte ranges. Payload lengths
+are calculated by the qarnyx-quant type registry, including per-row block
+alignment, and overlapping tensor ranges are rejected. Supported layouts and
+scalar F32 output decoders currently include F32, F16, Q4_0, Q8_0, Q4_K,
+Q5_K, and Q6_K. Unknown GGML types are rejected rather than assigned guessed
+sizes. The reader remains little-endian only and does not read payload bytes
+during inspection.
 
 ## Development
 
