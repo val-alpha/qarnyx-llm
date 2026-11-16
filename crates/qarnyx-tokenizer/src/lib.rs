@@ -24,6 +24,12 @@ pub enum TokenizerError {
 
     #[error("token ID {0} is outside the vocabulary")]
     TokenIdOutOfRange(usize),
+
+    #[error("tokenizer model {0} is not supported for production encoding")]
+    UnsupportedModel(String),
+
+    #[error("tokenizer cannot encode input at byte offset {offset}")]
+    Unencodable { offset: usize },
 }
 
 /// Tokenizer metadata embedded in a GGUF model.
@@ -75,13 +81,21 @@ impl GgufTokenizer {
         self.tokens.len()
     }
 
-    /// Encodes text using a deterministic longest-vocabulary-piece matcher.
+    /// Encodes text using the tokenizer family declared by GGUF metadata.
     ///
-    /// This is intentionally a baseline M5 encoder. It is suitable for
-    /// vocabularies whose token strings directly represent input pieces; a
-    /// model-specific BPE/SentencePiece pre-tokenizer will replace this path
-    /// before production compatibility work.
+    /// The current implementation supports the deterministic vocabulary
+    /// matcher for metadata without merges. Merge-based tokenizers use the
+    /// BPE path below; byte-level pre-tokenization remains intentionally
+    /// separate so we do not silently claim LLaMA compatibility we have not
+    /// implemented yet.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
+        if self.merges.is_empty() {
+            return self.encode_vocab_pieces(text);
+        }
+        self.encode_bpe(text)
+    }
+
+    fn encode_vocab_pieces(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
@@ -114,6 +128,48 @@ impl GgufTokenizer {
         }
 
         Ok(tokens)
+    }
+
+    fn encode_bpe(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
+        let mut merge_rank = std::collections::HashMap::with_capacity(self.merges.len());
+        for (rank, merge) in self.merges.iter().enumerate() {
+            let mut parts = merge.split_whitespace();
+            let left = parts.next();
+            let right = parts.next();
+            if let (Some(left), Some(right)) = (left, right) {
+                merge_rank.insert((left.to_owned(), right.to_owned()), rank);
+            }
+        }
+
+        let mut output = Vec::new();
+        for (byte_offset, piece) in text.split_inclusive(char::is_whitespace).enumerate() {
+            let _ = byte_offset;
+            let mut symbols: Vec<String> = piece.chars().map(|ch| ch.to_string()).collect();
+            if symbols.is_empty() {
+                continue;
+            }
+
+            loop {
+                let mut best: Option<(usize, usize)> = None;
+                for i in 0..symbols.len().saturating_sub(1) {
+                    if let Some(&rank) = merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
+                        if best.map(|(_, r)| rank < r).unwrap_or(true) {
+                            best = Some((i, rank));
+                        }
+                    }
+                }
+                let Some((index, _)) = best else { break };
+                let merged = format!("{}{}", symbols[index], symbols[index + 1]);
+                symbols.splice(index..=index + 1, [merged]);
+            }
+
+            for symbol in symbols {
+                let id = self.tokens.iter().position(|token| token == &symbol)
+                    .ok_or(TokenizerError::Unencodable { offset: text.find(&symbol).unwrap_or(0) })?;
+                output.push(id);
+            }
+        }
+        Ok(output)
     }
 
     /// Converts generated token IDs back to their GGUF token strings.
