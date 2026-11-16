@@ -284,7 +284,7 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
     let fd=matrix(g,d,&format!("{p}.ffn_down.weight"),&[H,FF])?;
     if c.recurrent_layers[i] {
         Ok(Qwen35Layer::Linear(Qwen35Linear{
-            attn_norm:an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*2,H])?,
+            attn_norm:an,qkv:matrix(g,d,&format!("{p}.attn_qkv.weight"),&[LIN*3,H])?,
             gate:matrix(g,d,&format!("{p}.attn_gate.weight"),&[LIN,H])?,
             conv:matrix(g,d,&format!("{p}.ssm_conv1d.weight"),&[LIN,CONV])?,
             dt:vector(g,d,&format!("{p}.ssm_dt.bias"),&[LH])?,
