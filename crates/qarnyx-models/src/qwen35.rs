@@ -64,7 +64,12 @@ impl Qwen35Config {
             group_count: u(g, "qwen35.ssm.group_count")?,
             time_step_rank: u(g, "qwen35.ssm.time_step_rank")?,
             inner_size: u(g, "qwen35.ssm.inner_size")?,
-            recurrent_layers: bools(g, "qwen35.attention.recurrent_layers")?,
+            recurrent_layers: match g.metadata_value("qwen35.attention.recurrent_layers") {
+                Some(_) => bools(g, "qwen35.attention.recurrent_layers")?,
+                None => (0..u(g, "qwen35.block_count")?)
+                    .map(|i| (i + 1) % u(g, "qwen35.full_attention_interval").unwrap_or(4) != 0)
+                    .collect(),
+            },
         };
         if c.block_count != N || c.embedding_length != H || c.feed_forward_length != FF
             || c.attention_head_count != FH || c.attention_head_count_kv != 2
