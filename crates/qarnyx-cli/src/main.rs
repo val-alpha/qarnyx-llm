@@ -35,7 +35,7 @@ enum Command {
     },
     /// Run CPU autoregressive generation from a supported GGUF architecture.
     Generate {
-        /// Path to a GGUF v3 LLaMA model.
+        /// Path to a supported GGUF v3 model.
         model: PathBuf,
         /// Prompt text.
         prompt: String,
