@@ -236,18 +236,6 @@ impl GgufTokenizer {
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
-    /// Converts generated token IDs back to their GGUF token strings.
-    pub fn decode(&self, token_ids: &[usize]) -> Result<String, TokenizerError> {
-        let mut output = String::new();
-        for &token_id in token_ids {
-            let token = self
-                .tokens
-                .get(token_id)
-                .ok_or(TokenizerError::TokenIdOutOfRange(token_id))?;
-            output.push_str(token);
-        }
-        Ok(output)
-    }
 }
 
 
