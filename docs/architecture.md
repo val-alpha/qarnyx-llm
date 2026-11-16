@@ -19,7 +19,7 @@ assuming that a VPS allocation represents dedicated physical cores.
 | Crate | Responsibility | Must not own |
 |---|---|---|
 | qarnyx-core | Tensor views, data types, backend contracts, common errors | File parsing or model architecture |
-| qarnyx-gguf | GGUF header, metadata, tensor directory, validated tensor views | Tensor math or generation |
+| qarnyx-gguf | GGUF v3 header, metadata, tensor directory, validated tensor views | Tensor math or generation |
 | qarnyx-quant | Quantization layouts and scalar reference decoders | Scheduling or model loading |
 | qarnyx-cpu | Scalar/SIMD kernels, CPU feature detection, persistent workers | Tokenization or GGUF parsing |
 | qarnyx-tokenizer | Tokenizer metadata and token-to-text conversion | Tensor operations |
@@ -29,6 +29,37 @@ assuming that a VPS allocation represents dedicated physical cores.
 
 Dependencies should point inward toward core contracts. Avoid cyclic crate
 dependencies and avoid putting model-specific logic in the GGUF parser.
+
+## GGUF reader boundary
+
+The current qarnyx-gguf reader:
+
+- Supports the GGUF v3 little-endian representation.
+- Reads from a seekable source and determines file size without reading the
+  model's tensor payload into memory.
+- Parses all defined metadata scalar types and recursively nested arrays.
+- Applies configurable limits to metadata counts, tensor counts, metadata
+  bytes, string lengths, array lengths/depth, and alignment.
+- Rejects invalid magic/version, invalid UTF-8, malformed booleans, duplicate
+  metadata keys/tensor names/tensor offsets, invalid dimensions, overflowing
+  shapes, invalid alignment, non-zero alignment padding, and tensor data start
+  offsets outside the file.
+- Preserves numeric ggml tensor type identifiers for forward compatibility.
+
+The reader validates the beginning of each tensor payload, not its complete
+byte extent. Correct payload lengths depend on the ggml type's block size and
+encoded block size. M2 will add a single authoritative type registry and use it
+to validate each tensor's full byte range before any tensor view is exposed.
+
+The reader currently rejects big-endian files. This limitation is explicit;
+the initial deployment target is little-endian x86_64/aarch64.
+
+The CLI can inspect a file using:
+
+```bash
+cargo run --release -p qarnyx-cli -- inspect model.gguf
+cargo run --release -p qarnyx-cli -- inspect model.gguf --list-tensors
+```
 
 ## Data path
 
@@ -133,16 +164,21 @@ end-to-end correctness tests.
 - Record compiler version and build flags.
 - Create repeatable kernel and end-to-end benchmark fixtures.
 
-### M1 - GGUF reader
-- Parse GGUF v3 header and metadata types.
-- Parse tensor descriptors and alignment.
-- Validate offsets, dimensions, block sizes, and file bounds.
-- Add malformed-file and fuzz-style boundary tests.
+### M1 - GGUF reader (implemented)
+- Parse GGUF v3 little-endian header and metadata value types.
+- Parse tensor descriptors and resolve the aligned tensor data section.
+- Validate counts, UTF-8 strings, dimensions, alignment, directory padding,
+  duplicate entries, and tensor data start offsets.
+- Parse from a seekable reader without loading tensor payloads into memory.
+- Add malformed-file and resource-limit tests.
+- Defer exact tensor payload byte lengths to M2, where quantization block sizes
+  are registered and validated.
 
 ### M2 - Quantization reference
 - Add F32/F16 handling and scalar Q8_0, Q4_0 decoders.
 - Add K-quant decoders only after validating their exact block layouts.
-- Test known blocks against independent reference data.
+- Add type-aware tensor extent validation and test known blocks against
+  independent reference data.
 
 ### M3 - Scalar tensor engine
 - Implement matvec, matmul, RMSNorm, RoPE, softmax, SiLU, and residual ops.

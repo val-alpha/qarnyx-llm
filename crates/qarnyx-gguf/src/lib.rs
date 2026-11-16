@@ -1,10 +1,13 @@
-//! GGUF file parsing and validated tensor access.
+//! GGUF v3 parsing and validated tensor-directory access.
 //!
-//! Planned responsibilities:
-//! - parse the GGUF header and metadata;
-//! - parse tensor descriptors and alignment;
-//! - validate all offsets and lengths against the file size;
-//! - expose immutable tensor views over validated mapped bytes.
-//!
-//! Parsing is not implemented yet. Do not use this crate to load untrusted
-//! model files until bounds checks and malformed-input tests are complete.
+//! The parser streams the header, metadata, and tensor descriptors from any
+//! seekable reader. Tensor weight payloads are not copied into memory. Exact
+//! per-tensor byte-range validation will be added with the GGML quantization
+//! type registry so block-encoded formats are sized correctly.
+
+mod parser;
+
+pub use parser::{
+    GgufError, GgufFile, MetadataEntry, MetadataValue, MetadataValueType, ParseOptions,
+    TensorInfo,
+};
