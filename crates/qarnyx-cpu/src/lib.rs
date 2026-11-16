@@ -4,10 +4,12 @@
 //! Q4_K matvec also has a direct fused block-dot path that avoids F32 row
 //! materialization. On x86_64, AVX2/FMA accelerates F32 dot products and
 //! row-major matmul output tiles. Scalar kernels remain the correctness
-//! reference and portable fallback. Worker scheduling is not yet implemented.
+//! reference and portable fallback. Large matrix operations can partition
+//! independent output rows across the configured worker count.
 
 use qarnyx_core::{Backend, BackendError, DType, TensorView};
 use qarnyx_quant::{dequantize_into, dot_q4_k, encoded_len};
+use std::thread;
 use thiserror::Error;
 
 /// Errors raised while constructing the CPU backend.
@@ -62,8 +64,8 @@ impl CpuFeatures {
 /// CPU backend configuration.
 ///
 /// Kernels dispatch at runtime to AVX2/FMA on supported x86_64 hosts and
-/// otherwise use the scalar reference implementation. Worker scheduling is
-/// not active yet; worker_count is currently informational.
+/// otherwise use the scalar reference implementation. Matrix output rows are
+/// partitioned across scoped OS threads when worker_count is greater than one.
 #[derive(Debug, Clone)]
 pub struct CpuBackend {
     worker_count: usize,
@@ -112,8 +114,8 @@ impl CpuBackend {
 
     /// Returns the configured worker count.
     ///
-    /// Worker scheduling is not active yet; this value is retained for the
-    /// worker-pool milestone and does not currently create threads.
+    /// Large matrix operations use this value to partition independent output
+    /// rows across scoped OS threads.
     pub const fn worker_count(&self) -> usize {
         self.worker_count
     }
@@ -487,32 +489,80 @@ impl Backend for CpuBackend {
         let (raw_type, columns, row_bytes) =
             matrix_row_layout(&weights, out_features, in_features, "matvec")?;
 
-        if self.fused_q4k_matvec && weights.dtype == DType::Q4K {
-            for (row_index, output_value) in output.iter_mut().enumerate() {
-                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row offset overflowed usize")
-                })?;
-                let end = start.checked_add(row_bytes).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row end overflowed usize")
-                })?;
-                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row is outside the tensor byte range")
-                })?;
-                *output_value = dot_q4_k(encoded_row, input)
-                    .map_err(|error| shape_mismatch("matvec", error.to_string()))?;
-            }
-            return Ok(());
+        let workers = self.worker_count.min(out_features);
+        let parallel = workers > 1 && out_features >= workers * 2;
+
+        if parallel {
+            return thread::scope(|scope| {
+                let chunk_rows = out_features.div_ceil(workers);
+                let mut jobs = Vec::with_capacity(workers);
+
+                for (chunk_index, output_chunk) in output.chunks_mut(chunk_rows).enumerate() {
+                    let first_row = chunk_index * chunk_rows;
+                    let weights = weights;
+                    let input = input;
+                    let fused = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
+                    let simd_enabled = self.simd_enabled;
+                    let features = self.features;
+
+                    jobs.push(scope.spawn(move || -> Result<(), BackendError> {
+                        if fused {
+                            for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
+                                let row_index = first_row + local_row;
+                                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
+                                    shape_mismatch("matvec", "encoded weight row offset overflowed usize")
+                                })?;
+                                let end = start.checked_add(row_bytes).ok_or_else(|| {
+                                    shape_mismatch("matvec", "encoded weight row end overflowed usize")
+                                })?;
+                                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
+                                    shape_mismatch("matvec", "encoded weight row is outside the tensor byte range")
+                                })?;
+                                *output_value = dot_q4_k(encoded_row, input)
+                                    .map_err(|error| shape_mismatch("matvec", error.to_string()))?;
+                            }
+                            return Ok(());
+                        }
+
+                        let mut row = allocate_row_scratch("matvec", in_features)?;
+                        for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
+                            let row_index = first_row + local_row;
+                            decode_weight_row(
+                                "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
+                            )?;
+                            *output_value = if simd_enabled && features.avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    if features.fma {
+                                        dot_avx2_fma(&row, input)
+                                    } else {
+                                        dot_avx2(&row, input)
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                dot_scalar(&row, input)
+                            } else {
+                                dot_scalar(&row, input)
+                            };
+                        }
+                        Ok(())
+                    }));
+                }
+
+                for job in jobs {
+                    job.join().expect("CPU matvec worker panicked")?;
+                }
+                Ok(())
+            });
         }
 
         let mut row = allocate_row_scratch("matvec", in_features)?;
-
         for (row_index, output_value) in output.iter_mut().enumerate() {
             decode_weight_row(
                 "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
             )?;
             *output_value = self.dot_product(&row, input);
         }
-
         Ok(())
     }
 
@@ -558,8 +608,47 @@ impl Backend for CpuBackend {
         }
 
         let (raw_type, columns, row_bytes) = matrix_row_layout(&weights, m, k, "matmul")?;
-        let mut row = allocate_row_scratch("matmul", k)?;
+        let workers = self.worker_count.min(m);
+        let parallel = workers > 1 && m >= workers * 2;
 
+        if parallel {
+            return thread::scope(|scope| {
+                let chunk_rows = m.div_ceil(workers);
+                let mut jobs = Vec::with_capacity(workers);
+
+                for (chunk_index, output_chunk) in output.chunks_mut(chunk_rows * n).enumerate() {
+                    let first_row = chunk_index * chunk_rows;
+                    let weights = weights;
+                    let input = input;
+
+                    jobs.push(scope.spawn(move || -> Result<(), BackendError> {
+                        let mut row = allocate_row_scratch("matmul", k)?;
+                        let rows_in_chunk = output_chunk.len() / n;
+                        for local_row in 0..rows_in_chunk {
+                            let row_index = first_row + local_row;
+                            decode_weight_row(
+                                "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
+                            )?;
+                            let output_start = local_row * n;
+                            self.matmul_row(
+                                &row,
+                                input,
+                                &mut output_chunk[output_start..output_start + n],
+                                n,
+                            );
+                        }
+                        Ok(())
+                    }));
+                }
+
+                for job in jobs {
+                    job.join().expect("CPU matmul worker panicked")?;
+                }
+                Ok(())
+            });
+        }
+
+        let mut row = allocate_row_scratch("matmul", k)?;
         for row_index in 0..m {
             decode_weight_row(
                 "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
@@ -573,7 +662,6 @@ impl Backend for CpuBackend {
                 n,
             );
         }
-
         Ok(())
     }
 
