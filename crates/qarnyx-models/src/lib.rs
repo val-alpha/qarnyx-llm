@@ -4,6 +4,10 @@
 //! can later be mapped to file-backed TensorView values without changing the
 //! forward graph.
 
+mod loader;
+
+pub use loader::{LlamaLayerStorage, LlamaModel, TensorLoadError};
+
 use qarnyx_core::{Backend, BackendError, TensorView};
 use qarnyx_gguf::{GgufFile, MetadataValue};
 use thiserror::Error;
@@ -240,7 +244,12 @@ fn validate_layer_shapes(
     }
 
     let expected = [
-        ("q_proj", weights.q_proj, config.embedding_length, config.embedding_length),
+        (
+            "q_proj",
+            weights.q_proj,
+            config.embedding_length,
+            config.embedding_length,
+        ),
         (
             "k_proj",
             weights.k_proj,
@@ -253,7 +262,12 @@ fn validate_layer_shapes(
             config.attention_head_count_kv * config.attention_value_length,
             config.embedding_length,
         ),
-        ("o_proj", weights.o_proj, config.embedding_length, config.embedding_length),
+        (
+            "o_proj",
+            weights.o_proj,
+            config.embedding_length,
+            config.embedding_length,
+        ),
         (
             "gate_proj",
             weights.gate_proj,
@@ -345,7 +359,11 @@ mod tests {
     }
 
     fn f32_view(bytes: &[u8], rows: usize, cols: usize) -> TensorView<'_> {
-        TensorView::new(bytes, Box::leak(vec![rows, cols].into_boxed_slice()), DType::F32)
+        TensorView::new(
+            bytes,
+            Box::leak(vec![rows, cols].into_boxed_slice()),
+            DType::F32,
+        )
     }
 
     fn identity_bytes(size: usize) -> Vec<u8> {
