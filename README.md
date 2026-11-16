@@ -85,7 +85,8 @@ Worker scheduling is not active yet, so `--workers` does not currently create
 parallel threads.
 
 Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
-The harness compares the scalar reference backend with runtime dispatch.
+The harness compares the scalar reference, default runtime dispatch, and
+opt-in fused Q4_K matvec paths.
 
 To compare end-to-end generation using the same model and prompt, select a
 kernel mode explicitly:
