@@ -1,13 +1,13 @@
 //! Runtime-dispatched CPU execution backend.
 //!
-//! Matrix kernels decode one weight row at a time into a reusable scratch
-//! buffer. On x86_64, AVX2/FMA accelerates the resulting F32 dot products and
-//! row-major matmul output tiles. Scalar kernels remain available as the
-//! correctness reference and portable fallback. Worker scheduling is separate
-//! and is not yet implemented.
+//! Matrix kernels use reusable F32 scratch rows for general quantized formats.
+//! Q4_K matvec also has a direct fused block-dot path that avoids F32 row
+//! materialization. On x86_64, AVX2/FMA accelerates F32 dot products and
+//! row-major matmul output tiles. Scalar kernels remain the correctness
+//! reference and portable fallback. Worker scheduling is not yet implemented.
 
 use qarnyx_core::{Backend, BackendError, DType, TensorView};
-use qarnyx_quant::{dequantize_into, encoded_len};
+use qarnyx_quant::{dequantize_into, dot_q4_k, encoded_len};
 use thiserror::Error;
 
 /// Errors raised while constructing the CPU backend.
@@ -69,20 +69,33 @@ pub struct CpuBackend {
     worker_count: usize,
     features: CpuFeatures,
     simd_enabled: bool,
+    fused_q4k_matvec: bool,
 }
 
 impl CpuBackend {
-    /// Creates a CPU backend that automatically dispatches supported SIMD kernels.
+    /// Creates the automatic backend: runtime SIMD plus fused Q4_K matvec.
     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_simd(worker_count, true)
+        Self::with_options(worker_count, true, true)
     }
 
     /// Creates a scalar-only backend for reference testing and benchmarks.
     pub fn new_scalar(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_simd(worker_count, false)
+        Self::with_options(worker_count, false, false)
     }
 
-    fn with_simd(worker_count: usize, simd_enabled: bool) -> Result<Self, CpuBackendError> {
+    /// Creates a SIMD backend that dequantizes Q4_K rows before the F32 dot.
+    ///
+    /// This provides an apples-to-apples benchmark baseline for the fused
+    /// Q4_K matvec path while retaining AVX2/FMA dispatch where available.
+    pub fn new_simd_dequant(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, false)
+    }
+
+    fn with_options(
+        worker_count: usize,
+        simd_enabled: bool,
+        fused_q4k_matvec: bool,
+    ) -> Result<Self, CpuBackendError> {
         if worker_count == 0 {
             return Err(CpuBackendError::ZeroWorkers);
         }
@@ -91,6 +104,7 @@ impl CpuBackend {
             worker_count,
             features: CpuFeatures::detect(),
             simd_enabled,
+            fused_q4k_matvec,
         })
     }
 
@@ -470,6 +484,24 @@ impl Backend for CpuBackend {
 
         let (raw_type, columns, row_bytes) =
             matrix_row_layout(&weights, out_features, in_features, "matvec")?;
+
+        if self.fused_q4k_matvec && weights.dtype == DType::Q4K {
+            for (row_index, output_value) in output.iter_mut().enumerate() {
+                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
+                    shape_mismatch("matvec", "encoded weight row offset overflowed usize")
+                })?;
+                let end = start.checked_add(row_bytes).ok_or_else(|| {
+                    shape_mismatch("matvec", "encoded weight row end overflowed usize")
+                })?;
+                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
+                    shape_mismatch("matvec", "encoded weight row is outside the tensor byte range")
+                })?;
+                *output_value = dot_q4_k(encoded_row, input)
+                    .map_err(|error| shape_mismatch("matvec", error.to_string()))?;
+            }
+            return Ok(());
+        }
+
         let mut row = allocate_row_scratch("matvec", in_features)?;
 
         for (row_index, output_value) in output.iter_mut().enumerate() {
@@ -738,6 +770,58 @@ mod tests {
             automatic.uses_avx2(),
             cfg!(target_arch = "x86_64") && automatic.features().avx2
         );
+    }
+
+    #[test]
+    fn fused_q4_k_matvec_matches_scalar_and_simd_dequant_references() {
+        let shape = [2, 512];
+        let mut bytes = vec![0_u8; 144 * 4];
+        let d_bits = [0x3c00_u16, 0x3800, 0x4000, 0x3a00];
+        let min_bits = [0x3400_u16, 0x3800, 0x3a00, 0x3000];
+
+        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&d_bits[block_index].to_le_bytes());
+            block[2..4].copy_from_slice(&min_bits[block_index].to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 19 + block_index * 31) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 13 + block_index * 29) as u8;
+            }
+        }
+
+        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
+        let input = (0..512)
+            .map(|index| ((index * 7 % 41) as f32 - 20.0) / 23.0)
+            .collect::<Vec<_>>();
+        let scalar = CpuBackend::new_scalar(1).unwrap();
+        let simd_dequant = CpuBackend::new_simd_dequant(1).unwrap();
+        let fused = CpuBackend::new(1).unwrap();
+        let mut expected = [0.0_f32; 2];
+        let mut dequant_output = [0.0_f32; 2];
+        let mut fused_output = [0.0_f32; 2];
+
+        scalar.matvec(weights, &input, &mut expected).unwrap();
+        simd_dequant
+            .matvec(weights, &input, &mut dequant_output)
+            .unwrap();
+        fused.matvec(weights, &input, &mut fused_output).unwrap();
+
+        for row in 0..2 {
+            let tolerance = 1.0e-3 * (1.0 + expected[row].abs());
+            assert!(
+                (dequant_output[row] - expected[row]).abs() <= tolerance,
+                "SIMD/dequant mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                dequant_output[row]
+            );
+            assert!(
+                (fused_output[row] - expected[row]).abs() <= tolerance,
+                "fused Q4_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                fused_output[row]
+            );
+        }
     }
 
     #[test]
