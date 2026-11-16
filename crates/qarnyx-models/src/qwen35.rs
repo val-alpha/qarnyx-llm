@@ -115,7 +115,7 @@ impl Qwen35Cache {
         Self {
             sequence_len: 0,
             recurrent: (0..c.block_count).map(|_| vec![0.0; state]).collect(),
-            conv: (0..c.block_count).map(|_| vec![0.0; LIN * (CONV-1)]).collect(),
+            conv: (0..c.block_count).map(|_| vec![0.0; LIN * 3 * (CONV-1)]).collect(),
             keys: (0..c.block_count).map(|_| Vec::new()).collect(),
             values: (0..c.block_count).map(|_| Vec::new()).collect(),
         }
