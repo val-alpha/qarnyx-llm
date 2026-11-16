@@ -127,12 +127,18 @@ impl<'a> LlamaModel<'a> {
             "output_norm.weight",
             &[config.embedding_length],
         )?;
-        let output = load_weight(
-            gguf,
-            data,
-            "output.weight",
-            &[token_count(gguf)?, config.embedding_length],
-        )?;
+        // Some LLaMA GGUFs tie the LM head to token embeddings and omit
+        // output.weight. Reuse the embedding matrix in that case.
+        let output = match find_tensor(gguf, "output.weight") {
+            Ok(_) => load_weight(
+                gguf,
+                data,
+                "output.weight",
+                &[token_count(gguf)?, config.embedding_length],
+            )?,
+            Err(TensorLoadError::MissingTensor(_)) => token_embedding,
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             config,
