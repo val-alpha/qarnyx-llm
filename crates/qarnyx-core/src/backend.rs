@@ -20,13 +20,31 @@ pub enum BackendError {
         /// Human-readable shape details.
         details: String,
     },
+
+    /// A scalar argument is outside the supported domain.
+    #[error("invalid parameter in {operation}: {details}")]
+    InvalidParameter {
+        /// Operation name.
+        operation: &'static str,
+        /// Human-readable parameter details.
+        details: String,
+    },
+
+    /// A temporary kernel buffer could not be reserved.
+    #[error("allocation failed in {operation} for {elements} elements")]
+    AllocationFailed {
+        /// Operation name.
+        operation: &'static str,
+        /// Requested number of elements.
+        elements: usize,
+    },
 }
 
 /// Hardware-independent tensor operations used by model implementations.
 ///
-/// Logical matrix layouts and buffer dimensions must be documented and
-/// validated by each implementation. Quantized weights should be consumed
-/// directly by suitable kernels rather than expanded into a full F32 copy.
+/// Logical matrix layouts and buffer dimensions are documented and validated
+/// by each operation. Quantized weights should be consumed directly by
+/// suitable kernels rather than expanded into a full F32 copy.
 pub trait Backend: Send + Sync {
     /// Returns a stable backend name.
     fn name(&self) -> &'static str;
@@ -41,6 +59,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), BackendError>;
 
     /// Computes C = A * B where A is [m, k], B is [k, n], and C is [m, n].
+    /// A is supplied as a row-major tensor view; B and C are row-major slices.
     fn matmul(
         &self,
         weights: TensorView<'_>,
@@ -60,7 +79,10 @@ pub trait Backend: Send + Sync {
         epsilon: f32,
     ) -> Result<(), BackendError>;
 
-    /// Applies rotary positional embedding to one packed head vector.
+    /// Applies LLaMA-style split-half rotary embedding to one head vector.
+    ///
+    /// The first and second halves form the rotation pairs. `input.len()`
+    /// must equal `head_dim`, which must be even.
     fn rope(
         &self,
         input: &mut [f32],
@@ -69,9 +91,12 @@ pub trait Backend: Send + Sync {
         theta: f32,
     ) -> Result<(), BackendError>;
 
-    /// Applies softmax in place.
+    /// Applies numerically stable softmax in place.
     fn softmax(&self, input: &mut [f32]) -> Result<(), BackendError>;
 
     /// Computes gate = SiLU(gate) * up in place.
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) -> Result<(), BackendError>;
+
+    /// Adds a residual slice to target in place.
+    fn residual_add(&self, target: &mut [f32], residual: &[f32]) -> Result<(), BackendError>;
 }
