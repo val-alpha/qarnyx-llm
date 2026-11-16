@@ -339,7 +339,7 @@ mod tests {
                 "hello".into(),
             ],
             scores: vec![0.0; 7],
-            merges: vec!["h e".into(), "l l".into(), "he l".into(), "hel lo".into()],
+            merges: vec!["h e".into(), "he l".into(), "l l".into(), "hel lo".into()],
             bos_token_id: None,
             eos_token_id: None,
         };
