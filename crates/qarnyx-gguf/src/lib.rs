@@ -1,9 +1,8 @@
 //! GGUF v3 parsing and validated tensor-directory access.
 //!
 //! The parser streams the header, metadata, and tensor descriptors from any
-//! seekable reader. Tensor weight payloads are not copied into memory. Exact
-//! per-tensor byte-range validation will be added with the GGML quantization
-//! type registry so block-encoded formats are sized correctly.
+//! seekable reader. It validates exact per-tensor byte ranges using the
+//! qarnyx-quant GGML type registry without copying payload bytes into memory.
 
 mod parser;
 
