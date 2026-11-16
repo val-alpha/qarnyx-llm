@@ -132,10 +132,13 @@ selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
 remain future optimizations. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
 addition currently use scalar implementations.
 
-The `workers` setting is currently retained as configuration only; it does
-not create threads. The persistent worker pool is a remaining M6 task. Run
-`cargo bench -p qarnyx-cpu --bench kernels` to compare scalar and runtime
-dispatch for each registered storage format.
+The `workers` setting now controls fork/join parallelism for large CPU matrix
+operations. Qarnyx uses scoped Rust threads so each operation joins before the
+next model operation begins; a persistent worker pool remains a follow-up
+optimization. Benchmark worker counts 1, 2, 4, 6, 8, and 10 on the target
+VPS because thread creation, scheduler contention, and memory bandwidth may
+make fewer workers faster. Run `cargo bench -p qarnyx-cpu --bench kernels` to
+compare scalar and runtime dispatch for each registered storage format.
 
 The scalar implementation is the correctness oracle. SIMD implementations
 must be compared against it with documented tolerances and must pass
@@ -238,8 +241,14 @@ state against an independent reference before declaring model compatibility.
   against the default AVX2 plus dequantization path on the target VPS.
 - Add fused Q5_K/Q6_K matvec kernels and then evaluate fused SIMD arithmetic.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
-- Implement a persistent worker pool, avoid nested scheduling, and measure
-  worker scaling rather than assuming more workers are faster.
+- Implemented first-stage worker parallelism across independent matvec/matmul
+  output rows using scoped Rust threads; a persistent pool is still planned to
+  remove per-operation thread creation overhead.
+- Add Qwen3.5 execution profiling for linear-attention projections,
+  full-attention projections, FFN projections, recurrent/attention core work,
+  and final logits projection before choosing the next kernel optimization.
+- Measure allocation volume and backend kernel time separately; use those
+  measurements to guide reusable activation scratch and dequantization work.
 - Benchmark prefill/decode tokens per second, latency, and peak RSS.
 
 ### M7 - Operational hardening
@@ -251,6 +260,8 @@ state against an independent reference before declaring model compatibility.
 
 Always record:
 - exact model file and quantization;
+- `workers` value and whether fork/join or persistent scheduling is active;
+- when `QARNYX_PROFILE=1` is enabled, aggregate Qwen3.5 projection/core timing;
 - CPU model, vCPU allocation, feature flags, and compiler version;
 - thread count and affinity policy;
 - prompt length, generation length, and context size;
