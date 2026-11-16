@@ -611,7 +611,7 @@ mod tests {
         for row in 0..2 {
             let base = row * 210;
             q6_k[base..base + 32].fill(if row == 0 { 0x01 } else { 0x02 });
-            q6_k[base + 128..base + 160].fill(0xaa);
+            q6_k[base + 128..base + 192].fill(0xaa);
             q6_k[base + 192..base + 208].fill(1);
             q6_k[base + 208..base + 210].copy_from_slice(&0x3c00_u16.to_le_bytes());
         }
