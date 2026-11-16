@@ -331,7 +331,7 @@ fn rms0(x:&[f32],w:&[f32],eps:f32)->Result<Vec<f32>,ModelError>{
 }
 fn headnorm(x:&mut[f32],w:&[f32],eps:f32){let m=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>()/x.len() as f64;let inv=(m+f64::from(eps)).sqrt().recip() as f32;for(i,a)in x.iter_mut().enumerate(){*a*=inv*(1.0+w[i]);}}
 fn l2(x:&mut[f32]){let s=x.iter().map(|v|f64::from(*v)*f64::from(*v)).sum::<f64>();let inv=(s+1e-6).sqrt().recip() as f32;for v in x{*v*=inv;}}
-fn rope(x:&mut[f32],theta:f32,pos:usize){for i in 0..ROPE/2{let a=(pos as f32)*theta.powf(-((2*i)as f32)/ROPE as f32);let(c,s)=(a.cos(),a.sin());let u=x[2*i];let v=x[2*i+1];x[2*i]=u*c-v*s;x[2*i+1]=u*s+v*c;}}
+fn rope(x:&mut[f32],theta:f32,pos:usize){\n    // Qwen3.5 uses the standard split-half rotate_half operation on its\n    // 64-dimensional rotary slice. The MRoPE frequency layout is\n    // interleaved, but the vector rotation itself is not adjacent-pair RoPE.\n    let half=ROPE/2;\n    for i in 0..half {\n        let a=(pos as f32)*theta.powf(-((2*i)as f32)/ROPE as f32);\n        let(c,s)=(a.cos(),a.sin());\n        let u=x[i];\n        let v=x[i+half];\n        x[i]=u*c-v*s;\n        x[i+half]=u*s+v*c;\n    }\n}
 fn dot(a:&[f32],b:&[f32])->f32{a.iter().zip(b).map(|(x,y)|x*y).sum()}
 fn add(a:&mut[f32],b:&[f32]){for(i,x)in a.iter_mut().enumerate(){*x+=b[i];}}
 fn softmax(x:&mut[f32]){let m=x.iter().copied().fold(f32::NEG_INFINITY,f32::max);let mut s=0.0f64;for v in x.iter_mut(){*v=(*v-m).exp();s+=f64::from(*v);}for v in x{*v=(f64::from(*v)/s)as f32;}}
