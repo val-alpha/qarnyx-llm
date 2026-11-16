@@ -13,6 +13,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 qarnyx-gguf = { path = "../qarnyx-gguf" }
+qarnyx-cpu = { path = "../qarnyx-cpu" }
+qarnyx-models = { path = "../qarnyx-models" }
+qarnyx-runtime = { path = "../qarnyx-runtime" }
+qarnyx-tokenizer = { path = "../qarnyx-tokenizer" }
 
 [lints]
 workspace = true
