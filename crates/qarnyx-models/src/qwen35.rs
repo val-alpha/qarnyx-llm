@@ -278,7 +278,7 @@ fn ffn<B:Backend>(b:&B,c:&Qwen35Config,norm:&[f32],gate:TensorView<'_>,up:Tensor
 fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35Layer<'a>,TensorLoadError>{
     let p=format!("blk.{i}");
     let an=Box::leak(vector(g,d,&format!("{p}.attn_norm.weight"),&[H])?.into_boxed_slice());
-    let fnorm=Box::leak(vector(g,d,&format!("{p}.ffn_norm.weight"),&[H])?.into_boxed_slice());
+    let fnorm=Box::leak(vector(g,d,&format!("{p}.post_attention_norm.weight"),&[H])?.into_boxed_slice());
     let fg=matrix(g,d,&format!("{p}.ffn_gate.weight"),&[FF,H])?;
     let fu=matrix(g,d,&format!("{p}.ffn_up.weight"),&[FF,H])?;
     let fd=matrix(g,d,&format!("{p}.ffn_down.weight"),&[H,FF])?;
