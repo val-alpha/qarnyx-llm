@@ -138,7 +138,6 @@ pub struct Qwen35Attention<'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum Qwen35Layer<'a> { Linear(Qwen35Linear<'a>), Attention(Qwen35Attention<'a>) }
 
-#[derive(Debug, Clone)]
 #[derive(Debug, Clone, Default)]
 struct Qwen35Scratch {
     hidden_a: Vec<f32>,
@@ -167,6 +166,7 @@ struct Qwen35Workspace {
     scores: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen35Cache {
     pub sequence_len: usize,
     recurrent: Vec<Vec<f32>>,
