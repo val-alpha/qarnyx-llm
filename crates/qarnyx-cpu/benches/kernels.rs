@@ -155,6 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let scalar_backend = CpuBackend::new_scalar(1)?;
     let auto_backend = CpuBackend::new(1)?;
     let fused_q4k_backend = CpuBackend::new_fused_q4k(1)?;
+    let fused_qk_backend = CpuBackend::new_fused_qk(1)?;
     let features = auto_backend.features();
     println!(
         "CPU features: avx2={} fma={} avx512f={} neon={} (AVX2 active: {})",
@@ -243,6 +244,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         DType::Q4K,
         12,
     )?;
+
+    println!("\nQ5_K / Q6_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
+    for (label, dtype, raw_type) in [
+        ("Q5_K", DType::Q5K, 13),
+        ("Q6_K", DType::Q6K, 14),
+    ] {
+        benchmark_matvec(&auto_backend, "auto-dequant", label, dtype, raw_type)?;
+        benchmark_matvec(&fused_qk_backend, "fused-qk", label, dtype, raw_type)?;
+    }
 
     println!("\nMatmul storage-format comparison (scalar vs runtime dispatch):");
     for (label, dtype, raw_type) in formats {
