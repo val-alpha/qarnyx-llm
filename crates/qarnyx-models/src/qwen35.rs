@@ -687,7 +687,7 @@ fn attention<B: Backend>(
 
 fn ffn<B: Backend>(
     b: &B,
-    _c: &Qwen35Config,
+    c: &Qwen35Config,
     norm_weights: &[f32],
     gate: TensorView<'_>,
     up: TensorView<'_>,
@@ -700,7 +700,7 @@ fn ffn<B: Backend>(
     profile: &mut Option<&mut Qwen35Profile>,
 ) -> Result<(), ModelError> {
     ensure_buffer(norm_scratch, H);
-    rms0_into(input, norm_weights, 1.0e-5, norm_scratch)?;
+    rms0_into(input, norm_weights, c.rms_epsilon, norm_scratch)?;
     ensure_buffer(gate_scratch, FF);
     ensure_buffer(up_scratch, FF);
 

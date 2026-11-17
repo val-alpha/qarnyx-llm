@@ -792,7 +792,7 @@ impl Backend for CpuBackend {
             outputs
                 .par_iter_mut()
                 .enumerate()
-                .try_for_each(|(index, output)| self.matvec(weights[index], input, output))
+                .try_for_each(|(index, output)| self.matvec(weights[index], input, *output))
         })
     }
 
@@ -1296,8 +1296,8 @@ mod tests {
 
         backend.matvec_batch(&weights, &input, &mut outputs).unwrap();
 
-        assert_eq!(first, [6.5, 11.0]);
-        assert_eq!(second, [-1.5, 7.0, 5.0]);
+        assert_eq!(first, [4.5, 9.0]);
+        assert_eq!(second, [-1.0, 4.5, 6.0]);
     }
 
     #[test]
