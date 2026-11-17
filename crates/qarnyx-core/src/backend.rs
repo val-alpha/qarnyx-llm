@@ -70,6 +70,34 @@ pub trait Backend: Send + Sync {
         k: usize,
     ) -> Result<(), BackendError>;
 
+    /// Computes independent matrix-vector projections that share one input.
+    ///
+    /// Each weight tensor writes to its corresponding output slice. The default
+    /// implementation executes projections sequentially; a backend with a
+    /// persistent scheduler may run independent projections concurrently.
+    fn matvec_batch(
+        &self,
+        weights: &[TensorView<'_>],
+        input: &[f32],
+        outputs: &mut [&mut [f32]],
+    ) -> Result<(), BackendError> {
+        if weights.len() != outputs.len() {
+            return Err(BackendError::ShapeMismatch {
+                operation: "matvec_batch",
+                details: format!(
+                    "{} weight tensors have {} output buffers",
+                    weights.len(),
+                    outputs.len()
+                ),
+            });
+        }
+
+        for (weight, output) in weights.iter().copied().zip(outputs.iter_mut()) {
+            self.matvec(weight, input, *output)?;
+        }
+        Ok(())
+    }
+
     /// Applies an operation to each disjoint, fixed-size mutable chunk.
     ///
     /// The default implementation is sequential. Backends with a persistent
