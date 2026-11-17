@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests pass, and the target Ubuntu workstation produced an initial 20.8% end-to-end wall-time improvement in a single before/after run with identical generated text. Treat the performance result as promising but not statistically conclusive.
+**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests pass, and two target-Ubuntu before/after pairs both showed lower wall time after M6 (20.8% and 11.6%; the two-run means were 16.6% lower), with identical displayed output in each pair. This is promising but remains a small, non-statistical sample.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -256,6 +256,25 @@ The post-M6 profile recorded `linear_recurrent_heads` 630 times, with 475.127 ms
 
 **Interpretation:** this is a promising initial end-to-end result and is consistent with the intended optimization. It is one before/after pair only, however. It does not establish statistical significance or prove that all 5.90 seconds came from the recurrent-head change; run-to-run system variation may contribute. Preserve the result as an observed measurement, not a universal speedup claim. The user considers the current testing sufficient and has requested no further benchmark sweep for this stage.
 
+### 4.7 Second M6-A end-to-end before/after pair (2026-11-17)
+
+The user repeated the same release-binary A/B comparison on the target Ubuntu workstation with the same model, prompt, token limit, sampling settings, ten workers, and `auto` CPU kernel.
+
+| Binary | Wall time |
+|---|---:|
+| Before M6 | 23.19 s |
+| After M6 | 20.51 s |
+| Observed difference | **2.68 s faster (11.6%)** |
+
+The displayed generated text was identical in both runs:
+`hi there! I am a 25 year old male, 5'5" tall, 180 lbs, and I have a 10 year old`
+
+The post-M6 profile recorded `linear_recurrent_heads` 630 times, with 550.594 ms aggregate measured time and 873.959 µs average per call. The before-M6 profile's `layer_linear_total` row showed 13,221.142 ms. The after-M6 excerpt starts at `output_logits_matvec`, so its `layer_linear_total` value is not available from the supplied `tail -n 20` output and should not be inferred.
+
+**Combined observation across the two A/B pairs:** the first pair was 28.35 s before versus 22.45 s after (20.8% lower); this second pair was 23.19 s before versus 20.51 s after (11.6% lower). Across the two samples per arm, the arithmetic mean was 25.77 s before and 21.48 s after, a 4.29 s / 16.6% lower mean elapsed time. Both pairs produced identical displayed text before and after.
+
+This second pair strengthens the evidence that the direction of the improvement is repeatable on this machine, but two pairs are still too few to establish statistical significance or isolate all of the observed difference to the recurrent-head scheduling change. The user considers testing sufficient and has requested no further benchmark sweep at this stage.
+
 ## 5. Qarnyx M6 work inspired by Kimi
 
 Follow-up A (parallel recurrent heads) is now implemented on `main`. Follow-ups B–D and the later research items remain proposals, not completed features or a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
@@ -286,7 +305,7 @@ The recorded results are summarized in section 4.5. Ten workers is the provision
 
 **CI note:** the run's final conclusion remains failed because the repository-wide `cargo fmt --all -- --check` reports formatting differences across multiple existing Rust files. The same formatting step also failed before this M6 change (run #159 on `8b91794`), so it is existing repository-wide formatting debt, not a new compile/test failure. The CI workflow now runs build and tests before that formatting gate so future runs still expose compiler and test results.
 
-**Performance evidence:** the first target-machine before/after run showed 20.8% lower elapsed time with identical displayed output (see section 4.6). Because this is one pair of samples, preserve it as a promising observation rather than a statistically established gain. The user has elected to stop benchmarking this stage here.
+**Performance evidence:** two target-machine before/after pairs showed 20.8% and 11.6% lower elapsed time, respectively, with identical displayed output in both pairs (see sections 4.6–4.7). The two-sample means were 25.77 s before and 21.48 s after, or 16.6% lower mean elapsed time. This remains a small sample, not a statistically established gain. The user has elected to stop benchmarking this stage here.
 
 ### M6 follow-up B — multi-projection scheduling
 
