@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests are included. End-to-end performance acceptance remains pending on the target Ubuntu workstation.
+**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests pass, and the target Ubuntu workstation produced an initial 20.8% end-to-end wall-time improvement in a single before/after run with identical generated text. Treat the performance result as promising but not statistically conclusive.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -230,6 +230,32 @@ The user ran the fixed Qwen3.5-2B generation workload six rounds at worker count
 
 Ten workers was the fastest of these three tested configurations by both mean and median: approximately 9.6% faster than eight workers and 7.1% faster than nine workers by mean elapsed time. Use ten workers as the provisional end-to-end comparison setting for the next M6 A/B test. This remains one machine and one short workload; it does not establish a universal worker-count optimum.
 
+### 4.6 M6-A end-to-end before/after result (2026-11-17)
+
+The user ran the same Qwen3.5-2B generation workload once with the pre-M6 binary and once with the M6 binary on the target Ubuntu workstation.
+
+| Setting | Value |
+|---|---|
+| Model | `models/Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf` |
+| Prompt | `hi there!` |
+| Max new tokens | 32 |
+| Sampling | temperature 0, top-k 0, top-p 1 |
+| Workers / CPU kernel | 10 / `auto` |
+| Profiling | `QARNYX_PROFILE=1` |
+
+| Binary | Wall time |
+|---|---:|
+| Before M6 | 28.35 s |
+| After M6 | 22.45 s |
+| Observed difference | **5.90 s faster (20.8%)** |
+
+The displayed generated text was identical in both runs:
+`hi there! I am a 25 year old male, 5'5" tall, 180 lbs, and I have a 10 year old`
+
+The post-M6 profile recorded `linear_recurrent_heads` 630 times, with 475.127 ms aggregate measured time and 754.170 µs average per call. This is the new section that covers recurrent-head state updates and head output work.
+
+**Interpretation:** this is a promising initial end-to-end result and is consistent with the intended optimization. It is one before/after pair only, however. It does not establish statistical significance or prove that all 5.90 seconds came from the recurrent-head change; run-to-run system variation may contribute. Preserve the result as an observed measurement, not a universal speedup claim. The user considers the current testing sufficient and has requested no further benchmark sweep for this stage.
+
 ## 5. Qarnyx M6 work inspired by Kimi
 
 Follow-up A (parallel recurrent heads) is now implemented on `main`. Follow-ups B–D and the later research items remain proposals, not completed features or a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
@@ -240,7 +266,7 @@ The user completed six rounds of the selected `auto` workload at workers 8, 9, a
 
 The recorded results are summarized in section 4.5. Ten workers is the provisional setting for the M6 before/after comparison on this workload; this is not a universal optimum. Use the same model, prompt, token settings, release build, and ten-worker setting for the next A/B run. Compare exact generated output/token IDs as well as elapsed time.
 
-### M6 follow-up A — parallel recurrent heads (implemented; performance acceptance pending)
+### M6 follow-up A — parallel recurrent heads (implemented; initial end-to-end improvement observed)
 
 **Why:** the 16 recurrent heads have separate state blocks. Kimi's KDA implementation uses the same general principle: parallelize across independent heads while preserving the sequential recurrence within each head.
 
@@ -260,7 +286,7 @@ The recorded results are summarized in section 4.5. Ten workers is the provision
 
 **CI note:** the run's final conclusion remains failed because the repository-wide `cargo fmt --all -- --check` reports formatting differences across multiple existing Rust files. The same formatting step also failed before this M6 change (run #159 on `8b91794`), so it is existing repository-wide formatting debt, not a new compile/test failure. The CI workflow now runs build and tests before that formatting gate so future runs still expose compiler and test results.
 
-**Performance gate (not yet accepted):** compare the new binary with the recorded pre-change baseline at 10 workers using the same model and prompt. Keep the change only if the end-to-end result improves without output drift or a material regression. The run must use the existing binary/model and should not trigger another worker-count sweep.
+**Performance evidence:** the first target-machine before/after run showed 20.8% lower elapsed time with identical displayed output (see section 4.6). Because this is one pair of samples, preserve it as a promising observation rather than a statistically established gain. The user has elected to stop benchmarking this stage here.
 
 ### M6 follow-up B — multi-projection scheduling
 
