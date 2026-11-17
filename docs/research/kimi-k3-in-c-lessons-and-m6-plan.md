@@ -510,8 +510,10 @@ until real workloads show a repeatable gain without an output regression.
 
 The M6-E code adds synthetic CPU microbenchmarks to
 `crates/qarnyx-cpu/benches/kernels.rs`. The bench uses equal logical matrix
-dimensions for each kernel arm and reports microseconds per matvec. On the
-user's Ubuntu checkout, run:
+dimensions for each kernel arm and reports microseconds per matvec. It tests
+both one worker (kernel-focused comparison) and ten workers (matching the
+current end-to-end inference setting) for each format. On the user's Ubuntu
+checkout, run:
 
 ```bash
 git status --short
@@ -520,11 +522,11 @@ git pull --ff-only origin main
 cargo bench --release -p qarnyx-cpu --bench kernels
 ```
 
-Keep the output lines labelled `auto-dequant Q5_K`, `fused-qk Q5_K`,
-`auto-dequant Q6_K`, and `fused-qk Q6_K`. The bench uses one worker for
-these A/B calls so it isolates packed-kernel work from thread scheduling. It
-also prints the CPU feature flags near the beginning. Report each format's
-speed ratio separately; Q5_K and Q6_K have different unpacking costs.
+Keep the output lines labelled `workers=1 auto-dequant Q5_K`,
+`workers=1 fused-qk Q5_K`, `workers=10 auto-dequant Q5_K`,
+`workers=10 fused-qk Q5_K`, and the equivalent four Q6_K lines. The bench
+also prints CPU feature flags near the beginning. Report each format and
+worker count separately; Q5_K and Q6_K have different unpacking costs.
 
 The current user's Q4_K model does not contain Q5_K/Q6_K tensors, so running
 the existing Qwen3.5-2B end-to-end generation command with that file will not
