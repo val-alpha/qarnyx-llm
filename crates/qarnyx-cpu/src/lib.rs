@@ -1304,7 +1304,8 @@ mod tests {
     fn matvec_batch_rejects_weight_output_count_mismatch() {
         let backend = CpuBackend::new(2).unwrap();
         let bytes = f32_bytes(&[1.0, 2.0]);
-        let weights = [TensorView::new(&bytes, &[1, 2], DType::F32)];
+        let weight = TensorView::new(&bytes, &[1, 2], DType::F32);
+        let weights = [weight, weight];
         let mut output = [0.0_f32; 1];
         let mut outputs: [&mut [f32]; 1] = [&mut output];
 
