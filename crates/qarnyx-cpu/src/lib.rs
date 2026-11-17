@@ -11,8 +11,8 @@ use qarnyx_quant::{
     dequantize_into, dot_q4_k as dot_q4_k_scalar, dot_q5_k as dot_q5_k_scalar,
     dot_q6_k as dot_q6_k_scalar, encoded_len,
 };
-use rayon::prelude::*;
 use rayon::ThreadPool;
+use rayon::prelude::*;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -181,8 +181,7 @@ impl CpuBackend {
             }
         }
 
-        dot_q4_k_scalar(encoded, input)
-            .map_err(|error| shape_mismatch("matvec", error.to_string()))
+        dot_q4_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
     }
 
     fn fused_q5k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
@@ -193,8 +192,7 @@ impl CpuBackend {
             }
         }
 
-        dot_q5_k_scalar(encoded, input)
-            .map_err(|error| shape_mismatch("matvec", error.to_string()))
+        dot_q5_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
     }
 
     fn fused_q6k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
@@ -205,8 +203,7 @@ impl CpuBackend {
             }
         }
 
-        dot_q6_k_scalar(encoded, input)
-            .map_err(|error| shape_mismatch("matvec", error.to_string()))
+        dot_q6_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
     }
 
     fn fused_k_dot(
@@ -516,8 +513,16 @@ unsafe fn dot_q5_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
                     for lane in 0..8 {
                         let index = offset + lane;
                         let packed = low_bits[quant_offset + index];
-                        let low = if half == 0 { packed & 0x0f } else { packed >> 4 };
-                        let high = if high_bits[index] & mask != 0 { 1_i32 } else { 0_i32 };
+                        let low = if half == 0 {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
+                        let high = if high_bits[index] & mask != 0 {
+                            1_i32
+                        } else {
+                            0_i32
+                        };
                         values[lane] = i32::from(low) | (high << 4);
                     }
                     let integers = _mm256_loadu_si256(values.as_ptr().cast());
@@ -820,18 +825,16 @@ impl Backend for CpuBackend {
         let workers = self.worker_count.min(out_features);
         let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
-        let fused_q5k_q6k = self.fused_q5k_q6k_matvec
-            && matches!(weights.dtype, DType::Q5K | DType::Q6K);
+        let fused_q5k_q6k =
+            self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
         let fused = fused_q4k || fused_q5k_q6k;
 
         if fused {
             if parallel {
                 let chunk_rows = out_features.div_ceil(workers);
                 return self.pool.install(|| {
-                    output
-                        .par_chunks_mut(chunk_rows)
-                        .enumerate()
-                        .try_for_each(|(chunk_index, output_chunk)| {
+                    output.par_chunks_mut(chunk_rows).enumerate().try_for_each(
+                        |(chunk_index, output_chunk)| {
                             let first_row = chunk_index * chunk_rows;
                             for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
                                 let row_index = first_row + local_row;
@@ -847,16 +850,19 @@ impl Backend for CpuBackend {
                                         "encoded weight row end overflowed usize",
                                     )
                                 })?;
-                                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
-                                    shape_mismatch(
-                                        "matvec",
-                                        "encoded weight row is outside the tensor byte range",
-                                    )
-                                })?;
-                                *output_value = self.fused_k_dot(weights.dtype, encoded_row, input)?;
+                                let encoded_row =
+                                    weights.data.get(start..end).ok_or_else(|| {
+                                        shape_mismatch(
+                                            "matvec",
+                                            "encoded weight row is outside the tensor byte range",
+                                        )
+                                    })?;
+                                *output_value =
+                                    self.fused_k_dot(weights.dtype, encoded_row, input)?;
                             }
                             Ok(())
-                        })
+                        },
+                    )
                 });
             }
 
@@ -868,7 +874,10 @@ impl Backend for CpuBackend {
                     shape_mismatch("matvec", "encoded weight row end overflowed usize")
                 })?;
                 let encoded_row = weights.data.get(start..end).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row is outside the tensor byte range")
+                    shape_mismatch(
+                        "matvec",
+                        "encoded weight row is outside the tensor byte range",
+                    )
                 })?;
                 *output_value = self.fused_k_dot(weights.dtype, encoded_row, input)?;
             }

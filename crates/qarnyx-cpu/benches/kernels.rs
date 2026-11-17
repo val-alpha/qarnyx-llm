@@ -246,10 +246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     println!("\nQ5_K / Q6_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
-    for (label, dtype, raw_type) in [
-        ("Q5_K", DType::Q5K, 13),
-        ("Q6_K", DType::Q6K, 14),
-    ] {
+    for (label, dtype, raw_type) in [("Q5_K", DType::Q5K, 13), ("Q6_K", DType::Q6K, 14)] {
         benchmark_matvec(&auto_backend, "auto-dequant", label, dtype, raw_type)?;
         benchmark_matvec(&fused_qk_backend, "fused-qk", label, dtype, raw_type)?;
     }

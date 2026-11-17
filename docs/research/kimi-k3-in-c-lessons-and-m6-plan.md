@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-ups A–D have initial implementations on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, and opt-in AVX2/FMA direct-block Q4_K matvec. Workspace `cargo check` and `cargo test` pass in GitHub Actions; the workspace formatting gate remains red. Two M6-A target-Ubuntu A/B pairs showed 16.6% lower mean elapsed time. The subsequent M6-B/C/D comparison has five samples per configuration: mean elapsed times were 17.01 s (M6-A `auto`), 15.76 s (B/C/D `auto`), and 12.27 s (B/C/D `fused-q4k`), with identical displayed output in all 15 runs. These are machine- and workload-specific observations, not universal performance claims. M6 remains in progress; fused Q5_K/Q6_K, AVX-512/NEON, and broader performance validation remain outstanding.
+**Status:** M6 follow-ups A–E have initial implementations on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, opt-in AVX2/FMA direct-block Q4_K, and opt-in AVX2 direct-block Q5_K/Q6_K matvecs. Workspace `cargo check` and `cargo test` pass in GitHub Actions for the M6-E commit; the workspace formatting gate remains red due to outstanding workspace rustfmt debt. Five-run M6-B/C/D measurements on the target Ubuntu workstation showed mean elapsed times of 17.01 s (M6-A `auto`), 15.76 s (B/C/D `auto`), and 12.27 s (B/C/D `fused-q4k`), with identical displayed output in all 15 runs. M6-E has correctness CI coverage but no target-machine Q5_K/Q6_K performance result yet. Measurements are machine- and workload-specific, not universal performance claims. M6 remains in progress; AVX-512/NEON and broader performance validation remain outstanding.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -407,7 +407,7 @@ the results above are transcribed from the user's supplied terminal output.
 
 ## 5. Qarnyx M6 work inspired by Kimi
 
-Follow-ups A–D now have initial implementations on `main`, and the first combined B/C/D end-to-end comparison is recorded in section 4.9. Five samples per configuration show a 7.4% lower mean elapsed time for B/C/D `auto` versus M6-A and a 27.9% lower mean for B/C/D `fused-q4k` versus M6-A on this workstation/workload. The broader M6 roadmap remains in progress because additional quantized kernels and validation across more workloads and hardware are outstanding.
+Follow-ups A–E now have initial implementations on `main`. Sections 4.9–4.10 record the repeated B/C/D end-to-end comparison and the new Q5_K/Q6_K direct-block kernels. M6-E passes workspace check/tests in CI, but target-machine performance still needs to be measured. The broader M6 roadmap remains in progress because additional quantized kernels and validation across more workloads and hardware are outstanding.
 
 ### Experiment 0 — repeatable worker baseline (completed 2026-11-17)
 
@@ -470,6 +470,68 @@ needed.
 
 Kimi's MXFP4 kernel remains an algorithmic reference only; Q4_K has its own
 block decoder and vectorized implementation.
+
+### M6 follow-up E — direct-block Q5_K / Q6_K matvecs (implemented; target benchmark pending)
+
+The CPU backend now has an opt-in `fused-qk` mode that uses direct-block
+Q4_K, Q5_K, and Q6_K matvecs. The previous `fused-q4k` mode remains
+backward-compatible and still fuses only Q4_K.
+
+- Added scalar direct-dot reference functions for Q5_K and Q6_K in
+  `qarnyx-quant`; they consume packed tensor blocks and do not allocate an
+  intermediate F32 row.
+- Added AVX2 packed-block implementations for Q5_K and Q6_K in
+  `qarnyx-cpu`. Q4_K retains its AVX2/FMA path. Q5_K/Q6_K fall back to their
+  scalar direct-block reference where AVX2 is unavailable.
+- Added CLI selection `--cpu-kernel fused-qk`; `auto` remains unchanged.
+- Added a synthetic Q5_K/Q6_K microbenchmark comparing `auto` dequantization
+  plus F32 dot against `fused-qk` direct-block matvec.
+- Tests compare scalar direct-dot, existing dequantized/automatic matvec, and
+  fused serial and parallel output on multi-block Q5_K/Q6_K fixtures. The
+  quant crate also checks direct-dot results against the decoder reference and
+  rejects invalid row alignment / encoded lengths.
+
+**CI validation:** GitHub Actions run
+[44183166986](https://github.com/val-alpha/qarnyx-llm/actions/runs/44183166986)
+for commit `f65067fe172e3d712f23b45dd26ce4ad43cbfb3b` passed
+`cargo check --workspace` and `cargo test --workspace`. The workflow still
+fails its final `cargo fmt --all -- --check` gate. The failure includes
+pre-existing workspace formatting debt in GGUF, model, runtime, tokenizer,
+and older sections of CPU/CLI files. Formatting differences in the newly
+added Q5_K/Q6_K code and benchmark loop were corrected in the follow-up
+format-only cleanup; no workspace-wide rustfmt pass was applied.
+
+**Performance status:** no Q5_K/Q6_K target-machine measurement has been
+captured yet. The synthetic microbenchmark is ready, but its timing should be
+recorded separately for both formats. Do not make `fused-qk` the default
+until real workloads show a repeatable gain without an output regression.
+
+### 4.10 Q5_K / Q6_K direct-block microbenchmark (M6-E; target run pending)
+
+The M6-E code adds synthetic CPU microbenchmarks to
+`crates/qarnyx-cpu/benches/kernels.rs`. The bench uses equal logical matrix
+dimensions for each kernel arm and reports microseconds per matvec. On the
+user's Ubuntu checkout, run:
+
+```bash
+git status --short
+git branch --show-current
+git pull --ff-only origin main
+cargo bench --release -p qarnyx-cpu --bench kernels
+```
+
+Keep the output lines labelled `auto-dequant Q5_K`, `fused-qk Q5_K`,
+`auto-dequant Q6_K`, and `fused-qk Q6_K`. The bench uses one worker for
+these A/B calls so it isolates packed-kernel work from thread scheduling. It
+also prints the CPU feature flags near the beginning. Report each format's
+speed ratio separately; Q5_K and Q6_K have different unpacking costs.
+
+The current user's Q4_K model does not contain Q5_K/Q6_K tensors, so running
+the existing Qwen3.5-2B end-to-end generation command with that file will not
+exercise the new Q5_K/Q6_K kernels. Use the synthetic microbenchmark above
+until a representative Q5_K or Q6_K GGUF model is available. No M6-E
+performance result has been inferred from the earlier Q4_K end-to-end
+measurements.
 
 ### Later research — prefill batching and file-backed weights
 
