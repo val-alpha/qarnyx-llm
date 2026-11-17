@@ -1220,6 +1220,45 @@ mod tests {
     }
 
     #[test]
+    fn parallel_fused_q4k_matvec_matches_scalar_reference() {
+        let shape = [4, 512];
+        let mut bytes = vec![0_u8; 144 * 8];
+        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 17 + block_index * 23) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 31) as u8;
+            }
+        }
+
+        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
+        let input = (0..512)
+            .map(|index| ((index * 13 % 67) as f32 - 33.0) / 37.0)
+            .collect::<Vec<_>>();
+        let scalar = CpuBackend::new_scalar(1).unwrap();
+        // Four rows and two workers enter the parallel fused-row path.
+        let fused = CpuBackend::new_fused_q4k(2).unwrap();
+        let mut expected = [0.0_f32; 4];
+        let mut actual = [0.0_f32; 4];
+
+        scalar.matvec(weights, &input, &mut expected).unwrap();
+        fused.matvec(weights, &input, &mut actual).unwrap();
+
+        for row in 0..4 {
+            let tolerance = 1.0e-3 * (1.0 + expected[row].abs());
+            assert!(
+                (actual[row] - expected[row]).abs() <= tolerance,
+                "parallel fused Q4_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                actual[row]
+            );
+        }
+    }
+
+    #[test]
     fn avx2_matvec_and_matmul_match_scalar_reference() {
         let (m, k, n) = (17, 65, 13);
         let weight_values = (0..m * k)
