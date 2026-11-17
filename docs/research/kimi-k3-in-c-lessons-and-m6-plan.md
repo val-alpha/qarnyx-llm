@@ -230,20 +230,15 @@ The user ran the fixed Qwen3.5-2B generation workload six rounds at worker count
 
 Ten workers was the fastest of these three tested configurations by both mean and median: approximately 9.6% faster than eight workers and 7.1% faster than nine workers by mean elapsed time. Use ten workers as the provisional end-to-end comparison setting for the next M6 A/B test. This remains one machine and one short workload; it does not establish a universal worker-count optimum.
 
-## 5. Proposed Qarnyx experiments inspired by Kimi
+## 5. Qarnyx M6 work inspired by Kimi
 
-These are **proposals**, not completed features and not a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
+Follow-up A (parallel recurrent heads) is now implemented on `main`. Follow-ups B–D and the later research items remain proposals, not completed features or a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
 
-### Experiment 0 — establish a repeatable baseline
+### Experiment 0 — repeatable worker baseline (completed 2026-11-17)
 
-Before changing code:
-1. Build release once and use the same binary for all arms.
-2. Run the selected `auto` workload at workers 8, 9, and 10 at least three times each (ideally interleave the order rather than always running ascending).
-3. Retain full wall-clock outputs and `QARNYX_PROFILE=1` reports.
-4. Capture host details (`lscpu`, `free -h`, `uname -a`, filesystem/device information).
-5. Record generated token IDs or exact output.
+The user completed six rounds of the selected `auto` workload at workers 8, 9, and 10, in varied order after the first three rounds. Full timing and profile logs were retained under `/tmp/qarnyx-m6-baseline/`. One Round 6 / 9-worker log was empty and excluded. No additional worker-count sweep is planned for this milestone.
 
-Treat 9 workers as a provisional configuration, not a permanent default, until this experiment confirms it.
+The recorded results are summarized in section 4.5. Ten workers is the provisional setting for the M6 before/after comparison on this workload; this is not a universal optimum. Use the same model, prompt, token settings, release build, and ten-worker setting for the next A/B run. Compare exact generated output/token IDs as well as elapsed time.
 
 ### M6 follow-up A — parallel recurrent heads (implemented; performance acceptance pending)
 
@@ -260,9 +255,9 @@ Treat 9 workers as a provisional configuration, not a permanent default, until t
 **Correctness evidence:**
 - a unit test compares q/k normalization, the complete recurrent state, and per-head output against a serial reference;
 - the test checks exact equality at 1, 4, and 10 workers, because the arithmetic order within each head is unchanged;
-- workspace CI still needs to pass after this commit, and a target-machine generation run should confirm end-to-end output/token stability.
+- the dedicated reference test is committed; the target-machine release generation run must still confirm end-to-end output/token stability.
 
-**Performance gate (not yet accepted):** compare the new binary with the recorded pre-change baseline at 10 workers using the same model and prompt. Keep the change only if the end-to-end result improves without output drift or a material regression.
+**Performance gate (not yet accepted):** compare the new binary with the recorded pre-change baseline at 10 workers using the same model and prompt. Keep the change only if the end-to-end result improves without output drift or a material regression. The run must use the existing binary/model and should not trigger another worker-count sweep.
 
 ### M6 follow-up B — multi-projection scheduling
 

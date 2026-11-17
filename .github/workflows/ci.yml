@@ -21,11 +21,13 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
+      # Run build and tests before the repository-wide formatting gate.
+      # Existing formatting debt should not hide compiler or test diagnostics.
       - name: Check workspace
         run: cargo check --workspace
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
