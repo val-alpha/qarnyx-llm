@@ -255,7 +255,10 @@ The recorded results are summarized in section 4.5. Ten workers is the provision
 **Correctness evidence:**
 - a unit test compares q/k normalization, the complete recurrent state, and per-head output against a serial reference;
 - the test checks exact equality at 1, 4, and 10 workers, because the arithmetic order within each head is unchanged;
-- the dedicated reference test is committed; the target-machine release generation run must still confirm end-to-end output/token stability.
+- GitHub Actions run #163 at commit `41708c0` passed both `cargo check --workspace` and `cargo test --workspace`, including the new exact-reference test;
+- the target-machine release generation run must still confirm end-to-end output/token stability.
+
+**CI note:** the run's final conclusion remains failed because the repository-wide `cargo fmt --all -- --check` reports formatting differences across multiple existing Rust files. The same formatting step also failed before this M6 change (run #159 on `8b91794`), so it is existing repository-wide formatting debt, not a new compile/test failure. The CI workflow now runs build and tests before that formatting gate so future runs still expose compiler and test results.
 
 **Performance gate (not yet accepted):** compare the new binary with the recorded pre-change baseline at 10 workers using the same model and prompt. Keep the change only if the end-to-end result improves without output drift or a material regression. The run must use the existing binary/model and should not trigger another worker-count sweep.
 
