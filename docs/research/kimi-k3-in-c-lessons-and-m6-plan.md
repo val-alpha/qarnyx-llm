@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** research note and experiment plan; proposed follow-up work is not yet implemented.
+**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests are included. End-to-end performance acceptance remains pending on the target Ubuntu workstation.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -218,6 +218,18 @@ Profile labels are nested: for example, matvecs contribute to the layer totals. 
 - Report every run, not only the fastest. A small speed difference is not meaningful until it exceeds measured run-to-run variation.
 - Always verify generated token IDs or text against the pre-optimization baseline when the change is intended to preserve numerical behavior.
 
+### 4.5 Repeated worker baseline update (2026-11-17)
+
+The user ran the fixed Qwen3.5-2B generation workload six rounds at worker counts 8, 9, and 10, with the round order varied after the initial three rounds. One Round 6 / 9-worker log was empty and is excluded. No further worker-count testing is planned for this milestone.
+
+| Workers | Valid samples | Mean | Median | Min | Max |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 6 | 21.12 s | 21.27 s | 19.75 s | 22.22 s |
+| 9 | 5 | 20.54 s | 20.82 s | 19.17 s | 21.31 s |
+| 10 | 6 | **19.08 s** | **19.10 s** | **18.39 s** | **19.79 s** |
+
+Ten workers was the fastest of these three tested configurations by both mean and median: approximately 9.6% faster than eight workers and 7.1% faster than nine workers by mean elapsed time. Use ten workers as the provisional end-to-end comparison setting for the next M6 A/B test. This remains one machine and one short workload; it does not establish a universal worker-count optimum.
+
 ## 5. Proposed Qarnyx experiments inspired by Kimi
 
 These are **proposals**, not completed features and not a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
@@ -233,23 +245,24 @@ Before changing code:
 
 Treat 9 workers as a provisional configuration, not a permanent default, until this experiment confirms it.
 
-### M6 follow-up A — parallel recurrent heads
+### M6 follow-up A — parallel recurrent heads (implemented; performance acceptance pending)
 
 **Why:** the 16 recurrent heads have separate state blocks. Kimi's KDA implementation uses the same general principle: parallelize across independent heads while preserving the sequential recurrence within each head.
 
-**Implementation direction:**
-- partition recurrent state into disjoint per-head mutable slices;
-- give each task the corresponding head's q/k/v, decay/beta values, and output slice;
-- preserve the existing inner-loop order within each head;
-- use the existing Rayon pool or a backend-owned scheduling primitive, not a second pool.
+**Implementation on main:**
+- added a fixed-size mutable-chunk scheduling method to the shared Backend contract, with a sequential default for other backends;
+- CpuBackend overrides it using the existing persistent Rayon pool, without creating another pool;
+- each recurrent head updates its own disjoint state block, keeping the decay, memory read, and rank-one update loop order unchanged;
+- each head then computes its output into a disjoint output slice using the same pool;
+- the decoder layer loop remains sequential; only independent work inside a recurrent layer is scheduled concurrently;
+- the model profile now reports the new work under linear_recurrent_heads.
 
-**Correctness gates:**
-- compare all recurrent state values after a step between serial and parallel implementations;
-- compare resulting hidden vectors/logits;
-- test multiple worker counts, including 1 and the configured pool size;
-- require bitwise equality when the arithmetic order is unchanged; otherwise define and justify a tight numeric tolerance and also verify identical greedy token IDs.
+**Correctness evidence:**
+- a unit test compares q/k normalization, the complete recurrent state, and per-head output against a serial reference;
+- the test checks exact equality at 1, 4, and 10 workers, because the arithmetic order within each head is unchanged;
+- workspace CI still needs to pass after this commit, and a target-machine generation run should confirm end-to-end output/token stability.
 
-**Performance gate:** the head-parallel path must improve end-to-end elapsed time on repeated runs, not merely a synthetic head microbenchmark. It must not regress small workloads.
+**Performance gate (not yet accepted):** compare the new binary with the recorded pre-change baseline at 10 workers using the same model and prompt. Keep the change only if the end-to-end result improves without output drift or a material regression.
 
 ### M6 follow-up B — multi-projection scheduling
 

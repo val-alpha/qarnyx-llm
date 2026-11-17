@@ -685,6 +685,39 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn parallel_for_each_mut(
+        &self,
+        values: &mut [f32],
+        chunk_size: usize,
+        operation: &(dyn Fn(usize, &mut [f32]) + Sync),
+    ) -> Result<(), BackendError> {
+        if chunk_size == 0 || values.len() % chunk_size != 0 {
+            return Err(shape_mismatch(
+                "parallel_for_each_mut",
+                format!(
+                    "buffer length {} must be divisible by non-zero chunk size {chunk_size}",
+                    values.len()
+                ),
+            ));
+        }
+
+        let chunk_count = values.len() / chunk_size;
+        if chunk_count <= 1 || self.worker_count <= 1 {
+            for (index, chunk) in values.chunks_exact_mut(chunk_size).enumerate() {
+                operation(index, chunk);
+            }
+            return Ok(());
+        }
+
+        self.pool.install(|| {
+            values
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(index, chunk)| operation(index, chunk));
+        });
+        Ok(())
+    }
+
     fn rms_norm(
         &self,
         input: &[f32],
@@ -854,6 +887,39 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn parallel_for_each_mut_processes_disjoint_chunks() {
+        let backend = CpuBackend::new(4).expect("four workers");
+        let mut values = vec![0.0_f32; 32];
+
+        backend
+            .parallel_for_each_mut(&mut values, 8, &|index, chunk| {
+                chunk.fill(index as f32);
+            })
+            .unwrap();
+
+        let expected = (0..32)
+            .map(|index| (index / 8) as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn parallel_for_each_mut_rejects_invalid_chunk_shapes() {
+        let backend = backend();
+        let mut values = vec![0.0_f32; 8];
+
+        for chunk_size in [0, 3] {
+            assert!(matches!(
+                backend.parallel_for_each_mut(&mut values, chunk_size, &|_, _| {}),
+                Err(BackendError::ShapeMismatch {
+                    operation: "parallel_for_each_mut",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

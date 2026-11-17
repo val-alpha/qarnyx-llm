@@ -70,6 +70,33 @@ pub trait Backend: Send + Sync {
         k: usize,
     ) -> Result<(), BackendError>;
 
+    /// Applies an operation to each disjoint, fixed-size mutable chunk.
+    ///
+    /// The default implementation is sequential. Backends with a persistent
+    /// scheduler may execute chunks concurrently. The operation must only mutate
+    /// the chunk passed to it; chunks never overlap.
+    fn parallel_for_each_mut(
+        &self,
+        values: &mut [f32],
+        chunk_size: usize,
+        operation: &(dyn Fn(usize, &mut [f32]) + Sync),
+    ) -> Result<(), BackendError> {
+        if chunk_size == 0 || values.len() % chunk_size != 0 {
+            return Err(BackendError::ShapeMismatch {
+                operation: "parallel_for_each_mut",
+                details: format!(
+                    "buffer length {} must be divisible by non-zero chunk size {chunk_size}",
+                    values.len()
+                ),
+            });
+        }
+
+        for (index, chunk) in values.chunks_exact_mut(chunk_size).enumerate() {
+            operation(index, chunk);
+        }
+        Ok(())
+    }
+
     /// Applies RMS normalization to input using the provided scale weights.
     fn rms_norm(
         &self,

@@ -307,35 +307,118 @@ fn linear<B: Backend>(b: &B, c: &Qwen35Config, w: &Qwen35Linear<'_>, input: &[f3
     q.copy_from_slice(&conv[..LIN]);
     k.copy_from_slice(&conv[LIN..2*LIN]);
     v.copy_from_slice(&conv[2*LIN..3*LIN]);
-    for h in 0..LH {
-        l2(&mut q[h*LD..(h+1)*LD]);
-        for v in &mut q[h*LD..(h+1)*LD] { *v /= (LD as f32).sqrt(); }
-        l2(&mut k[h*LD..(h+1)*LD]);
-        let sb = h*LD*LD;
-        let decay = (-w.a[h].exp() * softplus(alpha[h] + w.dt[h])).exp();
-        let beta = sigmoid(beta[h]);
-        for j in 0..LD { for i in 0..LD { state[sb+i*LD+j] *= decay; } }
-        let mut mem = [0.0f32; LD];
-        for j in 0..LD {
-            for i in 0..LD { mem[j] += state[sb+i*LD+j] * k[h*LD+i]; }
-        }
-        for i in 0..LD {
-            let d = (v[h*LD+i] - mem[i]) * beta;
-            for j in 0..LD { state[sb+j*LD+i] += k[h*LD+j] * d; }
-        }
-    }
-    let mut core = vec![0.0; LIN];
-    for h in 0..LH {
-        let sb=h*LD*LD;
-        for j in 0..LD { for i in 0..LD { core[h*LD+j] += state[sb+i*LD+j]*q[h*LD+i]; } }
-        let sl=&mut core[h*LD..(h+1)*LD];
-        let rms=(sl.iter().map(|x| f64::from(*x)*f64::from(*x)).sum::<f64>()/LD as f64+f64::from(c.rms_epsilon)).sqrt().recip() as f32;
-        for j in 0..LD { sl[j] *= rms*w.ssm_norm[j]*silu(z[h*LD+j]); }
+    let recurrent_start = Instant::now();
+    let core = recurrent_heads(
+        b, &mut q, &mut k, &v, &z, &beta, &alpha, w.a, w.dt, state, w.ssm_norm,
+        c.rms_epsilon,
+    )?;
+    if let Some(p) = profile.as_deref_mut() {
+        p.record("linear_recurrent_heads", recurrent_start.elapsed());
     }
     let mut y=vec![0.0;H];
     timed_matvec(b, w.out, &core, &mut y, profile, "linear_out_matvec")?;
     add(&mut y,input);
     ffn(b,c,w.ffn_norm,w.ffn_gate,w.ffn_up,w.ffn_down,&y, profile)
+}
+
+fn recurrent_heads<B: Backend>(
+    b: &B,
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &[f32],
+    z: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    a: &[f32],
+    dt: &[f32],
+    state: &mut [f32],
+    ssm_norm: &[f32],
+    rms_epsilon: f32,
+) -> Result<Vec<f32>, ModelError> {
+    if q.len() != LIN
+        || k.len() != LIN
+        || v.len() != LIN
+        || z.len() != LIN
+        || beta.len() != LH
+        || alpha.len() != LH
+        || a.len() != LH
+        || dt.len() != LH
+        || state.len() != LH * LD * LD
+        || ssm_norm.len() != LD
+    {
+        return Err(ModelError::ShapeMismatch(
+            "Qwen3.5 recurrent head buffers have incompatible lengths".into(),
+        ));
+    }
+
+    // Each head owns its q/k vectors. Normalize them before dispatch so the
+    // parallel state update only reads these buffers.
+    for head in 0..LH {
+        let q_head = &mut q[head * LD..(head + 1) * LD];
+        l2(q_head);
+        for value in q_head {
+            *value /= (LD as f32).sqrt();
+        }
+        l2(&mut k[head * LD..(head + 1) * LD]);
+    }
+
+    // Recurrent time order is preserved within a head. Only independent heads
+    // are scheduled concurrently, and each task receives one disjoint state block.
+    b.parallel_for_each_mut(state, LD * LD, &|head, head_state| {
+        let key_head = &k[head * LD..(head + 1) * LD];
+        let value_head = &v[head * LD..(head + 1) * LD];
+        let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+        let beta_value = sigmoid(beta[head]);
+
+        for column in 0..LD {
+            for row in 0..LD {
+                head_state[row * LD + column] *= decay;
+            }
+        }
+
+        let mut memory = [0.0_f32; LD];
+        for column in 0..LD {
+            for row in 0..LD {
+                memory[column] += head_state[row * LD + column] * key_head[row];
+            }
+        }
+
+        for row in 0..LD {
+            let delta = (value_head[row] - memory[row]) * beta_value;
+            for column in 0..LD {
+                head_state[column * LD + row] += key_head[column] * delta;
+            }
+        }
+    })?;
+
+    // Each output head reads only its updated state and writes to its own slice.
+    // The per-head reduction order is unchanged.
+    let mut core = vec![0.0_f32; LIN];
+    b.parallel_for_each_mut(&mut core, LD, &|head, head_core| {
+        let head_state = &state[head * LD * LD..(head + 1) * LD * LD];
+        let query_head = &q[head * LD..(head + 1) * LD];
+        let gate_head = &z[head * LD..(head + 1) * LD];
+
+        for column in 0..LD {
+            for row in 0..LD {
+                head_core[column] += head_state[row * LD + column] * query_head[row];
+            }
+        }
+
+        let mean_square = head_core
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            / LD as f64;
+        let rms = (mean_square + f64::from(rms_epsilon))
+            .sqrt()
+            .recip() as f32;
+        for column in 0..LD {
+            head_core[column] *= rms * ssm_norm[column] * silu(gate_head[column]);
+        }
+    })?;
+
+    Ok(core)
 }
 
 fn attention<B: Backend>(b:&B,c:&Qwen35Config,w:&Qwen35Attention<'_>,input:&[f32],pos:usize,
@@ -490,3 +573,169 @@ fn token_count(g:&GgufFile)->Result<usize,TensorLoadError>{let t=find(g,"token_e
 fn u(g:&GgufFile,k:&'static str)->Result<usize,TensorLoadError>{let v=g.metadata_value(k).ok_or_else(||TensorLoadError::Config(format!("missing metadata {k}")))?;let n=match v{MetadataValue::Uint32(x)=>u64::from(*x),MetadataValue::Uint64(x)=>*x,MetadataValue::Int32(x)if *x>=0=>*x as u64,MetadataValue::Int64(x)if *x>=0=>*x as u64,_=>return Err(TensorLoadError::Config(format!("{k} is not an integer")))};usize::try_from(n).map_err(|_|TensorLoadError::Config(format!("{k} exceeds usize")))}
 fn f(g:&GgufFile,k:&'static str)->Result<f32,TensorLoadError>{match g.metadata_value(k){Some(MetadataValue::Float32(x))=>Ok(*x),Some(MetadataValue::Float64(x))=>Ok(*x as f32),_=>Err(TensorLoadError::Config(format!("missing or invalid metadata {k}")))}}
 fn bools(g:&GgufFile,k:&'static str)->Result<Vec<bool>,TensorLoadError>{let MetadataValue::Array{values,..}=g.metadata_value(k).ok_or_else(||TensorLoadError::Config(format!("missing metadata {k}")))?else{return Err(TensorLoadError::Config(format!("{k} is not an array")))};values.iter().map(|v|match v{MetadataValue::Bool(x)=>Ok(*x),_=>Err(TensorLoadError::Config(format!("{k} is not BOOL[]")))}).collect()}
+
+
+#[cfg(test)]
+mod recurrent_head_tests {
+    use super::*;
+    use qarnyx_cpu::CpuBackend;
+
+    fn signal(length: usize, offset: usize) -> Vec<f32> {
+        (0..length)
+            .map(|index| {
+                let value = ((index * 37 + offset * 19) % 251) as i32 - 125;
+                value as f32 / 1_000.0
+            })
+            .collect()
+    }
+
+    fn serial_reference(
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        z: &[f32],
+        beta: &[f32],
+        alpha: &[f32],
+        a: &[f32],
+        dt: &[f32],
+        state: &mut [f32],
+        ssm_norm: &[f32],
+        rms_epsilon: f32,
+    ) -> Vec<f32> {
+        for head in 0..LH {
+            l2(&mut q[head * LD..(head + 1) * LD]);
+            for value in &mut q[head * LD..(head + 1) * LD] {
+                *value /= (LD as f32).sqrt();
+            }
+            l2(&mut k[head * LD..(head + 1) * LD]);
+
+            let state_start = head * LD * LD;
+            let head_state = &mut state[state_start..state_start + LD * LD];
+            let key_head = &k[head * LD..(head + 1) * LD];
+            let value_head = &v[head * LD..(head + 1) * LD];
+            let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+            let beta_value = sigmoid(beta[head]);
+
+            for column in 0..LD {
+                for row in 0..LD {
+                    head_state[row * LD + column] *= decay;
+                }
+            }
+
+            let mut memory = [0.0_f32; LD];
+            for column in 0..LD {
+                for row in 0..LD {
+                    memory[column] += head_state[row * LD + column] * key_head[row];
+                }
+            }
+
+            for row in 0..LD {
+                let delta = (value_head[row] - memory[row]) * beta_value;
+                for column in 0..LD {
+                    head_state[column * LD + row] += key_head[column] * delta;
+                }
+            }
+        }
+
+        let mut core = vec![0.0_f32; LIN];
+        for head in 0..LH {
+            let state_start = head * LD * LD;
+            let head_state = &state[state_start..state_start + LD * LD];
+            let query_head = &q[head * LD..(head + 1) * LD];
+            let gate_head = &z[head * LD..(head + 1) * LD];
+            let head_core = &mut core[head * LD..(head + 1) * LD];
+
+            for column in 0..LD {
+                for row in 0..LD {
+                    head_core[column] += head_state[row * LD + column] * query_head[row];
+                }
+            }
+
+            let mean_square = head_core
+                .iter()
+                .map(|value| f64::from(*value) * f64::from(*value))
+                .sum::<f64>()
+                / LD as f64;
+            let rms = (mean_square + f64::from(rms_epsilon))
+                .sqrt()
+                .recip() as f32;
+            for column in 0..LD {
+                head_core[column] *= rms * ssm_norm[column] * silu(gate_head[column]);
+            }
+        }
+        core
+    }
+
+    #[test]
+    fn parallel_recurrent_heads_match_serial_reference_exactly() {
+        let q = signal(LIN, 1);
+        let k = signal(LIN, 2);
+        let v = signal(LIN, 3);
+        let z = signal(LIN, 4);
+        let beta = (0..LH)
+            .map(|head| 0.1 + head as f32 * 0.015)
+            .collect::<Vec<_>>();
+        let alpha = signal(LH, 5);
+        let a = (0..LH)
+            .map(|head| -0.4 - head as f32 * 0.015)
+            .collect::<Vec<_>>();
+        let dt = (0..LH)
+            .map(|head| 0.02 + head as f32 * 0.001)
+            .collect::<Vec<_>>();
+        let ssm_norm = (0..LD)
+            .map(|index| 0.75 + (index % 17) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let initial_state = signal(LH * LD * LD, 6);
+        let rms_epsilon = 1.0e-5_f32;
+
+        let mut expected_q = q.clone();
+        let mut expected_k = k.clone();
+        let mut expected_state = initial_state.clone();
+        let expected_core = serial_reference(
+            &mut expected_q,
+            &mut expected_k,
+            &v,
+            &z,
+            &beta,
+            &alpha,
+            &a,
+            &dt,
+            &mut expected_state,
+            &ssm_norm,
+            rms_epsilon,
+        );
+
+        for workers in [1, 4, 10] {
+            let backend = CpuBackend::new(workers).expect("CPU worker pool");
+            let mut actual_q = q.clone();
+            let mut actual_k = k.clone();
+            let mut actual_state = initial_state.clone();
+            let actual_core = recurrent_heads(
+                &backend,
+                &mut actual_q,
+                &mut actual_k,
+                &v,
+                &z,
+                &beta,
+                &alpha,
+                &a,
+                &dt,
+                &mut actual_state,
+                &ssm_norm,
+                rms_epsilon,
+            )
+            .expect("parallel recurrent heads");
+
+            assert_eq!(actual_q, expected_q, "q differs with {workers} workers");
+            assert_eq!(actual_k, expected_k, "k differs with {workers} workers");
+            assert_eq!(
+                actual_state, expected_state,
+                "recurrent state differs with {workers} workers"
+            );
+            assert_eq!(
+                actual_core, expected_core,
+                "head output differs with {workers} workers"
+            );
+        }
+    }
+}
