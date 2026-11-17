@@ -715,7 +715,11 @@ fn ffn<B: Backend>(
         profile.record("ffn_projection_batch", projection_start.elapsed());
     }
 
-    b.silu_mul(gate_scratch, up_scratch)?;
+    // Preserve the model reference's exact SiLU multiplication order while
+    // combining gate/up in the reusable gate buffer.
+    for (gate_value, up_value) in gate_scratch.iter_mut().zip(up_scratch.iter()) {
+        *gate_value = silu(*gate_value) * *up_value;
+    }
     timed_matvec(b, down, gate_scratch, output, profile, "ffn_down_matvec")?;
     add(output, input);
     Ok(())
