@@ -253,10 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             CpuBackend::new(workers)?
         };
         let fused_qk_backend = CpuBackend::new_fused_qk(workers)?;
-        for (label, dtype, raw_type) in [
-            ("Q5_K", DType::Q5K, 13),
-            ("Q6_K", DType::Q6K, 14),
-        ] {
+        for (label, dtype, raw_type) in [("Q5_K", DType::Q5K, 13), ("Q6_K", DType::Q6K, 14)] {
             benchmark_matvec(
                 &auto_qk_backend,
                 &format!("workers={workers} auto-dequant"),
