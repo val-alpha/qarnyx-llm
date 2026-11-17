@@ -316,9 +316,14 @@ and `cargo test --workspace`. The CPU crate had 25 passing tests and the
 Qwen3.5 model crate had 7 passing tests, including batch projection checks,
 parallel fused-Q4_K versus scalar-reference coverage, scratch-capacity reuse,
 and the exact recurrent-head reference test. The overall workflow remains
-red only at `cargo fmt --all -- --check`, which reports existing formatting
-differences in workspace files such as `qarnyx-tokenizer`; formatting also
-failed before these changes. No local machine build was run by the assistant.
+red at `cargo fmt --all -- --check`. Rustfmt reports differences in several
+workspace files, including touched `qarnyx-cpu/src/lib.rs` and
+`qarnyx-models/src/qwen35.rs`, as well as other files such as
+`qarnyx-runtime` and `qarnyx-tokenizer`. The workspace formatting gate was
+already failing before this M6 work; the touched files still need formatting
+cleanup, but a workspace-wide format pass was not applied to avoid unrelated
+format-only churn across the repository. No local machine build was run by the
+assistant.
 
 **Performance status:** no end-to-end M6-B/C/D benchmark result has been
 captured yet. The implementation is ready for the user's Ubuntu A/B comparison
