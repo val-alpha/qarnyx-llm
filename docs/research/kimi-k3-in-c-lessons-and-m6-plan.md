@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-up A (parallel recurrent heads) is implemented on `main`; exact-reference tests pass, and two target-Ubuntu before/after pairs both showed lower wall time after M6 (20.8% and 11.6%; the two-run means were 16.6% lower), with identical displayed output in each pair. This is promising but remains a small, non-statistical sample.
+**Status:** M6 follow-ups A–D have initial implementations on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, and opt-in AVX2/FMA direct-block Q4_K matvec. Workspace check/tests pass in GitHub Actions. Two A-only target-Ubuntu A/B pairs showed 20.8% and 11.6% lower elapsed time (16.6% lower two-sample mean), with identical displayed output. B/C/D end-to-end timings have not yet been measured on the target workstation. M6 remains in progress; fused Q5_K/Q6_K, AVX-512/NEON, and further performance validation remain outstanding.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -275,9 +275,121 @@ The post-M6 profile recorded `linear_recurrent_heads` 630 times, with 550.594 ms
 
 This second pair strengthens the evidence that the direction of the improvement is repeatable on this machine, but two pairs are still too few to establish statistical significance or isolate all of the observed difference to the recurrent-head scheduling change. The user considers testing sufficient and has requested no further benchmark sweep at this stage.
 
+### 4.8 M6-B/C/D implementation and CI validation (2026-11-17)
+
+The following changes are implemented on `main` after the M6-A measurements:
+
+**M6-B — batched independent projections**
+- Added `Backend::matvec_batch`, with a sequential default for backends that do
+  not provide parallel scheduling.
+- `CpuBackend` runs independent projections over the existing persistent
+  Rayon pool. It creates no additional worker pool or per-projection OS
+  threads.
+- Qwen3.5 now batches the recurrent-layer QKV/gate/beta/alpha projections,
+  full-attention Q/K/V projections, and FFN gate/up projections.
+- Profile labels now report aggregate batch timing as
+  `linear_projection_batch`, `attention_projection_batch`, and
+  `ffn_projection_batch` rather than separate timing for every projection
+  inside those groups.
+
+**M6-C — reusable per-session scratch**
+- `Qwen35Cache` owns reusable hidden-state ping-pong buffers and a workspace
+  for normalization, projections, convolution output, recurrent output,
+  attention, scores, and FFN intermediates.
+- Qwen3.5 layer execution writes into caller-provided output slices and reuses
+  vector capacity across layers and decode steps. Cache clear retains scratch
+  capacity for reuse.
+- The gate/up combination keeps the original SiLU-then-multiply arithmetic
+  order to avoid an unnecessary numerical behavior change.
+
+**M6-D — direct-block Q4_K SIMD**
+- The opt-in `fused-q4k` path now dispatches to an AVX2 or AVX2/FMA packed-block
+  dot kernel on supported x86_64 CPUs. It expands quant values in vector
+  registers and does not materialize an F32 weight row.
+- Scalar direct-block Q4_K remains the fallback where AVX2 is unavailable.
+- The `auto` mode remains the dequantize-plus-AVX2/FMA baseline. The fused
+  mode is not made the default pending target-machine comparisons.
+
+**Validation:** GitHub Actions run `44057801727` for commit
+`ce72d083ed106dd889225982e8e32a12802cec12` passed `cargo check --workspace`
+and `cargo test --workspace`. The CPU crate had 25 passing tests and the
+Qwen3.5 model crate had 7 passing tests, including batch projection checks,
+parallel fused-Q4_K versus scalar-reference coverage, scratch-capacity reuse,
+and the exact recurrent-head reference test. The overall workflow remains
+red only at `cargo fmt --all -- --check`, which reports existing formatting
+differences in workspace files such as `qarnyx-tokenizer`; formatting also
+failed before these changes. No local machine build was run by the assistant.
+
+**Performance status:** no end-to-end M6-B/C/D benchmark result has been
+captured yet. The implementation is ready for the user's Ubuntu A/B comparison
+described in section 4.9; correctness CI success does not prove a wall-time
+improvement.
+
+### 4.9 Target Ubuntu A/B comparison for M6-B/C/D
+
+This comparison separates the changes as far as the current CLI permits:
+- M6-A binary with `auto` versus new B/C/D binary with `auto` measures the
+  impact of projection batching and scratch reuse in the default path.
+- New B/C/D binary with `auto` versus `fused-q4k` measures the opt-in Q4_K
+  direct SIMD path separately.
+- Keep model, prompt, token limit, sampling, worker count, and machine fixed.
+
+First inspect local changes and save the existing M6-A release binary **before**
+pulling or rebuilding:
+
+```bash
+git status --short
+cp target/release/qarnyx /tmp/qarnyx-m6a
+
+QARNYX_PROFILE=1 /usr/bin/time -f 'elapsed_seconds=%e' \
+  /tmp/qarnyx-m6a generate \
+  models/Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf \
+  "hi there!" --max-new-tokens 32 \
+  --temperature 0 --top-k 0 --top-p 1 \
+  --workers 10 --cpu-kernel auto \
+  > /tmp/qarnyx-m6a.log 2>&1
+```
+
+Then update the existing `main` checkout and build:
+
+```bash
+git pull --ff-only origin main
+cargo build --release -p qarnyx-cli
+```
+
+Run the new build first with `auto`, then with `fused-q4k`:
+
+```bash
+QARNYX_PROFILE=1 /usr/bin/time -f 'elapsed_seconds=%e' \
+  ./target/release/qarnyx generate \
+  models/Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf \
+  "hi there!" --max-new-tokens 32 \
+  --temperature 0 --top-k 0 --top-p 1 \
+  --workers 10 --cpu-kernel auto \
+  > /tmp/qarnyx-m6bcd-auto.log 2>&1
+
+QARNYX_PROFILE=1 /usr/bin/time -f 'elapsed_seconds=%e' \
+  ./target/release/qarnyx generate \
+  models/Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf \
+  "hi there!" --max-new-tokens 32 \
+  --temperature 0 --top-k 0 --top-p 1 \
+  --workers 10 --cpu-kernel fused-q4k \
+  > /tmp/qarnyx-m6bcd-fused.log 2>&1
+
+tail -n 30 /tmp/qarnyx-m6a.log
+tail -n 30 /tmp/qarnyx-m6bcd-auto.log
+tail -n 30 /tmp/qarnyx-m6bcd-fused.log
+```
+
+The new profile groups will include `linear_projection_batch`,
+`attention_projection_batch`, and `ffn_projection_batch`; these replace
+some of the old per-projection rows, so compare aggregate labels carefully.
+Check generated text or token IDs as well as elapsed time. The assistant has
+not run this benchmark on the user's workstation.
+
 ## 5. Qarnyx M6 work inspired by Kimi
 
-Follow-up A (parallel recurrent heads) is now implemented on `main`. Follow-ups B–D and the later research items remain proposals, not completed features or a claim that all are part of the existing official M6 roadmap. The existing README milestone description remains authoritative until deliberately updated.
+Follow-ups A–D now have initial implementations on `main`. Their end-to-end performance effects have not yet been established together; see sections 4.8–4.9. The broader M6 roadmap remains in progress because additional quantized kernels and target-machine performance evidence are outstanding.
 
 ### Experiment 0 — repeatable worker baseline (completed 2026-11-17)
 
@@ -307,38 +419,33 @@ The recorded results are summarized in section 4.5. Ten workers is the provision
 
 **Performance evidence:** two target-machine before/after pairs showed 20.8% and 11.6% lower elapsed time, respectively, with identical displayed output in both pairs (see sections 4.6–4.7). The two-sample means were 25.77 s before and 21.48 s after, or 16.6% lower mean elapsed time. This remains a small sample, not a statistically established gain. The user has elected to stop benchmarking this stage here.
 
-### M6 follow-up B — multi-projection scheduling
+### M6 follow-up B — multi-projection scheduling (implemented; performance unmeasured)
 
-**Why:** Q/K/V or gate/up operations can share an input while producing disjoint output buffers.
+Independent Qwen3.5 recurrent, attention, and FFN projections now use the
+`matvec_batch` API. The CPU implementation schedules them using the existing
+persistent Rayon pool; other backends retain the sequential default. Correctness
+tests compare batch results to expected individual projection results and
+validate weight/output count mismatches.
 
-**Implementation direction:**
-- investigate a backend API such as a batch of independent matvec operations;
-- execute these operations on the same persistent Rayon pool;
-- avoid creating OS threads or separate pools per projection;
-- benchmark both operation-level parallel scheduling and the current sequential-call approach.
+### M6 follow-up C — reusable per-session scratch (implemented; performance unmeasured)
 
-**Correctness gates:** each output must match the current implementation; ensure no mutable output aliasing and no nested-pool oversubscription.
+The Qwen3.5 cache now owns the scratch buffers reused across layer/token
+execution. Hidden states ping-pong between two retained buffers. Projection,
+normalization, convolution, recurrent output, attention scores/output, and FFN
+intermediates reuse capacity. The test suite checks capacity reuse and CI
+checks the full workspace. The change is intended to reduce allocation churn;
+its wall-time and peak-memory effects are not yet measured.
 
-### M6 follow-up C — FFN fusion and reusable scratch
+### M6 follow-up D — SIMD fused Q4_K path (implemented; performance unmeasured)
 
-Investigate:
-- shared scheduling for gate/up projections;
-- fusion of activation and elementwise gate/up combination;
-- reusing per-generation/per-layer buffers instead of repeatedly allocating `Vec<f32>`;
-- scratch sizing and lifetime ownership that remain explicit and safe.
+The opt-in `fused-q4k` matvec now uses AVX2/FMA direct-block arithmetic when
+available, with a scalar fallback. Differential tests compare both serial and
+parallel fused rows against the scalar reference within a documented tolerance.
+The default `auto` path remains unchanged. Do not make fused mode the default
+until target-machine measurements show it wins without an output regression.
 
-Fusion should be driven by memory traffic and measured allocation/scheduling cost, not by reducing source-code line count. Do not fuse operations if it increases temporary memory or slows the critical path.
-
-### M6 follow-up D — improve the fused Q4_K path
-
-The current `fused-q4k` path is slower than `auto` in the captured end-to-end test. Profile and microbenchmark it before changing it:
-- separate packed-block decode cost from dot-product cost;
-- test AVX2/FMA implementations against the scalar reference;
-- retain the dequantized `auto` route as a baseline;
-- verify quantized block edge cases and numerical agreement;
-- only select the fused path automatically if repeated end-to-end tests demonstrate a win.
-
-Kimi's MXFP4 kernel is an algorithmic reference only; Q4_K needs its own correct block decoder and vectorization.
+Kimi's MXFP4 kernel remains an algorithmic reference only; Q4_K has its own
+block decoder and vectorized implementation.
 
 ### Later research — prefill batching and file-backed weights
 

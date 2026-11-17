@@ -115,30 +115,31 @@ Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
-storage lengths and do not materialize a full F32 matrix. The automatic Q4_K matvec path evaluates each packed block
-directly and avoids the temporary F32 row; other quantized matvec/matmul paths
-decode only the active weight row into reusable F32 scratch. RMSNorm requires
-a positive finite epsilon. RoPE pairs the first and second halves of one head
-vector, matching the split-half convention used by LLaMA-style rotary
-embeddings. Softmax rejects empty or non-finite inputs.
+storage lengths and do not materialize a full F32 matrix. The automatic Q4_K
+matvec path decodes the active row into reusable F32 scratch for the AVX2/FMA
+dot. Other quantized matvec/matmul paths also decode only the active weight row
+into reusable F32 scratch. RMSNorm requires a positive finite epsilon. RoPE
+pairs the first and second halves of one head vector, matching the split-half
+convention used by LLaMA-style rotary embeddings. Softmax rejects empty or
+non-finite inputs.
 
-Q4_K matvec has an opt-in fused direct-block dot product, which avoids F32
-row materialization but currently uses scalar arithmetic. The default
-`auto` backend remains the AVX2/FMA plus row-dequantization baseline.
-Benchmark `auto` against `fused-q4k` to measure the combined impact of
-removing the F32 temporary and changing the Q4_K dot implementation. Other
-quantized formats still use the scalar reference decoder followed by the
-selected F32 dot kernel. Fused SIMD arithmetic and fused Q5_K/Q6_K paths
-remain future optimizations. RMSNorm, RoPE, softmax, SiLU-times-up, and residual
-addition currently use scalar implementations.
+The opt-in `fused-q4k` mode computes directly from packed Q4_K blocks without
+materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
+falls back to the scalar direct-block dot elsewhere. Keep `auto` as the
+dequantize-plus-AVX2/FMA baseline and compare it against `fused-q4k` on the
+target machine; the faster path is hardware- and workload-dependent. Fused
+Q5_K/Q6_K kernels and their SIMD implementations remain future work. RMSNorm,
+RoPE, softmax, and residual addition currently use scalar implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
-large matvec/matmul operations; each operation is synchronous and completes
-before returning to the model runtime. Cloned backends share the same pool.
-Small matrices remain on the single-threaded path to avoid scheduling overhead.
-Benchmark worker counts 1, 2, 4, 6, 8, and 10 on the target VPS because scheduler
-contention and memory bandwidth may make fewer workers faster. Run
+large matvec/matmul operations. `matvec_batch` schedules independent
+projections that share an input on that same pool; it does not create a second
+pool or per-projection OS threads. Each output remains disjoint, and every
+projection completes before the model continues. Small matrices remain on the
+single-threaded path to avoid scheduling overhead. Benchmark worker counts
+1, 2, 4, 6, 8, and 10 on the target VPS because scheduler contention and memory
+bandwidth may make fewer workers faster. Run
 `cargo bench -p qarnyx-cpu --bench kernels` to compare scaling for F32 and Q4_K
 matvec in addition to the storage-format comparisons.
 
@@ -150,9 +151,9 @@ correctness tests before dispatch is enabled.
 
 Keep the scalar backend as the correctness reference and dispatch by runtime
 feature detection:
-- x86_64: initial AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: opt-in direct fused Q4_K matvec is available; fused SIMD arithmetic
-  and fused Q5_K/Q6_K matvec remain to be evaluated;
+- x86_64: AVX2/FMA matvec and matmul kernels are implemented;
+- x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
+  available when those features are absent;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
@@ -160,11 +161,13 @@ Do not compile the default release build with target-cpu=native. That setting
 can produce a binary that fails on a different CPU. Use it only for
 host-specific builds and benchmark it separately.
 
-The CPU backend now uses a persistent Rayon worker pool rather than creating
-OS threads for each tensor operation. Partition large matvec/matmul work into
-independent output-row chunks, avoid nested parallelism, and benchmark 1, 2, 4,
-6, 8, and 10 workers. VPS CPU scheduling and memory bandwidth may make fewer
-workers faster than all available vCPUs.
+The CPU backend uses a persistent Rayon worker pool rather than creating OS
+threads for each tensor operation. Large matvec/matmul work is partitioned into
+independent output-row chunks. Independent Qwen3.5 projections can also be
+submitted as one batch to the same pool; nested work is kept within that shared
+scheduler rather than creating additional pools. Benchmark 1, 2, 4, 6, 8, and
+10 workers. VPS CPU scheduling and memory bandwidth may make fewer workers
+faster than all available vCPUs.
 
 ## Memory policy
 
@@ -236,23 +239,29 @@ state against an independent reference before declaring model compatibility.
 - Verify generated token IDs, not only rendered text.
 
 ### M6 - CPU optimization (in progress)
-- Implemented runtime AVX2/FMA dispatch for matvec dot products and matmul
-  output tiles, with scalar fallbacks and differential tests.
-- Benchmark scalar versus runtime dispatch for the supported GGUF storage
-  formats on the target VPS.
-- Q4_K direct fused matvec is implemented as an opt-in mode; benchmark it
-  against the default AVX2 plus dequantization path on the target VPS.
-- Add fused Q5_K/Q6_K matvec kernels and then evaluate fused SIMD arithmetic.
+Implemented on `main`:
+- Runtime AVX2/FMA dispatch for matvec dot products and matmul output tiles,
+  with scalar fallbacks and differential tests.
+- Persistent Rayon scheduling across independent matvec/matmul output rows.
+- Parallel Qwen3.5 recurrent-head state updates and head outputs, with the
+  recurrence and per-head reduction order preserved.
+- A `matvec_batch` backend contract with a sequential default and a CPU
+  implementation that schedules independent Qwen3.5 Q/K/V, recurrent, and
+  FFN gate/up projections on the same persistent Rayon pool.
+- Per-session Qwen3.5 scratch/workspace reuse across layers and decode steps,
+  including ping-pong hidden buffers, normalization/projection buffers,
+  attention scores, recurrent output, and FFN intermediates.
+- Opt-in direct-block Q4_K matvec with AVX2/FMA on supported x86_64 CPUs and a
+  scalar direct-block fallback, covered by scalar-reference differential tests.
+
+Still planned or awaiting target-machine evidence:
+- Benchmark `auto` against `fused-q4k` and compare M6-A against the B/C/D
+  build on the target workstation. Do not assume either path is faster until
+  the same workload is measured end to end.
+- Add fused Q5_K/Q6_K matvec kernels and evaluate further fused SIMD arithmetic.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
-- Implemented persistent Rayon scheduling across independent matvec/matmul
-  output rows; the pool is created once per backend and reused across calls.
-  Worker-count scaling is covered by the CPU microbenchmark harness.
-- Add Qwen3.5 execution profiling for linear-attention projections,
-  full-attention projections, FFN projections, recurrent/attention core work,
-  and final logits projection before choosing the next kernel optimization.
-- Measure allocation volume and backend kernel time separately; use those
-  measurements to guide reusable activation scratch and dequantization work.
-- Benchmark prefill/decode tokens per second, latency, and peak RSS.
+- Benchmark prefill/decode tokens per second, latency, allocation behavior,
+  and peak RSS on the target machine.
 
 ### M7 - Operational hardening
 - Add context and memory limits, cancellation, session isolation, and stress tests.
@@ -264,7 +273,9 @@ state against an independent reference before declaring model compatibility.
 Always record:
 - exact model file and quantization;
 - `workers` value and whether fork/join or persistent scheduling is active;
-- when `QARNYX_PROFILE=1` is enabled, aggregate Qwen3.5 projection/core timing;
+- when `QARNYX_PROFILE=1` is enabled, aggregate Qwen3.5 projection/core timing
+  (including `linear_projection_batch`, `attention_projection_batch`, and
+  `ffn_projection_batch` after the batched-projection change);
 - CPU model, vCPU allocation, feature flags, and compiler version;
 - thread count and affinity policy;
 - prompt length, generation length, and context size;

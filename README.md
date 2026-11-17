@@ -10,10 +10,11 @@ explicit memory ownership, and predictable resource usage.
 > **Project status: early development.** The GGUF v3 reader validates tensor
 > descriptors and payload ranges without loading weights during inspection.
 > Scalar decoders support F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The CPU
-> backend retains runtime-dispatched AVX2/FMA matvec dot products and matmul
-> output tiles, and includes an opt-in fused direct-block Q4_K matvec path.
-> Experimental Qwen3.5 2B GGUF loading and text generation are implemented;
-> numerical validation, quantized-kernel fusion, and worker-pool scheduling
+> backend has runtime-dispatched AVX2/FMA matvec and matmul kernels, a persistent
+> Rayon pool, batched independent Qwen3.5 projections, reusable per-session
+> inference scratch, parallel recurrent heads, and an opt-in direct-block Q4_K
+> AVX2/FMA path with a scalar fallback. Experimental Qwen3.5 2B generation is
+> implemented; further quantized kernels and end-to-end performance validation
 > remain in progress.
 
 ## Design goals
@@ -76,15 +77,20 @@ sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
 The CPU backend executes matrix-vector and matrix-matrix operations with all
-currently registered storage types. The default automatic backend keeps the AVX2/FMA path and dequantizes Q4_K
-rows into reusable F32 scratch before the dot product. An experimental
-`fused-q4k` mode computes Q4_K matvec directly from packed blocks without
-creating an F32 scratch row; that fused dot currently uses scalar arithmetic.
-Other quantized matrix operations still decode one row at a time, and the full
-weight matrix is never expanded. Large matvec and matmul operations partition
-independent output rows across a persistent Rayon worker pool. The pool is
-created when the CPU backend is constructed and reused across kernel calls;
-small matrix operations remain single-threaded.
+currently registered storage types. The default `auto` backend dequantizes
+Q4_K rows into reusable F32 scratch before the AVX2/FMA dot product.
+The opt-in `fused-q4k` mode evaluates Q4_K directly from packed blocks using
+runtime AVX2/FMA on supported x86_64 CPUs, with the scalar direct-block kernel
+as fallback; it does not materialize an F32 weight row. Other quantized formats
+still decode one active row at a time, and the full weight matrix is never
+expanded.
+
+Large matvec/matmul output rows and independent Qwen3.5 projection batches use
+the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
+FFN gate/up projections can be submitted as batches over a shared input.
+Its recurrent and attention workspaces are retained in the per-session cache
+and reused across tokens/layers rather than repeatedly allocating the same
+intermediate buffers.
 
 Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
 The harness compares the scalar reference, default runtime dispatch, and
@@ -138,11 +144,13 @@ portable binaries without an appropriate dispatch/build strategy.
    LLaMA path separately.
 6. **M5 - Tokenization and generation:** add prefill, incremental decode,
    bounded KV cache, stopping rules, and sampling.
-7. **M6 - CPU optimization:** initial x86_64 AVX2/FMA matvec and matmul kernels
-   are implemented with scalar fallbacks and scalar-vs-runtime benchmarks.
-   An opt-in mode provides direct fused Q4_K matvec. Large matrix operations
-   now reuse a persistent Rayon worker pool; fused Q5_K/Q6_K kernels, fused
-   SIMD implementations, and NEON remain planned.
+7. **M6 - CPU optimization (in progress):** AVX2/FMA matvec/matmul, a persistent
+   Rayon pool, parallel Qwen3.5 recurrent heads, shared-pool multi-projection
+   scheduling, per-session activation scratch reuse, and opt-in direct-block
+   Q4_K AVX2/FMA are implemented with scalar fallbacks and correctness tests.
+   Target-machine before/after measurements for the B/C/D additions are still
+   pending. Fused Q5_K/Q6_K kernels, further SIMD work, AVX-512, and NEON remain
+   planned.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
 
