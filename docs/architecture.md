@@ -201,9 +201,10 @@ faster than all available vCPUs.
   maps Ctrl+C to this signal and emits no partial generated text.
 - The Qwen3.5 CLI path applies a single-turn text ChatML prompt with the
   assistant generation prefix from the model's chat template. Non-thinking is
-  the default; --thinking leaves the reasoning block open. It prints only
-  newly generated text. Control-token spellings found in the vocabulary are
-  encoded as their atomic token IDs instead of ordinary byte-level text.
+  the default; --thinking leaves the reasoning block open and displays its
+  opening <think> marker with generated reasoning. Control-token spellings
+  found in the vocabulary are encoded as their atomic token IDs instead of
+  ordinary byte-level text.
 - Known end-of-turn tokens (<|im_end|>, <|fim_suffix|>, and <|endoftext|>) plus
   the configured EOS ID stop generation and are excluded from returned output.
 - Activations: reusable scratch buffers sized from model configuration.

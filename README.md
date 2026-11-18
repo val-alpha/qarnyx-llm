@@ -139,8 +139,8 @@ excluded.
 For Qwen3.5 text generation, the CLI encodes a single-turn chat prompt using
 the model's ChatML control tokens. Non-thinking is the default; pass
 `--thinking` to leave the reasoning block open and include generated reasoning
-in the output. The CLI prints only newly generated text, excluding the input
-prompt and turn-ending control tokens.
+in the output. The CLI displays the opening `<think>` marker for that mode
+and omits the end-of-turn control token.
 
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its
