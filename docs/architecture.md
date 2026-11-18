@@ -294,9 +294,9 @@ Implemented:
 Target-machine evidence:
 - On the Qwen3.5 2B Q4_K_M 32-token greedy workload, M6-A reduced the measured
   mean runtime from 25.77 s to 21.48 s (16.6%).
-- The B/C/D changes reduced the same mean to 19?; the later three-run benchmark
-  recorded 17.64 s for M6-A, 16.22 s for the auto path, and 12.57 s for fused
-  Q4_K. Fused Q4_K was 28.74% below the M6-A baseline and 22.50% below auto.
+- A later three-run benchmark recorded 17.64 s for M6-A, 16.22 s for the
+  auto path, and 12.57 s for fused Q4_K. Fused Q4_K was 28.74% below the
+  M6-A baseline and 22.50% below auto.
 - Outputs were identical across the compared Q4_K runs.
 - Synthetic Q5_K/Q6_K microbenchmarks show fused gains depend on worker count
   and workload; they are not substitutes for representative end-to-end model
