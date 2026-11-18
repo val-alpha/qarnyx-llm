@@ -195,6 +195,11 @@ pub struct GenerationResult {
     pub text: String,
 }
 
+/// Sampling state for one generation stream.
+///
+/// Model weights and the backend may be shared across requests. Each concurrent
+/// stream should own its generator; every generation call allocates a fresh,
+/// request-local KV cache.
 pub struct LlamaGenerator {
     rng_state: u64,
 }
@@ -276,13 +281,62 @@ mod tests {
         }
     }
 
-    fn matrix(data: &[f32], rows: usize, cols: usize) -> TensorView<'_> {
+    fn matrix(data: &[f32], rows: usize, cols: usize) -> TensorView<'static> {
         let mut bytes = Vec::with_capacity(data.len() * 4);
         for value in data {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        TensorView::new(bytes, Box::leak(vec![rows, cols].into_boxed_slice()), DType::F32)
+        let shape: &'static [usize] = Box::leak(vec![rows, cols].into_boxed_slice());
+        TensorView::new(bytes, shape, DType::F32)
+    }
+
+    fn tiny_llama_fixture() -> (LlamaModel<'static>, GgufTokenizer) {
+        let identity = [1.0_f32, 0.0, 0.0, 1.0];
+        let zero_2x2 = [0.0_f32; 4];
+        let zero_4x2 = [0.0_f32; 8];
+        let zero_2x4 = [0.0_f32; 8];
+
+        let layer = LlamaLayerStorage {
+            attention_norm: vec![1.0, 1.0],
+            q_proj: matrix(&identity, 2, 2),
+            k_proj: matrix(&zero_2x2, 2, 2),
+            v_proj: matrix(&zero_2x2, 2, 2),
+            o_proj: matrix(&identity, 2, 2),
+            ffn_norm: vec![1.0, 1.0],
+            gate_proj: matrix(&zero_4x2, 4, 2),
+            up_proj: matrix(&zero_4x2, 4, 2),
+            down_proj: matrix(&zero_2x4, 2, 4),
+        };
+
+        let model = LlamaModel {
+            config: LlamaConfig {
+                block_count: 1,
+                embedding_length: 2,
+                feed_forward_length: 4,
+                attention_head_count: 1,
+                attention_head_count_kv: 1,
+                attention_key_length: 2,
+                attention_value_length: 2,
+                attention_layer_norm_rms_epsilon: 1.0e-5,
+                rope_freq_base: 10_000.0,
+            },
+            layers: vec![layer],
+            token_embedding: matrix(&identity, 2, 2),
+            output_norm: vec![1.0, 1.0],
+            output: matrix(&identity, 2, 2),
+        };
+        let tokenizer = GgufTokenizer {
+            model: "test".into(),
+            pre: None,
+            tokens: vec!["a".into(), "b".into()],
+            scores: vec![0.0, 0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        (model, tokenizer)
     }
 
     #[test]
@@ -372,6 +426,73 @@ mod tests {
         assert!(cancellation.is_cancelled());
     }
 
+
+    #[test]
+    fn concurrent_generation_requests_keep_session_state_isolated() {
+        use std::sync::Arc;
+
+        let (model, tokenizer) = tiny_llama_fixture();
+        let model = Arc::new(model);
+        let tokenizer = Arc::new(tokenizer);
+        let backend = Arc::new(qarnyx_cpu::CpuBackend::new(2).unwrap());
+        let config = GenerationConfig {
+            max_new_tokens: 3,
+            max_context_tokens: 8,
+            max_cache_mib: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 123,
+        };
+
+        const SESSIONS: usize = 8;
+        const REQUESTS_PER_SESSION: usize = 4;
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(SESSIONS);
+            for session_id in 0..SESSIONS {
+                let model = Arc::clone(&model);
+                let tokenizer = Arc::clone(&tokenizer);
+                let backend = Arc::clone(&backend);
+
+                handles.push(scope.spawn(move || {
+                    let prompt_id = session_id % 2;
+                    let expected_ids = vec![prompt_id; config.max_new_tokens + 1];
+                    let expected_text = if prompt_id == 0 { "aaaa" } else { "bbbb" };
+                    let mut generator = LlamaGenerator::new(session_id as u64 + 1);
+
+                    for request_id in 0..REQUESTS_PER_SESSION {
+                        let result = generator
+                            .generate_ids(
+                                &model,
+                                &tokenizer,
+                                &backend,
+                                &[prompt_id],
+                                config,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "session {session_id}, request {request_id} failed: {error}"
+                                )
+                            });
+
+                        assert_eq!(
+                            result.token_ids, expected_ids,
+                            "token state leaked into session {session_id}, request {request_id}"
+                        );
+                        assert_eq!(
+                            result.text, expected_text,
+                            "decoded output leaked into session {session_id}, request {request_id}"
+                        );
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.join().expect("generation stress-test worker panicked");
+            }
+        });
+    }
 
     #[test]
     fn greedy_sampling_is_deterministic() {
@@ -658,7 +779,11 @@ impl LlamaGenerator {
 }
 
 
-/// Autoregressive generator for the Qwen3.5 hybrid decoder.
+/// Autoregressive generator for one Qwen3.5 generation stream.
+///
+/// Model weights and the backend may be shared across requests. Each concurrent
+/// stream should own its generator; every generation call allocates a fresh,
+/// request-local recurrent/attention cache and scratch workspace.
 pub struct Qwen35Generator {
     rng_state: u64,
 }

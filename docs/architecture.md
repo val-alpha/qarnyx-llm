@@ -67,16 +67,19 @@ cargo run --release -p qarnyx-cli -- inspect model.gguf --list-tensors
 
 1. Open a GGUF file and validate its magic, version, metadata counts, tensor
    dimensions, alignment, offsets, and file bounds.
-2. Keep immutable model weights in a read-only mapped region where supported.
+2. The current CLI reads the complete GGUF payload into a bounded owned byte
+   buffer. Matrix weights remain immutable borrowed tensor views into those
+   bytes; memory-mapped loading is a future optimization.
 3. Resolve tensor metadata by name and expose checked, non-owning tensor views.
 4. Load model configuration and map tensor names to a model implementation.
 5. Allocate bounded per-session KV cache and reusable activation scratch.
 6. Execute prefill, then incremental decode through the selected CPU backend.
 7. Sample the next token and decode it with the tokenizer.
 
-A mapped file is not equivalent to resident RAM usage. Pages are faulted in as
-they are accessed; the operating system may reclaim file-backed pages. Track
-process RSS and system page cache separately during benchmarks.
+The current CLI uses an owned model-file buffer rather than a memory map.
+Track process RSS during benchmarks. If memory-mapped loading is added later,
+report process RSS and system page cache separately because mapped file size
+and resident memory are different quantities.
 
 ## Core tensor contract
 
@@ -175,26 +178,30 @@ faster than all available vCPUs.
 
 ## Memory policy
 
-- Model weights: immutable mapped GGUF bytes; no full-model F32 copy.
+- Model weights: immutable GGUF bytes in an owned `Vec<u8>` in the current
+  CLI; no full-model F32 copy. Memory-mapped loading remains future work.
 - KV cache: allocated per session with an explicit context limit.
 - Generation requests: the runtime enforces a configurable maximum combined
   prompt and generated length (max_context_tokens, default 4096) before it
   allocates the per-request KV/recurrent cache. The CLI exposes this as
   --max-context-tokens; raise it deliberately when a longer context is needed.
-- Per-session cache budget: the runtime estimates retained KV/recurrent state
-  and reusable Qwen3.5 workspace capacity before allocation. The default is
-  512 MiB, configurable with --max-cache-mib. Qwen3.5 and LLaMA reserve their
-  maximum sequence capacity up front to avoid cache growth reallocations.
-  This budget excludes immutable model weights, allocator metadata, and
-  transient output/logit buffers; it is not a process-wide RSS limit.
+- Per-generation cache budget: the runtime estimates retained KV/recurrent
+  state and reusable Qwen3.5 workspace capacity before allocation. The default
+  is 512 MiB, configurable with --max-cache-mib. Qwen3.5 and LLaMA reserve
+  their maximum sequence capacity up front to avoid cache growth reallocations.
+  Each concurrent generation call has its own budget; this is not a global
+  process-wide RSS or aggregate concurrency limit. The estimate excludes
+  immutable model weights, allocator metadata, and transient output/logit
+  buffers.
 - Model-load admission budget: the CLI defaults --max-memory-mib to 8192 MiB.
   Before reading a GGUF file, it reserves the configured --max-cache-mib
   allowance and checks that the model file fits in the remainder. The read
   itself is capped at that remainder to guard against a file changing after
-  the metadata check. This accounts for model-file bytes plus the maximum
-  session-cache reservation; parser/tokenizer allocations, transient logits
-  and outputs, allocator overhead, and unrelated process memory are excluded.
-  It is an admission-control envelope, not an RSS guarantee.
+  the metadata check. This accounts for model-file bytes plus one maximum
+  generation-cache reservation. Additional concurrent cache reservations,
+  parser/tokenizer allocations, transient logits and outputs, allocator
+  overhead, and unrelated process memory are excluded. It is an admission-
+  control envelope, not an RSS guarantee.
 - Cooperative cancellation: callers can share a CancellationToken with a
   generation task. Cancellation is checked between complete token evaluations;
   the in-flight token finishes, then request-local state is dropped. The CLI
@@ -208,8 +215,12 @@ faster than all available vCPUs.
 - Known end-of-turn tokens (<|im_end|>, <|fim_suffix|>, and <|endoftext|>) plus
   the configured EOS ID stop generation and are excluded from returned output.
 - Activations: reusable scratch buffers sized from model configuration.
-- Sessions: bounded; do not create unbounded per-request caches.
-- Ownership: shared immutable model data, session-owned mutable state.
+- Ownership: share immutable model data and the CPU backend; keep one
+  generator/RNG state and one mutable cache/workspace per concurrent stream.
+- Isolation: never share a mutable LLaMA KV cache or Qwen3.5 recurrent/attention
+  cache between independent streams.
+- Admission: per-generation limits are not a substitute for a process-wide
+  in-flight request limit when a serving layer is introduced.
 - Synchronization: keep locks out of hot tensor loops; avoid a global
   Mutex around model weights.
 - Limits: validate context length, batch size, and allocation sizes before
@@ -303,51 +314,75 @@ Target-machine evidence:
   measurements.
 - AVX-512 and NEON remain future hardware-specific work.
 
-### M7 - Operational hardening (implemented on main)
-Implemented:
+### M7 - Operational hardening (implemented on main; target validation ongoing)
+
+Implemented safeguards:
 - Combined prompt + generated-token context cap via `max_context_tokens`,
   default 4096, checked with overflow-safe arithmetic before cache allocation.
-- Per-session cache/workspace admission budget via `max_cache_mib`, default
-  512 MiB, checked before allocation. Qwen3.5 recurrent/attention state and
-  reusable scratch capacity are included; immutable model weights and transient
+- Per-generation cache/workspace budget via `max_cache_mib`, default 512 MiB,
+  checked before allocation. Qwen3.5 recurrent/attention state and reusable
+  scratch capacity are included; immutable model weights and transient output
   buffers are excluded.
 - Cooperative cancellation through a shared `CancellationToken`. Runtime
   checks occur between complete token evaluations; the in-flight token is
-  allowed
-  to finish, then request-local state is dropped. CLI Ctrl+C uses the same
-  mechanism and does not print partial generated text.
-- Model-load memory admission via `max_memory_mib`, default 8192 MiB. Model
-  bytes plus the configured maximum session-cache reservation must fit before
-  the GGUF payload is read; the read is bounded to the remaining allowance.
-  This is an admission-control envelope, not a process-wide RSS guarantee.
+  allowed to finish, then request-local state is dropped. CLI Ctrl+C uses the
+  same mechanism and does not print partial generated text.
+- Model-load memory admission via `max_memory_mib`, default 8192 MiB. The
+  current CLI requires model-file bytes plus one configured maximum cache
+  reservation to fit before reading the GGUF payload; the read is bounded to
+  the remaining allowance. This is an admission envelope, not a process-wide
+  RSS guarantee or a reservation for an arbitrary number of concurrent runs.
 - Qwen3.5 opt-in thinking mode via `--thinking`. Non-thinking remains the
-  default. Thinking mode uses the model's `<think>` generation prefix and
-  keeps the reasoning block visible; known end-of-turn control tokens are
-  recognized and excluded from returned generated text.
+  default. Thinking mode uses the model's `<think>` generation prefix; known
+  end-of-turn control tokens are recognized and excluded from returned text.
 - Qwen3.5 chat-template special control tokens are encoded atomically when
   present in the tokenizer vocabulary.
 
-Still planned:
-- Session isolation and stress tests.
-- Reproducible benchmark methodology and published known limitations.
-- Do not add HTTP serving until the library/runtime serving boundary is stable.
+Session ownership and isolation:
+- Model weights and the CPU backend are immutable/shareable across generation
+  requests. Each concurrent stream must own its own generator instance because
+  the generator contains mutable sampling RNG state.
+- Every `generate`/`generate_ids` call allocates a fresh request-local
+  LLaMA KV cache or Qwen3.5 recurrent/attention cache plus scratch workspace.
+  Mutable cache state must not be shared between independent streams.
+- Runtime stress coverage: eight concurrent LLaMA generation sessions each
+  issue four sequential requests while sharing one model and CPU backend but
+  keeping separate generators. The test checks prompt-specific token IDs and
+  decoded output on every request.
+- Qwen3.5 cache coverage: two independently allocated caches are checked for
+  non-shared recurrent state, convolution state, attention K/V data, and
+  scratch buffers; `clear` is checked for recurrent/conv/KV reset.
 
-### M7 - Operational hardening
-- Initial context and cache hardening are implemented: generation requests
-  have a configurable combined prompt/output token limit (default 4096) and a
-  per-session cache/workspace budget (default 512 MiB), both checked before
-  cache allocation. K/V and scratch capacities are reserved from the limit.
-- Cancellation is implemented for LLaMA and Qwen3.5 runtime generation and
-  wired to Ctrl+C in the CLI. It is cooperative at token boundaries, not an
-  asynchronous interruption inside a SIMD kernel or model-layer evaluation.
-- M7-D model-load admission budget is implemented in the CLI: model-file bytes
-  plus the configured maximum session-cache reservation must fit the default
-  8192 MiB budget before the GGUF payload is read. The read is bounded to
-  prevent a changing file from exceeding its allowance. This is not a full
-  process RSS cap; tokenizer/parser and transient allocations are excluded.
-- Still planned: session isolation and stress tests.
-- Add CLI and optional HTTP serving only after the library is stable.
-- Publish reproducible benchmark methodology and known limitations.
+Known operational limits:
+- The CLI still serves one blocking generation per process; no HTTP server,
+  request queue, global concurrency limit, or process-wide cache admission
+  controller exists. Several simultaneous library requests can each consume
+  their own configured cache budget, so aggregate memory can scale with the
+  number of in-flight requests.
+- The current CLI reads the complete GGUF file into an owned byte `Vec`.
+  Memory-mapped loading is not implemented yet; there is no full-model F32
+  expansion, but model-file bytes are resident in the process allocation.
+- `max_memory_mib` covers the model-file buffer plus one maximum cache
+  allowance only. Tokenizer/parser metadata, allocator overhead, transient
+  logits/output buffers, other process memory, and additional concurrent cache
+  reservations are outside that envelope.
+- Cancellation is cooperative at token boundaries, not an asynchronous
+  interruption inside a SIMD kernel or model-layer evaluation.
+- `--thinking` has no separate reasoning-token budget. It is bounded only by
+  the request's `max_new_tokens` / context limits; a long reasoning trace can
+  consume most of that output allowance.
+- Generation caches are request-local and are not retained for multi-turn
+  conversation continuation. A caller must provide the conversation context
+  again as part of the next prompt.
+
+Remaining validation:
+- Run the new runtime/model isolation tests and the full workspace suite on
+  the target Ubuntu host.
+- Capture a repeatable end-to-end benchmark result using the protocol in
+  [docs/benchmarking.md](benchmarking.md). The procedure is documented, but
+  benchmark numbers remain host-, model-, and kernel-specific.
+- Add process-wide admission/concurrency controls only when the serving layer
+  is designed; do not start HTTP serving inside M7.
 
 ## M8 - API and serving layer (planned)
 
@@ -394,19 +429,9 @@ and model/runtime integration rather than the HTTP protocol adapters.
 
 ## Benchmark methodology
 
-Always record:
-- exact model file and quantization;
-- `workers` value and whether fork/join or persistent scheduling is active;
-- when `QARNYX_PROFILE=1` is enabled, aggregate Qwen3.5 projection/core timing
-  (including `linear_projection_batch`, `attention_projection_batch`, and
-  `ffn_projection_batch` after the batched-projection change);
-- CPU model, vCPU allocation, feature flags, and compiler version;
-- thread count and affinity policy;
-- prompt length, generation length, and context size;
-- prefill tokens/s and decode tokens/s separately;
-- first-token latency and steady-state latency;
-- peak RSS, swap activity, and memory pressure.
-
-Compare against other runtimes using the same model file, prompt, token count,
-CPU allocation, and thread settings. Do not infer performance from synthetic
+The repeatable CLI benchmark procedure, command template, CSV fields, warm-up
+rules, and interpretation limits are maintained in
+[docs/benchmarking.md](benchmarking.md). CLI wall-clock results include model
+loading and request setup as well as generation; they are not decode-only
+throughput measurements. Do not infer end-to-end performance from synthetic
 kernel tests alone.

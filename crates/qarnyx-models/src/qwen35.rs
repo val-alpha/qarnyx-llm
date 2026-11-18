@@ -208,6 +208,11 @@ struct Qwen35Workspace {
     scores: Vec<f32>,
 }
 
+/// Mutable recurrent/attention state and scratch owned by one Qwen3.5 request.
+///
+/// Do not share one cache between concurrent generation streams. Construct a
+/// separate cache per stream; immutable model weights and the CPU backend can
+/// be shared.
 #[derive(Debug, Clone)]
 pub struct Qwen35Cache {
     pub sequence_len: usize,
@@ -1175,6 +1180,54 @@ mod recurrent_head_tests {
         assert!(cache.keys[0].is_empty());
         assert_eq!(cache.keys[1].capacity(), 2 * KV);
         assert_eq!(cache.values[1].capacity(), 2 * KV);
+    }
+
+    #[test]
+    fn qwen_generation_caches_do_not_share_mutable_session_state() {
+        let config = Qwen35Config {
+            block_count: 2,
+            embedding_length: H,
+            feed_forward_length: FF,
+            attention_head_count: FH,
+            attention_head_count_kv: 2,
+            attention_key_length: FHD,
+            attention_value_length: FHD,
+            rms_epsilon: 1.0e-5,
+            rope_theta: 1.0,
+            rope_dimension: ROPE,
+            conv_kernel: CONV,
+            state_size: LD,
+            group_count: LH,
+            time_step_rank: LH,
+            inner_size: LIN,
+            recurrent_layers: vec![true, false],
+        };
+
+        let mut first = Qwen35Cache::with_context_capacity(&config, 3).unwrap();
+        let second = Qwen35Cache::with_context_capacity(&config, 3).unwrap();
+
+        first.sequence_len = 2;
+        first.recurrent[0][0] = 0.25;
+        first.conv[0][0] = -0.5;
+        first.keys[1].extend([1.0, 2.0]);
+        first.values[1].extend([3.0, 4.0]);
+        first.scratch.hidden_a.push(5.0);
+        first.scratch.workspace.norm.push(6.0);
+
+        assert_eq!(second.sequence_len, 0);
+        assert_eq!(second.recurrent[0][0], 0.0);
+        assert_eq!(second.conv[0][0], 0.0);
+        assert!(second.keys[1].is_empty());
+        assert!(second.values[1].is_empty());
+        assert!(second.scratch.hidden_a.is_empty());
+        assert!(second.scratch.workspace.norm.is_empty());
+
+        first.clear();
+        assert_eq!(first.sequence_len, 0);
+        assert!(first.recurrent[0].iter().all(|value| *value == 0.0));
+        assert!(first.conv[0].iter().all(|value| *value == 0.0));
+        assert!(first.keys[1].is_empty());
+        assert!(first.values[1].is_empty());
     }
 
     #[test]
