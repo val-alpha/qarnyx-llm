@@ -272,8 +272,8 @@ state against an independent reference before declaring model compatibility.
 - Add KV cache, stopping rules, and sampling.
 - Verify generated token IDs, not only rendered text.
 
-### M6 - CPU optimization (in progress)
-Implemented on `main`:
+### M6 - CPU optimization (implemented on main)
+Implemented:
 - Runtime AVX2/FMA dispatch for matvec dot products and matmul output tiles,
   with scalar fallbacks and differential tests.
 - Persistent Rayon scheduling across independent matvec/matmul output rows.
@@ -291,16 +291,46 @@ Implemented on `main`:
   when supported on x86_64 CPUs, plus AVX2-only and scalar direct-block
   fallbacks, covered by multi-block differential tests.
 
-Still planned or awaiting target-machine evidence:
-- Benchmark `auto` against `fused-q4k` and compare M6-A against the B/C/D
-  build on the target workstation. Do not assume either path is faster until
-  the same workload is measured end to end.
-- Validate fused Q5_K/Q6_K on representative GGUF models; the current
-  synthetic VPS microbenchmark shows worker-dependent gains but is not an
-  end-to-end workload result.
-- Evaluate AVX-512 and add NEON where the target hardware warrants it.
-- Benchmark representative Q5_K/Q6_K model workloads plus prefill/decode
-  tokens per second, latency, allocation behavior, and peak RSS.
+Target-machine evidence:
+- On the Qwen3.5 2B Q4_K_M 32-token greedy workload, M6-A reduced the measured
+  mean runtime from 25.77 s to 21.48 s (16.6%).
+- The B/C/D changes reduced the same mean to 19?; the later three-run benchmark
+  recorded 17.64 s for M6-A, 16.22 s for the auto path, and 12.57 s for fused
+  Q4_K. Fused Q4_K was 28.74% below the M6-A baseline and 22.50% below auto.
+- Outputs were identical across the compared Q4_K runs.
+- Synthetic Q5_K/Q6_K microbenchmarks show fused gains depend on worker count
+  and workload; they are not substitutes for representative end-to-end model
+  measurements.
+- AVX-512 and NEON remain future hardware-specific work.
+
+### M7 - Operational hardening (implemented on main)
+Implemented:
+- Combined prompt + generated-token context cap via `max_context_tokens`,
+  default 4096, checked with overflow-safe arithmetic before cache allocation.
+- Per-session cache/workspace admission budget via `max_cache_mib`, default
+  512 MiB, checked before allocation. Qwen3.5 recurrent/attention state and
+  reusable scratch capacity are included; immutable model weights and transient
+  buffers are excluded.
+- Cooperative cancellation through a shared `CancellationToken`. Runtime
+  checks occur between complete token evaluations; the in-flight token is
+  allowed
+  to finish, then request-local state is dropped. CLI Ctrl+C uses the same
+  mechanism and does not print partial generated text.
+- Model-load memory admission via `max_memory_mib`, default 8192 MiB. Model
+  bytes plus the configured maximum session-cache reservation must fit before
+  the GGUF payload is read; the read is bounded to the remaining allowance.
+  This is an admission-control envelope, not a process-wide RSS guarantee.
+- Qwen3.5 opt-in thinking mode via `--thinking`. Non-thinking remains the
+  default. Thinking mode uses the model's `<think>` generation prefix and
+  keeps the reasoning block visible; known end-of-turn control tokens are
+  recognized and excluded from returned generated text.
+- Qwen3.5 chat-template special control tokens are encoded atomically when
+  present in the tokenizer vocabulary.
+
+Still planned:
+- Session isolation and stress tests.
+- Reproducible benchmark methodology and published known limitations.
+- Do not add HTTP serving until the library/runtime serving boundary is stable.
 
 ### M7 - Operational hardening
 - Initial context and cache hardening are implemented: generation requests
@@ -318,6 +348,49 @@ Still planned or awaiting target-machine evidence:
 - Still planned: session isolation and stress tests.
 - Add CLI and optional HTTP serving only after the library is stable.
 - Publish reproducible benchmark methodology and known limitations.
+
+## M8 - API and serving layer (planned)
+
+M8 starts only after the runtime generation contract is stable. It is an API
+adapter/serving layer, not another model or inference layer.
+
+Architecture target:
+
+```text
+OpenAI request ─┐
+Anthropic       ├──> API adapter ──> common GenerationRequest
+Native Qarnyx ─┘                         │
+                                         ▼
+                                  Qarnyx Runtime
+                                         │
+                                         ▼
+                              common GenerationResult
+                                ├── normal response
+                                └── streaming events
+```
+
+Planned work:
+- M8-A Streaming: define a runtime streaming/event primitive that can expose
+  token deltas without coupling the runtime to HTTP, JSON, SSE, or a specific
+  vendor protocol.
+- M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
+  the common generation request and map results/events back to the expected
+  response or stream format.
+- M8-C Anthropic Messages-compatible API: provide the corresponding adapter
+  using the same runtime request/event contract.
+- M8-D Native Qarnyx API: expose the runtime's native request/configuration
+  surface without forcing vendor-specific semantics.
+- M8-E Common API abstraction: keep authentication, HTTP routing, JSON parsing,
+  SSE/stream transport, and protocol-specific validation in the serving/API
+  layer rather than in qarnyx-runtime.
+
+Streaming should be implemented first because OpenAI, Anthropic, and native
+protocols can then share the same runtime event source. The API layer must not
+duplicate generation loops or model-specific logic.
+
+Model-specific chat formatting remains below M8: Qwen3.5 ChatML templates,
+thinking-mode control tokens, and end-of-turn handling belong to the tokenizer
+and model/runtime integration rather than the HTTP protocol adapters.
 
 ## Benchmark methodology
 
