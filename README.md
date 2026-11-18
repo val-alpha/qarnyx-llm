@@ -116,6 +116,12 @@ The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
 opt-in pending broader validation. `scalar` remains the non-SIMD correctness
 reference.
 
+Generation is capped at 4096 combined prompt and requested output tokens by
+default. Use `--max-context-tokens N` to set a different per-request limit;
+the runtime checks the requested length before allocating the generation
+cache. This is an operational safety limit, not a declaration of the model's
+native context window.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
@@ -158,8 +164,10 @@ portable binaries without an appropriate dispatch/build strategy.
    are also implemented and covered by differential tests. Three-round VPS
    microbenchmarks show median gains for Q5_K/Q6_K, varying by worker count;
    representative-model validation, AVX-512, and NEON remain outstanding.
-8. **M7 - Operational hardening:** add resource limits, cancellation, session
-   isolation, stress tests, and reproducible benchmarks.
+8. **M7 - Operational hardening:** an initial combined prompt/output context
+   cap (default 4096, configurable from the CLI) is implemented before cache
+   allocation. Broader memory budgets, cancellation, session isolation,
+   stress tests, and reproducible benchmarks remain planned.
 
 ## Non-goals for the first milestone
 
