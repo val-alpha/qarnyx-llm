@@ -1,6 +1,6 @@
+use std::fs;
 use std::fs::File;
 use std::io::BufReader;
-use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -54,7 +54,8 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
-        /// CPU kernel implementation: automatic SIMD, fused Q4_K / K-quants, or scalar reference.
+        /// CPU kernel implementation: auto (direct-block K-quant SIMD), dequant (previous
+        /// decode-to-F32 baseline), fused-q4k (Q4_K only), or the scalar reference.
         #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.
@@ -66,8 +67,8 @@ enum Command {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CpuKernelMode {
     Auto,
+    Dequant,
     FusedQ4k,
-    FusedQk,
     Scalar,
 }
 
@@ -77,8 +78,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Status) | None => {
             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
-            println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
-            println!("Use --cpu-kernel auto|fused-q4k|fused-qk|scalar to select CPU kernels.");
+            println!(
+                "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
+            );
+            println!("Use --cpu-kernel auto|dequant|fused-q4k|scalar to select CPU kernels.");
         }
         Some(Command::Inspect {
             model,
@@ -135,7 +138,12 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
         for tensor in &gguf.tensors {
             println!(
                 "  {:<36} shape={:?} ggml_type={} bytes={} offset={} file_offset={}",
-                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.byte_len, tensor.offset, tensor.file_offset
+                tensor.name,
+                tensor.dimensions,
+                tensor.ggml_type,
+                tensor.byte_len,
+                tensor.offset,
+                tensor.file_offset
             );
         }
     } else if !gguf.tensors.is_empty() {
@@ -172,8 +180,8 @@ fn generate_model(
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
     let backend = match cpu_kernel {
         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
+        CpuKernelMode::Dequant => qarnyx_cpu::CpuBackend::new_dequant(workers)?,
         CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
-        CpuKernelMode::FusedQk => qarnyx_cpu::CpuBackend::new_fused_qk(workers)?,
         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
     };
     let config = GenerationConfig {
