@@ -1,6 +1,10 @@
 //! Autoregressive generation orchestration for Qarnyx model execution.
 
 use qarnyx_core::Backend;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model, Qwen35Profile};
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use thiserror::Error;
@@ -15,6 +19,9 @@ pub enum GenerationError {
 
     #[error("generation requires at least one prompt token")]
     EmptyPrompt,
+
+    #[error("generation cancelled")]
+    Cancelled,
 
     #[error("generation configuration is invalid: {0}")]
     InvalidConfig(&'static str),
@@ -38,6 +45,45 @@ pub enum GenerationError {
 
     #[error("logits contain non-finite values")]
     NonFiniteLogits,
+}
+
+/// A clonable cancellation signal shared between a generation task and its caller.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// Creates a token in the active (not cancelled) state.
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Requests cancellation. The generation task observes it at the next token boundary.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), GenerationError> {
+        if self.is_cancelled() {
+            Err(GenerationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Sampling and generation controls.
@@ -272,6 +318,17 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_token_clones_share_cancellation_state() {
+        let token = CancellationToken::new();
+        let signal = token.clone();
+
+        assert!(!token.is_cancelled());
+        signal.cancel();
+        assert!(token.is_cancelled());
+        assert!(matches!(token.check(), Err(GenerationError::Cancelled)));
+    }
+
+    #[test]
     fn rejects_invalid_generation_config() {
         let config = GenerationConfig {
             max_new_tokens: 0,
@@ -338,6 +395,8 @@ impl LlamaGenerator {
     }
 
     /// Generates new tokens from an already-tokenized prompt.
+    ///
+    /// This compatibility entry point runs without an externally-triggered cancellation signal.
     pub fn generate_ids<B: Backend>(
         &mut self,
         model: &LlamaModel<'_>,
@@ -346,14 +405,34 @@ impl LlamaGenerator {
         prompt: &[usize],
         config: GenerationConfig,
     ) -> Result<GenerationResult, GenerationError> {
+        let cancellation = CancellationToken::new();
+        self.generate_ids_with_cancellation(
+            model, tokenizer, backend, prompt, config, &cancellation,
+        )
+    }
+
+    /// Generates new tokens and checks the signal between complete token evaluations.
+    ///
+    /// Cancellation drops the request-local KV cache and returns GenerationError::Cancelled.
+    pub fn generate_ids_with_cancellation<B: Backend>(
+        &mut self,
+        model: &LlamaModel<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerationResult, GenerationError> {
         config.validate()?;
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
         }
         config.validate_context(prompt.len())?;
+        cancellation.check()?;
         let estimated_cache_bytes =
             estimate_llama_cache_bytes(model, config.max_context_tokens)?;
         config.validate_cache_budget(estimated_cache_bytes)?;
+        cancellation.check()?;
 
         let mut cache =
             LlamaKvCache::with_context_capacity(&model.config, config.max_context_tokens)?;
@@ -361,10 +440,12 @@ impl LlamaGenerator {
         let mut logits = Vec::new();
 
         for (position, &token_id) in prompt.iter().enumerate() {
+            cancellation.check()?;
             logits = model.forward_logits(backend, token_id, position, &mut cache)?;
         }
 
         for _ in 0..config.max_new_tokens {
+            cancellation.check()?;
             let next = self.sample(&logits, config)?;
             generated.push(next);
             if tokenizer.eos_token_id == Some(next) {
@@ -391,8 +472,25 @@ impl LlamaGenerator {
         prompt: &str,
         config: GenerationConfig,
     ) -> Result<GenerationResult, GenerationError> {
+        let cancellation = CancellationToken::new();
+        self.generate_with_cancellation(model, tokenizer, backend, prompt, config, &cancellation)
+    }
+
+    /// Tokenizes a prompt and runs generation with an external cancellation signal.
+    pub fn generate_with_cancellation<B: Backend>(
+        &mut self,
+        model: &LlamaModel<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &str,
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerationResult, GenerationError> {
+        cancellation.check()?;
         let prompt_tokens = tokenizer.encode(prompt)?;
-        self.generate_ids(model, tokenizer, backend, &prompt_tokens, config)
+        self.generate_ids_with_cancellation(
+            model, tokenizer, backend, &prompt_tokens, config, cancellation,
+        )
     }
 
     fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
@@ -486,11 +584,30 @@ impl Qwen35Generator {
         prompt: &[usize],
         config: GenerationConfig,
     ) -> Result<GenerationResult, GenerationError> {
+        let cancellation = CancellationToken::new();
+        self.generate_ids_with_cancellation(
+            model, tokenizer, backend, prompt, config, &cancellation,
+        )
+    }
+
+    /// Generates new tokens and checks the signal between complete token evaluations.
+    ///
+    /// Cancellation drops the request-local hybrid cache and returns GenerationError::Cancelled.
+    pub fn generate_ids_with_cancellation<B: Backend>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerationResult, GenerationError> {
         config.validate()?;
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
         }
         config.validate_context(prompt.len())?;
+        cancellation.check()?;
         let estimated_cache_bytes = model
             .config
             .estimated_cache_bytes(config.max_context_tokens)
@@ -498,6 +615,8 @@ impl Qwen35Generator {
                 "Qwen3.5 session cache size overflow or invalid layer map",
             ))?;
         config.validate_cache_budget(estimated_cache_bytes)?;
+        cancellation.check()?;
+
         let mut cache =
             Qwen35Cache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
@@ -506,6 +625,7 @@ impl Qwen35Generator {
         let mut profile = Qwen35Profile::default();
 
         for (position, &token_id) in prompt.iter().enumerate() {
+            cancellation.check()?;
             if profiling {
                 logits = model.forward_logits_profiled(
                     backend, token_id, position, &mut cache, &mut profile,
@@ -516,6 +636,7 @@ impl Qwen35Generator {
         }
 
         for _ in 0..config.max_new_tokens {
+            cancellation.check()?;
             let next = self.sample(&logits, config)?;
             generated.push(next);
             if tokenizer.eos_token_id == Some(next) {
@@ -549,8 +670,23 @@ impl Qwen35Generator {
         prompt: &str,
         config: GenerationConfig,
     ) -> Result<GenerationResult, GenerationError> {
+        let cancellation = CancellationToken::new();
+        self.generate_with_cancellation(model, tokenizer, backend, prompt, config, &cancellation)
+    }
+
+    /// Tokenizes a prompt and runs generation with an external cancellation signal.
+    pub fn generate_with_cancellation<B: Backend>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &str,
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerationResult, GenerationError> {
+        cancellation.check()?;
         let ids = tokenizer.encode(prompt)?;
-        self.generate_ids(model, tokenizer, backend, &ids, config)
+        self.generate_ids_with_cancellation(model, tokenizer, backend, &ids, config, cancellation)
     }
 
     fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
