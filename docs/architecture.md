@@ -187,6 +187,10 @@ faster than all available vCPUs.
   maximum sequence capacity up front to avoid cache growth reallocations.
   This budget excludes immutable model weights, allocator metadata, and
   transient output/logit buffers; it is not a process-wide RSS limit.
+- Cooperative cancellation: callers can share a CancellationToken with a
+  generation task. Cancellation is checked between complete token evaluations;
+  the in-flight token finishes, then request-local state is dropped. The CLI
+  maps Ctrl+C to this signal and emits no partial generated text.
 - Activations: reusable scratch buffers sized from model configuration.
 - Sessions: bounded; do not create unbounded per-request caches.
 - Ownership: shared immutable model data, session-owned mutable state.
@@ -287,8 +291,11 @@ Still planned or awaiting target-machine evidence:
   have a configurable combined prompt/output token limit (default 4096) and a
   per-session cache/workspace budget (default 512 MiB), both checked before
   cache allocation. K/V and scratch capacities are reserved from the limit.
+- Cancellation is implemented for LLaMA and Qwen3.5 runtime generation and
+  wired to Ctrl+C in the CLI. It is cooperative at token boundaries, not an
+  asynchronous interruption inside a SIMD kernel or model-layer evaluation.
 - Still planned: broader allocation budgets beyond retained session caches,
-  cancellation, session isolation, and stress tests.
+  session isolation, and stress tests.
 - Add CLI and optional HTTP serving only after the library is stable.
 - Publish reproducible benchmark methodology and known limitations.
 
