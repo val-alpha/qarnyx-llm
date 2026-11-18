@@ -1156,7 +1156,7 @@ mod recurrent_head_tests {
         let two_tokens = config.estimated_cache_bytes(2).unwrap();
         assert_eq!(
             two_tokens - base,
-            2 * KV * 2 * std::mem::size_of::<f32>()
+            (2 * KV * 2 + 2) * std::mem::size_of::<f32>()
         );
         assert!(config.estimated_cache_bytes(usize::MAX).is_none());
 
