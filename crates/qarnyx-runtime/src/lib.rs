@@ -28,6 +28,14 @@ pub enum GenerationError {
         limit: usize,
     },
 
+    #[error(
+        "estimated session cache is {estimated_bytes} bytes, exceeding the configured budget of {limit_bytes} bytes"
+    )]
+    CacheBudgetExceeded {
+        estimated_bytes: usize,
+        limit_bytes: usize,
+    },
+
     #[error("logits contain non-finite values")]
     NonFiniteLogits,
 }
@@ -38,6 +46,8 @@ pub struct GenerationConfig {
     pub max_new_tokens: usize,
     /// Maximum combined prompt and generated sequence length.
     pub max_context_tokens: usize,
+    /// Maximum retained per-session cache/workspace memory, in MiB.
+    pub max_cache_mib: usize,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -49,6 +59,7 @@ impl Default for GenerationConfig {
         Self {
             max_new_tokens: 128,
             max_context_tokens: 4096,
+            max_cache_mib: 512,
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
@@ -65,6 +76,13 @@ impl GenerationConfig {
         if self.max_context_tokens == 0 {
             return Err(GenerationError::InvalidConfig(
                 "max_context_tokens must be non-zero",
+            ));
+        }
+        if self.max_cache_mib == 0
+            || self.max_cache_mib.checked_mul(1024 * 1024).is_none()
+        {
+            return Err(GenerationError::InvalidConfig(
+                "max_cache_mib must be non-zero and fit in bytes",
             ));
         }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
@@ -88,6 +106,40 @@ impl GenerationConfig {
         }
         Ok(())
     }
+
+    fn validate_cache_budget(&self, estimated_bytes: usize) -> Result<(), GenerationError> {
+        let limit_bytes = self.max_cache_mib.checked_mul(1024 * 1024).ok_or(
+            GenerationError::InvalidConfig("max_cache_mib must fit in bytes"),
+        )?;
+        if estimated_bytes > limit_bytes {
+            return Err(GenerationError::CacheBudgetExceeded {
+                estimated_bytes,
+                limit_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn estimate_llama_cache_bytes(
+    model: &LlamaModel<'_>,
+    context_tokens: usize,
+) -> Result<usize, GenerationError> {
+    let config = &model.config;
+    let key_width = config
+        .attention_head_count_kv
+        .checked_mul(config.attention_key_length)
+        .ok_or(GenerationError::InvalidConfig("LLaMA KV key width overflow"))?;
+    let value_width = config
+        .attention_head_count_kv
+        .checked_mul(config.attention_value_length)
+        .ok_or(GenerationError::InvalidConfig("LLaMA KV value width overflow"))?;
+    key_width
+        .checked_add(value_width)
+        .and_then(|width| width.checked_mul(config.block_count))
+        .and_then(|floats| floats.checked_mul(context_tokens))
+        .and_then(|floats| floats.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(GenerationError::InvalidConfig("LLaMA KV cache size overflow"))
 }
 
 /// Result of an autoregressive generation run.
@@ -172,6 +224,7 @@ mod tests {
             .generate(&model, &tokenizer, &backend, "a", GenerationConfig {
                 max_new_tokens: 3,
                 max_context_tokens: 8,
+                max_cache_mib: 512,
                 temperature: 0.0,
                 top_k: 0,
                 top_p: 1.0,
@@ -190,6 +243,7 @@ mod tests {
         let config = GenerationConfig {
             max_new_tokens: 1,
             max_context_tokens: 8,
+            max_cache_mib: 512,
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -203,6 +257,7 @@ mod tests {
         let config = GenerationConfig {
             max_new_tokens: 1,
             max_context_tokens: 8,
+            max_cache_mib: 512,
             temperature: 1.0,
             top_k: 3,
             top_p: 1.0,
@@ -229,6 +284,28 @@ mod tests {
             ..GenerationConfig::default()
         };
         assert!(zero_context.validate().is_err());
+
+        let zero_budget = GenerationConfig {
+            max_cache_mib: 0,
+            ..GenerationConfig::default()
+        };
+        assert!(zero_budget.validate().is_err());
+    }
+
+    #[test]
+    fn cache_budget_accepts_exact_fit_and_rejects_excess() {
+        let config = GenerationConfig {
+            max_cache_mib: 1,
+            ..GenerationConfig::default()
+        };
+        assert!(config.validate_cache_budget(1024 * 1024).is_ok());
+        assert!(matches!(
+            config.validate_cache_budget(1024 * 1024 + 1),
+            Err(GenerationError::CacheBudgetExceeded {
+                estimated_bytes: 1024 * 1024 + 1,
+                limit_bytes: 1024 * 1024,
+            })
+        ));
     }
 
     #[test]
@@ -273,8 +350,12 @@ impl LlamaGenerator {
             return Err(GenerationError::EmptyPrompt);
         }
         config.validate_context(prompt.len())?;
+        let estimated_cache_bytes =
+            estimate_llama_cache_bytes(model, config.max_context_tokens)?;
+        config.validate_cache_budget(estimated_cache_bytes)?;
 
-        let mut cache = LlamaKvCache::new(&model.config);
+        let mut cache =
+            LlamaKvCache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
 
@@ -409,7 +490,15 @@ impl Qwen35Generator {
             return Err(GenerationError::EmptyPrompt);
         }
         config.validate_context(prompt.len())?;
-        let mut cache = Qwen35Cache::new(&model.config);
+        let estimated_cache_bytes = model
+            .config
+            .estimated_cache_bytes(config.max_context_tokens)
+            .ok_or(GenerationError::InvalidConfig(
+                "Qwen3.5 session cache size overflow or invalid layer map",
+            ))?;
+        config.validate_cache_budget(estimated_cache_bytes)?;
+        let mut cache =
+            Qwen35Cache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
         let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
