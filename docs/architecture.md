@@ -177,6 +177,10 @@ faster than all available vCPUs.
 
 - Model weights: immutable mapped GGUF bytes; no full-model F32 copy.
 - KV cache: allocated per session with an explicit context limit.
+- Generation requests: the runtime enforces a configurable maximum combined
+  prompt and generated length (max_context_tokens, default 4096) before it
+  allocates the per-request KV/recurrent cache. The CLI exposes this as
+  --max-context-tokens; raise it deliberately when a longer context is needed.
 - Activations: reusable scratch buffers sized from model configuration.
 - Sessions: bounded; do not create unbounded per-request caches.
 - Ownership: shared immutable model data, session-owned mutable state.
@@ -273,7 +277,11 @@ Still planned or awaiting target-machine evidence:
   tokens per second, latency, allocation behavior, and peak RSS.
 
 ### M7 - Operational hardening
-- Add context and memory limits, cancellation, session isolation, and stress tests.
+- Initial context hardening is implemented: generation requests have a
+  configurable combined prompt/output token limit, defaulting to 4096, checked
+  before per-request cache allocation.
+- Still planned: broader allocation/memory budgets, cancellation, session
+  isolation, and stress tests.
 - Add CLI and optional HTTP serving only after the library is stable.
 - Publish reproducible benchmark methodology and known limitations.
 
