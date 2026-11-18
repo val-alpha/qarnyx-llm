@@ -125,11 +125,13 @@ non-finite inputs.
 
 The opt-in `fused-q4k` mode computes directly from packed Q4_K blocks without
 materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
-falls back to the scalar direct-block dot elsewhere. Keep `auto` as the
-dequantize-plus-AVX2/FMA baseline and compare it against `fused-q4k` on the
-target machine; the faster path is hardware- and workload-dependent. Fused
-Q5_K/Q6_K kernels and their SIMD implementations remain future work. RMSNorm,
-RoPE, softmax, and residual addition currently use scalar implementations.
+falls back to the scalar direct-block dot elsewhere. The opt-in `fused-qk`
+mode extends direct-block matvec to Q5_K and Q6_K, using AVX2 on supported
+x86_64 CPUs and scalar direct-block references elsewhere; it also enables the
+fused Q4_K path. Keep `auto` as the dequantize-plus-AVX2/FMA baseline. Fused
+paths are hardware- and workload-dependent and must remain opt-in until
+representative target-machine measurements are repeatable. RMSNorm, RoPE,
+softmax, and residual addition currently use scalar implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
@@ -154,6 +156,7 @@ feature detection:
 - x86_64: AVX2/FMA matvec and matmul kernels are implemented;
 - x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
   available when those features are absent;
+- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 with scalar fallback;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
@@ -253,15 +256,18 @@ Implemented on `main`:
   attention scores, recurrent output, and FFN intermediates.
 - Opt-in direct-block Q4_K matvec with AVX2/FMA on supported x86_64 CPUs and a
   scalar direct-block fallback, covered by scalar-reference differential tests.
+- Opt-in direct-block Q5_K/Q6_K matvec with AVX2 on supported x86_64 CPUs and
+  scalar direct-block fallbacks, covered by multi-block differential tests.
 
 Still planned or awaiting target-machine evidence:
 - Benchmark `auto` against `fused-q4k` and compare M6-A against the B/C/D
   build on the target workstation. Do not assume either path is faster until
   the same workload is measured end to end.
-- Add fused Q5_K/Q6_K matvec kernels and evaluate further fused SIMD arithmetic.
+- Improve and re-measure Q5_K/Q6_K fused kernels where the synthetic VPS
+  benchmark shows worker-count sensitivity or no material gain.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
-- Benchmark prefill/decode tokens per second, latency, allocation behavior,
-  and peak RSS on the target machine.
+- Benchmark representative Q5_K/Q6_K model workloads plus prefill/decode
+  tokens per second, latency, allocation behavior, and peak RSS.
 
 ### M7 - Operational hardening
 - Add context and memory limits, cancellation, session isolation, and stress tests.
