@@ -244,32 +244,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         12,
     )?;
 
-    println!("\nQ5_K / Q6_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
-    for workers in [1, 10] {
-        let auto_qk_backend = if workers == 1 {
-            CpuBackend::new(1)?
-        } else {
-            CpuBackend::new(workers)?
-        };
-        let fused_qk_backend = CpuBackend::new_fused_qk(workers)?;
-        for (label, dtype, raw_type) in [("Q5_K", DType::Q5K, 13), ("Q6_K", DType::Q6K, 14)] {
-            benchmark_matvec(
-                &auto_qk_backend,
-                &format!("workers={workers} auto-dequant"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-            benchmark_matvec(
-                &fused_qk_backend,
-                &format!("workers={workers} fused-qk"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-        }
-    }
-
     println!("\nMatmul storage-format comparison (scalar vs runtime dispatch):");
     for (label, dtype, raw_type) in formats {
         benchmark_matmul(&scalar_backend, "scalar", label, dtype, raw_type)?;
