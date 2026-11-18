@@ -154,9 +154,9 @@ portable binaries without an appropriate dispatch/build strategy.
    Rayon pool, parallel Qwen3.5 recurrent heads, shared-pool multi-projection
    scheduling, per-session activation scratch reuse, and opt-in direct-block
    Q4_K AVX2/FMA are implemented with scalar fallbacks and correctness tests.
-   Opt-in direct-block Q5_K/Q6_K AVX2 matvecs are also implemented and covered
-   by differential tests. Target-machine microbenchmarks have been captured,
-   but Q5_K is worker-count-sensitive and Q6_K is near parity; broader
+   Opt-in direct-block Q5_K/Q6_K AVX2 kernels with runtime FMA accumulation
+   are also implemented and covered by differential tests. Three-round VPS
+   microbenchmarks show median gains for Q5_K/Q6_K, varying by worker count;
    representative-model validation, AVX-512, and NEON remain outstanding.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
