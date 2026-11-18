@@ -126,7 +126,10 @@ pub struct LlamaLayerWeights<'a> {
     pub down_proj: TensorView<'a>,
 }
 
-/// Mutable key/value cache used by incremental LLaMA decoding.
+/// Mutable key/value cache owned by one LLaMA decoding sequence.
+///
+/// Construct a separate cache for each independent generation stream; do not
+/// share one mutable cache between concurrent requests.
 #[derive(Debug, Clone)]
 pub struct LlamaKvCache {
     keys: Vec<Vec<f32>>,

@@ -529,6 +529,17 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_tokens_are_isolated_between_generation_sessions() {
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+
+        first.cancel();
+
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+    }
+
+    #[test]
     fn cancellation_token_clones_share_cancellation_state() {
         let token = CancellationToken::new();
         let signal = token.clone();

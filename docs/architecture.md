@@ -72,7 +72,8 @@ cargo run --release -p qarnyx-cli -- inspect model.gguf --list-tensors
    bytes; memory-mapped loading is a future optimization.
 3. Resolve tensor metadata by name and expose checked, non-owning tensor views.
 4. Load model configuration and map tensor names to a model implementation.
-5. Allocate bounded per-session KV cache and reusable activation scratch.
+5. Allocate a bounded request-local KV/recurrent cache and reusable activation
+   scratch workspace.
 6. Execute prefill, then incremental decode through the selected CPU backend.
 7. Sample the next token and decode it with the tokenizer.
 
@@ -180,7 +181,7 @@ faster than all available vCPUs.
 
 - Model weights: immutable GGUF bytes in an owned `Vec<u8>` in the current
   CLI; no full-model F32 copy. Memory-mapped loading remains future work.
-- KV cache: allocated per session with an explicit context limit.
+- KV cache: allocated per generation request with an explicit context limit.
 - Generation requests: the runtime enforces a configurable maximum combined
   prompt and generated length (max_context_tokens, default 4096) before it
   allocates the per-request KV/recurrent cache. The CLI exposes this as
@@ -345,6 +346,8 @@ Session ownership and isolation:
 - Every `generate`/`generate_ids` call allocates a fresh request-local
   LLaMA KV cache or Qwen3.5 recurrent/attention cache plus scratch workspace.
   Mutable cache state must not be shared between independent streams.
+- Create one `CancellationToken` per request; clone it only to share that
+  request's cancellation signal between its caller and generation task.
 - Runtime stress coverage: eight concurrent LLaMA generation sessions each
   issue four sequential requests while sharing one model and CPU backend but
   keeping separate generators. The test checks prompt-specific token IDs and
