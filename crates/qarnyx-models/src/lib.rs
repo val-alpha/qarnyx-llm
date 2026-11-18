@@ -136,13 +136,39 @@ pub struct LlamaKvCache {
 
 impl LlamaKvCache {
     pub fn new(config: &LlamaConfig) -> Self {
-        let key_width = config.attention_head_count_kv * config.attention_key_length;
-        let value_width = config.attention_head_count_kv * config.attention_value_length;
-        Self {
-            keys: vec![Vec::with_capacity(key_width); config.block_count],
-            values: vec![Vec::with_capacity(value_width); config.block_count],
+        Self::with_context_capacity(config, 1)
+            .expect("LLaMA KV cache dimensions must fit in memory")
+    }
+
+    /// Creates a KV cache with per-layer capacity reserved for the full context.
+    pub fn with_context_capacity(
+        config: &LlamaConfig,
+        context_tokens: usize,
+    ) -> Result<Self, ModelError> {
+        let key_width = config
+            .attention_head_count_kv
+            .checked_mul(config.attention_key_length)
+            .ok_or(ModelError::InvalidConfig("LLaMA KV key width overflow"))?;
+        let value_width = config
+            .attention_head_count_kv
+            .checked_mul(config.attention_value_length)
+            .ok_or(ModelError::InvalidConfig("LLaMA KV value width overflow"))?;
+        let key_capacity = key_width
+            .checked_mul(context_tokens)
+            .ok_or(ModelError::InvalidConfig("LLaMA KV key capacity overflow"))?;
+        let value_capacity = value_width
+            .checked_mul(context_tokens)
+            .ok_or(ModelError::InvalidConfig("LLaMA KV value capacity overflow"))?;
+
+        Ok(Self {
+            keys: (0..config.block_count)
+                .map(|_| Vec::with_capacity(key_capacity))
+                .collect(),
+            values: (0..config.block_count)
+                .map(|_| Vec::with_capacity(value_capacity))
+                .collect(),
             sequence_len: 0,
-        }
+        })
     }
 
     pub fn sequence_len(&self) -> usize {
@@ -610,6 +636,25 @@ mod tests {
             LlamaConfig::from_gguf(&gguf),
             Err(ModelError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn kv_cache_reserves_full_context_capacity() {
+        let config = LlamaConfig {
+            block_count: 2,
+            embedding_length: 4,
+            feed_forward_length: 8,
+            attention_head_count: 2,
+            attention_head_count_kv: 1,
+            attention_key_length: 2,
+            attention_value_length: 3,
+            attention_layer_norm_rms_epsilon: 1.0e-5,
+            rope_freq_base: 10_000.0,
+        };
+        let cache = LlamaKvCache::with_context_capacity(&config, 16).unwrap();
+        assert_eq!(cache.keys[0].capacity(), 32);
+        assert_eq!(cache.values[0].capacity(), 48);
+        assert!(LlamaKvCache::with_context_capacity(&config, usize::MAX).is_err());
     }
 
     #[test]
