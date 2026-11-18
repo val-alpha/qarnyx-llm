@@ -302,9 +302,10 @@ mod tests {
         assert!(matches!(
             config.validate_cache_budget(1024 * 1024 + 1),
             Err(GenerationError::CacheBudgetExceeded {
-                estimated_bytes: 1024 * 1024 + 1,
-                limit_bytes: 1024 * 1024,
-            })
+                estimated_bytes,
+                limit_bytes,
+            }) if estimated_bytes == 1024 * 1024 + 1
+                && limit_bytes == 1024 * 1024
         ));
     }
 
