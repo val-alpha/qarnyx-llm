@@ -219,8 +219,17 @@ pub struct Qwen35Cache {
 }
 impl Qwen35Cache {
     pub fn new(c: &Qwen35Config) -> Self {
-        Self::with_context_capacity(c, 0)
-            .expect("Qwen3.5 cache dimensions must fit in memory")
+        let state = LH * LD * LD;
+        Self {
+            sequence_len: 0,
+            recurrent: (0..c.block_count).map(|_| vec![0.0; state]).collect(),
+            conv: (0..c.block_count)
+                .map(|_| vec![0.0; LIN * 3 * (CONV - 1)])
+                .collect(),
+            keys: (0..c.block_count).map(|_| Vec::new()).collect(),
+            values: (0..c.block_count).map(|_| Vec::new()).collect(),
+            scratch: Qwen35Scratch::default(),
+        }
     }
 
     /// Creates a session cache with K/V and workspace capacity reserved up front.
