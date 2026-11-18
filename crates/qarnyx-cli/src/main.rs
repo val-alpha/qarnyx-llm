@@ -45,6 +45,9 @@ enum Command {
         /// Maximum combined prompt and generated sequence length.
         #[arg(long, default_value_t = 4096)]
         max_context_tokens: usize,
+        /// Maximum per-session cache/workspace budget in MiB.
+        #[arg(long, default_value_t = 512)]
+        max_cache_mib: usize,
         /// Sampling temperature; zero selects greedy decoding.
         #[arg(long, default_value_t = 0.8)]
         temperature: f32,
@@ -92,6 +95,7 @@ fn main() -> anyhow::Result<()> {
             prompt,
             max_new_tokens,
             max_context_tokens,
+            max_cache_mib,
             temperature,
             top_k,
             top_p,
@@ -103,6 +107,7 @@ fn main() -> anyhow::Result<()> {
             &prompt,
             max_new_tokens,
             max_context_tokens,
+            max_cache_mib,
             temperature,
             top_k,
             top_p,
@@ -166,6 +171,7 @@ fn generate_model(
     prompt: &str,
     max_new_tokens: usize,
     max_context_tokens: usize,
+    max_cache_mib: usize,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -185,6 +191,7 @@ fn generate_model(
     let config = GenerationConfig {
         max_new_tokens,
         max_context_tokens,
+        max_cache_mib,
         temperature,
         top_k,
         top_p,
