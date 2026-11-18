@@ -125,6 +125,10 @@ front. The cache budget excludes model weights and transient logits/outputs;
 it is not a process-wide RSS limit. Neither default changes the model's native
 context window.
 
+Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
+currently executing token evaluation finishes, then inference stops and its
+request-local cache is released. The CLI does not print partial generated text.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
@@ -168,10 +172,10 @@ portable binaries without an appropriate dispatch/build strategy.
    microbenchmarks show median gains for Q5_K/Q6_K, varying by worker count;
    representative-model validation, AVX-512, and NEON remain outstanding.
 8. **M7 - Operational hardening:** combined prompt/output context cap
-   (default 4096) and a per-session cache/workspace memory budget (default
-   512 MiB) are implemented before cache allocation. Broader process memory
-   budgets, cancellation, session isolation, stress tests, and reproducible
-   benchmarks remain planned.
+   (default 4096), per-session cache/workspace memory budget (default 512 MiB),
+   and cooperative token-boundary cancellation (including CLI Ctrl+C) are
+   implemented. Broader process memory budgets, session isolation, stress
+   tests, and reproducible benchmarks remain planned.
 
 ## Non-goals for the first milestone
 
