@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-ups A–E are implemented on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, opt-in AVX2/FMA direct-block Q4_K, and opt-in AVX2 direct-block Q5_K/Q6_K matvecs. GitHub Actions has passed workspace `cargo check` and `cargo test` for the latest M6-E code; the final workspace formatting gate remains red because rustfmt reports outstanding formatting differences across the workspace. The selected three-repeat M6-B/C/D end-to-end comparison on the target Ubuntu machine averaged 17.64 s (M6-A `auto`), 16.22 s (B/C/D `auto`), and 12.57 s (B/C/D `fused-q4k`), with identical displayed output in all selected runs. The M6-E VPS microbenchmark now shows a strong Q4_K and single-worker Q5_K fused result, but Q5_K regresses at ten workers and Q6_K is near parity. These are synthetic/machine-specific measurements, not universal performance claims. M6 remains in progress; AVX-512/NEON and broader real-model validation remain outstanding.
+**Status:** M6 follow-ups A–F are implemented on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, opt-in AVX2/FMA direct-block Q4_K, opt-in AVX2 Q5_K/Q6_K kernels, and FMA accumulation variants for the latter. The target Ubuntu VPS passed `cargo check --workspace` and all 71 unit tests after pulling the M6-F changes; the repository-wide formatting gate was not run in this session. Three paired synthetic VPS benchmark rounds show median fused improvements of 41.5% (Q5_K, one worker), 2.6% (Q6_K, one worker), 17.1% (Q5_K, ten workers), and 27.1% (Q6_K, ten workers). Absolute microbenchmark times varied considerably between rounds, so medians and paired comparisons are reported; these are machine-specific synthetic-kernel results, not end-to-end model claims. M6 remains in progress; representative Q5_K/Q6_K model validation, AVX-512/NEON, and broader performance validation remain outstanding.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -495,74 +495,80 @@ Q6_K is close to the automatic path at both tested worker counts. These
 measurements are not enough to make `fused-qk` the default. Representative
 Q5_K/Q6_K model runs and repeat measurements remain outstanding.
 
-### 4.10 Q5_K / Q6_K direct-block microbenchmark (M6-E; VPS result recorded)
+### 4.10 Q5_K / Q6_K direct-block microbenchmark (M6-E; three VPS rounds)
 
-The user ran the synthetic M6-E CPU benchmark on the Ubuntu 24.04.1 VPS with
-`cargo bench -p qarnyx-cpu --bench kernels`. Cargo automatically uses the
-optimized bench profile; passing `--release` directly to this Cargo version
-is invalid. The benchmark's Q5_K/Q6_K arms use a logical matrix shape of
-`[128, 512]` and 20 matvec iterations per arm.
+The user ran `cargo bench -p qarnyx-cpu --bench kernels` three times
+before and after the M6-F FMA change. The benchmark compares auto
+dequantization plus F32 dot against the packed-block fused path at logical
+shape `[128, 512]`, 20 iterations per arm. The VPS reports
+`avx2=true`, `fma=true`, `avx512f=false`, and `neon=false`.
 
-**VPS CPU features**
+**M6-E baseline before the FMA implementation (one run)**
 
-| Feature | Result |
-|---|---:|
-| AVX2 | available and active |
-| FMA | available |
-| AVX-512F | unavailable |
-| NEON | unavailable |
+| Format | Workers | Auto | Fused non-FMA | Fused relative to auto |
+|---|---:|---:|---:|---:|
+| Q5_K | 1 | 80.31 µs | 46.80 µs | 41.7% faster |
+| Q6_K | 1 | 78.72 µs | 76.19 µs | 3.2% faster |
+| Q5_K | 10 | 55.21 µs | 64.93 µs | 17.6% slower |
+| Q6_K | 10 | 49.16 µs | 47.95 µs | 2.5% faster |
 
-**Observed matvec timings**
+**M6-F after AVX2/FMA dispatch was added (three paired rounds)**
 
-| Format | Workers | Auto dequant + F32 dot | Fused packed-block | Interpretation |
-|---|---:|---:|---:|---|
-| Q4_K | 1 | 62.33 µs | 26.71 µs | **57.1% lower elapsed time** |
-| Q5_K | 1 | 80.31 µs | 46.80 µs | **41.7% lower elapsed time** |
-| Q6_K | 1 | 78.72 µs | 76.19 µs | **3.2% lower elapsed time** |
-| Q5_K | 10 | 55.21 µs | 64.93 µs | **17.6% higher elapsed time** |
-| Q6_K | 10 | 49.16 µs | 47.95 µs | **2.5% lower elapsed time** |
+| Format | Workers | Auto runs (µs) | Fused FMA runs (µs) | Auto median | Fused median | Median improvement |
+|---|---:|---|---|---:|---:|---:|
+| Q5_K | 1 | 153.54, 80.71, 148.78 | 88.64, 46.90, 87.09 | 148.78 | 87.09 | **41.5%** |
+| Q6_K | 1 | 154.17, 81.44, 153.62 | 151.25, 76.96, 149.69 | 153.62 | 149.69 | **2.6%** |
+| Q5_K | 10 | 58.25, 68.44, 57.21 | 57.40, 39.74, 48.31 | 58.25 | 48.31 | **17.1%** |
+| Q6_K | 10 | 57.90, 61.95, 68.13 | 45.06, 45.14, 48.32 | 61.95 | 45.14 | **27.1%** |
+
+Paired round-by-round percentage improvements (FMA fused vs auto) were:
+- Q5_K, one worker: 42.3%, 41.9%, and 41.5%.
+- Q6_K, one worker: 1.9%, 5.5%, and 2.6%.
+- Q5_K, ten workers: 1.5%, 41.9%, and 15.6%.
+- Q6_K, ten workers: 22.2%, 27.1%, and 29.1%.
 
 **Interpretation and guardrails**
 
-- Q4_K fused is substantially faster in this synthetic VPS microbenchmark.
-- Q5_K fused is substantially faster at one worker but regresses at ten.
-  This worker-count sensitivity is the main optimization target for the next
-  experiment; inspect scheduling cost and the packed-value unpack loop before
-  changing dispatch policy.
-- Q6_K fused is effectively near parity in this sample. Differences of 2–3%
-  from one short run are not strong evidence of a real improvement.
-- These are synthetic kernel timings, not end-to-end model results. The
-  current Qwen3.5-2B Q4_K_M model does not exercise Q5_K or Q6_K tensors.
+- Q5_K has a repeatable approximately 42% single-worker improvement. At ten
+  workers, the median is 17.1% faster, but the paired round results vary much
+  more; treat the size of the multi-worker gain as preliminary.
+- Q6_K has only a small 2.6% median gain at one worker, which is too small to
+  call a material improvement from this short synthetic test. At ten workers,
+  all three paired runs improved by 22–29%, with a 27.1% median improvement.
+- Absolute timings fluctuate substantially between rounds. In particular,
+  single-worker automatic timings in round 2 were about half the values in
+  rounds 1 and 3. Paired same-round comparisons and medians are therefore
+  more informative than raw means, but the variability still calls for
+  cautious interpretation.
+- The FMA path is covered by the existing differential CPU test. After
+  pulling the FMA change, the user's VPS run passed `cargo check --workspace`
+  and `cargo test --workspace`: 71 unit tests passed, zero failed. The
+  `cargo fmt` gate was not run in this session.
+- These are synthetic kernel measurements, not end-to-end model results.
+  The current Qwen3.5-2B Q4_K_M model does not exercise Q5_K/Q6_K tensors.
   A representative Q5_K/Q6_K GGUF model is still needed for real workload
   validation.
-- The benchmark printed a non-fatal `unused variable: fused_qk_backend`
-  warning because an initial single-worker backend binding is shadowed by the
-  worker-loop binding. That redundant binding is removed in the follow-up
-  cleanup.
-- Keep `fused-qk` opt-in until repeatable, representative model benchmarks
-  show a gain without an output regression.
+- Keep `fused-qk` opt-in pending real-model correctness and repeatable
+  end-to-end performance evidence. Do not change `auto` defaults based only
+  on this microbenchmark.
 
-The user supplied these timings. The assistant did not execute the benchmark
-on the VPS.
+The user supplied these timings and local validation output. The assistant
+did not execute the benchmark or tests on the VPS.
 
-### M6 follow-up F — FMA accumulation for fused Q5_K / Q6_K (implemented; target re-benchmark pending)
+### M6 follow-up F — FMA accumulation for fused Q5_K / Q6_K (implemented; synthetic VPS result recorded)
 
-The first VPS benchmark showed that the direct-block Q5_K path was faster
-with one worker but slower than auto-dequantization with ten workers. Q6_K
-was close to parity in both settings. The current VPS advertises both AVX2
-and FMA, while the original Q5_K/Q6_K vector loops used separate multiply
-and add instructions.
+The fused Q5_K/Q6_K dispatch selects AVX2/FMA accumulation when the runtime
+CPU feature check reports FMA. AVX2-only hosts retain the non-FMA vector
+implementation, and hosts without AVX2 retain scalar direct-block fallbacks.
+The `auto` path is unchanged.
 
-The fused Q5_K/Q6_K dispatch now selects AVX2/FMA accumulation when the
-runtime CPU feature check reports FMA. The existing AVX2 non-FMA implementation
-remains available for AVX2 hosts without FMA, and scalar direct-block
-fallbacks remain available where AVX2 is absent. The `auto` path is unchanged.
-
-The existing differential matvec tests exercise the selected runtime path
-against the scalar and dequantized references. The VPS benchmark must be
-re-run after updating the checkout to determine whether FMA improves the
-single-worker result and, especially, reduces the ten-worker Q5_K regression.
-No performance gain is claimed yet.
+The three-round VPS benchmark is recorded in section 4.10. The most material
+observed changes are Q5_K at one worker (41.5% faster by median) and Q6_K at
+ten workers (27.1% faster by median). Q5_K at ten workers is also faster by
+median (17.1%), but its paired results show greater variation. Q6_K at one
+worker is near parity. Keep the fused mode opt-in until representative real
+models confirm output correctness and end-to-end gains. No default kernel
+selection was changed by M6-F.
 
 ### Later research — prefill batching and file-backed weights
 
