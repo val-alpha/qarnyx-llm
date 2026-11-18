@@ -181,6 +181,12 @@ faster than all available vCPUs.
   prompt and generated length (max_context_tokens, default 4096) before it
   allocates the per-request KV/recurrent cache. The CLI exposes this as
   --max-context-tokens; raise it deliberately when a longer context is needed.
+- Per-session cache budget: the runtime estimates retained KV/recurrent state
+  and reusable Qwen3.5 workspace capacity before allocation. The default is
+  512 MiB, configurable with --max-cache-mib. Qwen3.5 and LLaMA reserve their
+  maximum sequence capacity up front to avoid cache growth reallocations.
+  This budget excludes immutable model weights, allocator metadata, and
+  transient output/logit buffers; it is not a process-wide RSS limit.
 - Activations: reusable scratch buffers sized from model configuration.
 - Sessions: bounded; do not create unbounded per-request caches.
 - Ownership: shared immutable model data, session-owned mutable state.
@@ -277,11 +283,12 @@ Still planned or awaiting target-machine evidence:
   tokens per second, latency, allocation behavior, and peak RSS.
 
 ### M7 - Operational hardening
-- Initial context hardening is implemented: generation requests have a
-  configurable combined prompt/output token limit, defaulting to 4096, checked
-  before per-request cache allocation.
-- Still planned: broader allocation/memory budgets, cancellation, session
-  isolation, and stress tests.
+- Initial context and cache hardening are implemented: generation requests
+  have a configurable combined prompt/output token limit (default 4096) and a
+  per-session cache/workspace budget (default 512 MiB), both checked before
+  cache allocation. K/V and scratch capacities are reserved from the limit.
+- Still planned: broader allocation budgets beyond retained session caches,
+  cancellation, session isolation, and stress tests.
 - Add CLI and optional HTTP serving only after the library is stable.
 - Publish reproducible benchmark methodology and known limitations.
 
