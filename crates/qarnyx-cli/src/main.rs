@@ -1,6 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
-use std::fs;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,6 +49,9 @@ enum Command {
         /// Maximum per-session cache/workspace budget in MiB.
         #[arg(long, default_value_t = 512)]
         max_cache_mib: usize,
+        /// Maximum accounted model-file plus session-cache budget in MiB.
+        #[arg(long, default_value_t = 8192)]
+        max_memory_mib: usize,
         /// Sampling temperature; zero selects greedy decoding.
         #[arg(long, default_value_t = 0.8)]
         temperature: f32,
@@ -98,6 +100,7 @@ fn main() -> anyhow::Result<()> {
             max_new_tokens,
             max_context_tokens,
             max_cache_mib,
+            max_memory_mib,
             temperature,
             top_k,
             top_p,
@@ -110,6 +113,7 @@ fn main() -> anyhow::Result<()> {
             max_new_tokens,
             max_context_tokens,
             max_cache_mib,
+            max_memory_mib,
             temperature,
             top_k,
             top_p,
@@ -168,12 +172,73 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
     Ok(())
 }
 
+fn model_file_budget_bytes(
+    max_memory_mib: usize,
+    max_cache_mib: usize,
+) -> anyhow::Result<usize> {
+    const MIB: usize = 1024 * 1024;
+
+    if max_memory_mib == 0 || max_cache_mib == 0 {
+        anyhow::bail!("--max-memory-mib and --max-cache-mib must be non-zero");
+    }
+
+    let total_budget_bytes = max_memory_mib
+        .checked_mul(MIB)
+        .ok_or_else(|| anyhow::anyhow!("--max-memory-mib does not fit in bytes"))?;
+    let cache_budget_bytes = max_cache_mib
+        .checked_mul(MIB)
+        .ok_or_else(|| anyhow::anyhow!("--max-cache-mib does not fit in bytes"))?;
+
+    total_budget_bytes
+        .checked_sub(cache_budget_bytes)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--max-memory-mib must be greater than --max-cache-mib so the model file has a non-zero budget"
+            )
+        })
+}
+
+fn read_model_with_memory_budget(
+    path: &std::path::Path,
+    max_memory_mib: usize,
+    max_cache_mib: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let model_budget_bytes = model_file_budget_bytes(max_memory_mib, max_cache_mib)?;
+    let model_budget_u64 = u64::try_from(model_budget_bytes)?;
+    let mut file = File::open(path)?;
+    let expected_size = file.metadata()?.len();
+
+    if expected_size > model_budget_u64 {
+        anyhow::bail!(
+            "model file is {expected_size} bytes; --max-memory-mib {max_memory_mib} with --max-cache-mib {max_cache_mib} leaves {model_budget_bytes} bytes for model data"
+        );
+    }
+
+    // Allocate only the size checked above, then verify EOF to detect a file
+    // that changes size between metadata inspection and the read.
+    let expected_len = usize::try_from(expected_size)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(expected_len)
+        .map_err(|error| anyhow::anyhow!("could not reserve model file buffer: {error}"))?;
+    data.resize(expected_len, 0);
+    file.read_exact(&mut data)?;
+
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        anyhow::bail!("model file size changed while it was being read");
+    }
+
+    Ok(data)
+}
+
 fn generate_model(
     path: &std::path::Path,
     prompt: &str,
     max_new_tokens: usize,
     max_context_tokens: usize,
     max_cache_mib: usize,
+    max_memory_mib: usize,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -185,7 +250,7 @@ fn generate_model(
     let signal_cancellation = cancellation.clone();
     ctrlc::set_handler(move || signal_cancellation.cancel())?;
 
-    let data = fs::read(path)?;
+    let data = read_model_with_memory_budget(path, max_memory_mib, max_cache_mib)?;
     let gguf = GgufFile::parse(&data)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
     let backend = match cpu_kernel {
@@ -251,4 +316,30 @@ fn generate_model(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    #[test]
+    fn model_budget_reserves_the_configured_session_cache() {
+        assert_eq!(
+            model_file_budget_bytes(8192, 512).unwrap(),
+            (8192 - 512) * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn rejects_a_cache_reservation_that_consumes_the_total_budget() {
+        assert!(model_file_budget_bytes(512, 512).is_err());
+        assert!(model_file_budget_bytes(128, 512).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_and_overflowing_budgets() {
+        assert!(model_file_budget_bytes(0, 1).is_err());
+        assert!(model_file_budget_bytes(8192, 0).is_err());
+        assert!(model_file_budget_bytes(usize::MAX, 1).is_err());
+    }
 }

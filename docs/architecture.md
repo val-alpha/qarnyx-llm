@@ -187,6 +187,14 @@ faster than all available vCPUs.
   maximum sequence capacity up front to avoid cache growth reallocations.
   This budget excludes immutable model weights, allocator metadata, and
   transient output/logit buffers; it is not a process-wide RSS limit.
+- Model-load admission budget: the CLI defaults --max-memory-mib to 8192 MiB.
+  Before reading a GGUF file, it reserves the configured --max-cache-mib
+  allowance and checks that the model file fits in the remainder. The read
+  itself is capped at that remainder to guard against a file changing after
+  the metadata check. This accounts for model-file bytes plus the maximum
+  session-cache reservation; parser/tokenizer allocations, transient logits
+  and outputs, allocator overhead, and unrelated process memory are excluded.
+  It is an admission-control envelope, not an RSS guarantee.
 - Cooperative cancellation: callers can share a CancellationToken with a
   generation task. Cancellation is checked between complete token evaluations;
   the in-flight token finishes, then request-local state is dropped. The CLI
@@ -294,8 +302,12 @@ Still planned or awaiting target-machine evidence:
 - Cancellation is implemented for LLaMA and Qwen3.5 runtime generation and
   wired to Ctrl+C in the CLI. It is cooperative at token boundaries, not an
   asynchronous interruption inside a SIMD kernel or model-layer evaluation.
-- Still planned: broader allocation budgets beyond retained session caches,
-  session isolation, and stress tests.
+- M7-D model-load admission budget is implemented in the CLI: model-file bytes
+  plus the configured maximum session-cache reservation must fit the default
+  8192 MiB budget before the GGUF payload is read. The read is bounded to
+  prevent a changing file from exceeding its allowance. This is not a full
+  process RSS cap; tokenizer/parser and transient allocations are excluded.
+- Still planned: session isolation and stress tests.
 - Add CLI and optional HTTP serving only after the library is stable.
 - Publish reproducible benchmark methodology and known limitations.
 

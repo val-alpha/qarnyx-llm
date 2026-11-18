@@ -125,6 +125,14 @@ front. The cache budget excludes model weights and transient logits/outputs;
 it is not a process-wide RSS limit. Neither default changes the model's native
 context window.
 
+The CLI also has an 8192 MiB `--max-memory-mib` admission budget. Before
+reading a model file, it reserves the configured `--max-cache-mib` allowance
+and verifies that the file fits in the remaining bytes. The read itself is
+bounded to that allowance. This is an accounted model-file-plus-session-cache
+budget, not a process-wide RSS guarantee: parser metadata, tokenizer data,
+transient logits/outputs, allocator overhead, and other process memory are
+excluded.
+
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its
 request-local cache is released. The CLI does not print partial generated text.
@@ -173,9 +181,10 @@ portable binaries without an appropriate dispatch/build strategy.
    representative-model validation, AVX-512, and NEON remain outstanding.
 8. **M7 - Operational hardening:** combined prompt/output context cap
    (default 4096), per-session cache/workspace memory budget (default 512 MiB),
-   and cooperative token-boundary cancellation (including CLI Ctrl+C) are
-   implemented. Broader process memory budgets, session isolation, stress
-   tests, and reproducible benchmarks remain planned.
+   cooperative token-boundary cancellation (including CLI Ctrl+C), and the
+   M7-D model-load admission budget (default 8192 MiB, including the configured
+   session-cache reservation) are implemented. Session isolation, stress tests,
+   and reproducible benchmarks remain planned.
 
 ## Non-goals for the first milestone
 
