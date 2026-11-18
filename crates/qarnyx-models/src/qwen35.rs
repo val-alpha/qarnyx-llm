@@ -501,12 +501,19 @@ fn recurrent_heads<B: Backend>(
         l2(&mut k[head * LD..(head + 1) * LD]);
     }
 
+    // GGUF stores ssm_a as -exp(A_log), so it is already the non-positive
+    // decay coefficient. Compute exp(ssm_a * softplus(alpha + dt)) directly.
+    let mut decay_factors = [0.0_f32; LH];
+    for head in 0..LH {
+        decay_factors[head] = ssm_decay_factor(a[head], alpha[head], dt[head])?;
+    }
+
     // Recurrent time order is preserved within a head. Only independent heads
     // are scheduled concurrently, and each task receives one disjoint state block.
     b.parallel_for_each_mut(state, LD * LD, &|head, head_state| {
         let key_head = &k[head * LD..(head + 1) * LD];
         let value_head = &v[head * LD..(head + 1) * LD];
-        let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+        let decay = decay_factors[head];
         let beta_value = sigmoid(beta[head]);
 
         for column in 0..LD {
@@ -843,6 +850,29 @@ fn silu(x:f32)->f32{if x>=0.0{x/(1.0+(-x).exp())}else{let e=x.exp();x*e/(1.0+e)}
 fn sigmoid(x:f32)->f32{if x>=0.0{1.0/(1.0+(-x).exp())}else{let e=x.exp();e/(1.0+e)}}
 fn softplus(x:f32)->f32{if x>20.0{x}else if x< -20.0{x.exp()}else{(1.0+x.exp()).ln()}}
 
+/// Computes the Qwen3.5 Gated DeltaNet decay from the GGUF representation.
+///
+/// The GGUF converter stores `ssm_a` as `-exp(A_log)`. It is therefore already
+/// a non-positive coefficient, not the raw `A_log` value.
+fn ssm_decay_factor(a: f32, alpha: f32, dt: f32) -> Result<f32, ModelError> {
+    let gate_input = alpha + dt;
+    if !a.is_finite() || a > 0.0 || !gate_input.is_finite() {
+        return Err(ModelError::InvalidConfig(
+            "Qwen3.5 ssm_a must be finite and non-positive, and alpha + dt must be finite"
+                .into(),
+        ));
+    }
+
+    let log_decay = a * softplus(gate_input);
+    if log_decay.is_nan() || log_decay > 0.0 {
+        return Err(ModelError::InvalidConfig(
+            "Qwen3.5 recurrent log-decay must be non-positive".into(),
+        ));
+    }
+
+    Ok(log_decay.exp())
+}
+
 fn row(t:TensorView<'_>,r:usize,n:usize)->Result<Vec<f32>,ModelError>{let mut o=vec![0.0;n];decode_into(t,r,&mut o)?;Ok(o)}
 fn decode_into(t:TensorView<'_>,r:usize,o:&mut[f32])->Result<(),ModelError>{
     let ty=dtype_id(t.dtype).ok_or(ModelError::InvalidConfig("unsupported tensor dtype"))?;
@@ -901,7 +931,8 @@ mod recurrent_head_tests {
             let head_state = &mut state[state_start..state_start + LD * LD];
             let key_head = &k[head * LD..(head + 1) * LD];
             let value_head = &v[head * LD..(head + 1) * LD];
-            let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+            let decay = ssm_decay_factor(a[head], alpha[head], dt[head])
+                .expect("test fixture has valid GGUF decay parameters");
             let beta_value = sigmoid(beta[head]);
 
             for column in 0..LD {
@@ -952,6 +983,31 @@ mod recurrent_head_tests {
             }
         }
         core
+    }
+
+    #[test]
+    fn ssm_decay_uses_pretransformed_negative_gguf_a() {
+        let a = -0.25_f32;
+        let gate_input = 0.6_f32;
+        let expected = (a * (1.0 + gate_input.exp()).ln()).exp();
+        let old_log_a_interpretation =
+            (-a.exp() * (1.0 + gate_input.exp()).ln()).exp();
+
+        let actual = ssm_decay_factor(a, gate_input, 0.0).unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(actual < 1.0);
+        assert!(
+            (actual - old_log_a_interpretation).abs() > 0.1,
+            "regression fixture must distinguish the GGUF and raw A_log formulas"
+        );
+    }
+
+    #[test]
+    fn ssm_decay_rejects_invalid_gguf_parameters() {
+        assert!(ssm_decay_factor(0.1, 0.0, 0.0).is_err());
+        assert!(ssm_decay_factor(f32::NAN, 0.0, 0.0).is_err());
+        assert!(ssm_decay_factor(-0.1, f32::INFINITY, 0.0).is_err());
     }
 
     #[test]
