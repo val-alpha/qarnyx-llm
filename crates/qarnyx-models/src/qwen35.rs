@@ -119,7 +119,7 @@ impl Qwen35Config {
 
     /// Estimates the retained per-session Qwen3.5 cache and scratch capacity.
     ///
-    /// This includes recurrent/ convolution state, attention K/V capacity, and
+    /// This includes recurrent/convolution state, attention K/V capacity, and
     /// reusable activation workspaces. Model weights and transient logits are
     /// intentionally excluded.
     pub fn estimated_cache_bytes(&self, context_tokens: usize) -> Option<usize> {
@@ -150,7 +150,7 @@ impl Qwen35Config {
             context_tokens,
         ]
         .into_iter()
-        .try_fold(0usize, usize::checked_add)?;
+        .try_fold(0usize, |total, value| total.checked_add(value))?;
 
         recurrent_floats
             .checked_add(convolution_floats)?
