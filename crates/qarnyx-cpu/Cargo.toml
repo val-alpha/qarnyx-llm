@@ -17,3 +17,7 @@ workspace = true
 [[bench]]
 name = "kernels"
 harness = false
+
+[[bench]]
+name = "perf"
+harness = false
