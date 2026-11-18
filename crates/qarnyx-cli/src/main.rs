@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use qarnyx_gguf::GgufFile;
 use qarnyx_models::{LlamaModel, Qwen35Model};
-use qarnyx_runtime::{GenerationConfig, LlamaGenerator, Qwen35Generator};
+use qarnyx_runtime::{
+    CancellationToken, GenerationConfig, GenerationError, LlamaGenerator, Qwen35Generator,
+};
 use qarnyx_tokenizer::GgufTokenizer;
 
 /// Qarnyx command-line interface.
@@ -179,6 +181,10 @@ fn generate_model(
     cpu_kernel: CpuKernelMode,
     seed: u64,
 ) -> anyhow::Result<()> {
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    ctrlc::set_handler(move || signal_cancellation.cancel())?;
+
     let data = fs::read(path)?;
     let gguf = GgufFile::parse(&data)?;
     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
@@ -198,17 +204,46 @@ fn generate_model(
         seed,
     };
 
+    eprintln!("Press Ctrl+C to cancel generation cleanly.");
     match gguf.metadata_string("general.architecture") {
         Some("qwen35") => {
             let model = Qwen35Model::from_gguf(&gguf, &data)?;
             let mut generator = Qwen35Generator::new(seed);
-            let result = generator.generate(&model, &tokenizer, &backend, prompt, config)?;
+            let result = match generator.generate_with_cancellation(
+                &model,
+                &tokenizer,
+                &backend,
+                prompt,
+                config,
+                &cancellation,
+            ) {
+                Ok(result) => result,
+                Err(GenerationError::Cancelled) => {
+                    eprintln!("\nGeneration cancelled; session cache released.");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("{}", result.text);
         }
         Some("llama") => {
             let model = LlamaModel::from_gguf(&gguf, &data)?;
             let mut generator = LlamaGenerator::new(seed);
-            let result = generator.generate(&model, &tokenizer, &backend, prompt, config)?;
+            let result = match generator.generate_with_cancellation(
+                &model,
+                &tokenizer,
+                &backend,
+                prompt,
+                config,
+                &cancellation,
+            ) {
+                Ok(result) => result,
+                Err(GenerationError::Cancelled) => {
+                    eprintln!("\nGeneration cancelled; session cache released.");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("{}", result.text);
         }
         Some(other) => anyhow::bail!("unsupported model architecture: {other}"),
