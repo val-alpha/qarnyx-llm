@@ -156,7 +156,8 @@ feature detection:
 - x86_64: AVX2/FMA matvec and matmul kernels are implemented;
 - x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
   available when those features are absent;
-- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 with scalar fallback;
+- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 and selects FMA
+  accumulation when supported, with AVX2-only and scalar fallbacks;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
