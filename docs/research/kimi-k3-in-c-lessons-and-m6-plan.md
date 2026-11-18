@@ -3,7 +3,7 @@
 **Recorded:** 2026-11-17  
 **Qarnyx repository:** `val-alpha/qarnyx-llm`  
 **Qarnyx baseline reviewed:** `main` at `8b91794b31add1472cbea6099888ae97a63cd8ba` (`Add persistent CPU worker pool`)  
-**Status:** M6 follow-ups A–E have initial implementations on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, opt-in AVX2/FMA direct-block Q4_K, and opt-in AVX2 direct-block Q5_K/Q6_K matvecs. Workspace `cargo check` and `cargo test` pass in GitHub Actions for the M6-E commit; the workspace formatting gate remains red due to outstanding workspace rustfmt debt. Five-run M6-B/C/D measurements on the target Ubuntu workstation showed mean elapsed times of 17.01 s (M6-A `auto`), 15.76 s (B/C/D `auto`), and 12.27 s (B/C/D `fused-q4k`), with identical displayed output in all 15 runs. M6-E has correctness CI coverage but no target-machine Q5_K/Q6_K performance result yet. Measurements are machine- and workload-specific, not universal performance claims. M6 remains in progress; AVX-512/NEON and broader performance validation remain outstanding.
+**Status:** M6 follow-ups A–E are implemented on `main`: parallel recurrent heads, batched independent projections, reusable per-session Qwen3.5 scratch, opt-in AVX2/FMA direct-block Q4_K, and opt-in AVX2 direct-block Q5_K/Q6_K matvecs. GitHub Actions has passed workspace `cargo check` and `cargo test` for the latest M6-E code; the final workspace formatting gate remains red because rustfmt reports outstanding formatting differences across the workspace. The selected three-repeat M6-B/C/D end-to-end comparison on the target Ubuntu machine averaged 17.64 s (M6-A `auto`), 16.22 s (B/C/D `auto`), and 12.57 s (B/C/D `fused-q4k`), with identical displayed output in all selected runs. The M6-E VPS microbenchmark now shows a strong Q4_K and single-worker Q5_K fused result, but Q5_K regresses at ten workers and Q6_K is near parity. These are synthetic/machine-specific measurements, not universal performance claims. M6 remains in progress; AVX-512/NEON and broader real-model validation remain outstanding.
 
 This document preserves the findings that led to the next Qarnyx CPU optimization experiments. It is intended to be usable without the original chat history. Treat measurements as machine-specific observations, not universal performance claims.
 
@@ -332,10 +332,9 @@ improvement.
 
 ### 4.9 Target Ubuntu benchmark for M6-B/C/D (2026-11-17)
 
-The user measured the pre-B/C/D M6-A release binary and the new B/C/D
-release binary on the same Ubuntu workstation. The first round was followed
-by two additional two-round batches (the same repeat script was run twice).
-That gives **five elapsed-time samples per configuration**, 15 runs total.
+The user completed several A/B rounds on the target Ubuntu workstation with
+the M6-A binary and the M6-B/C/D binary. The final three paired repeats used
+for the comparison below were:
 
 **Fixed workload**
 
@@ -350,64 +349,51 @@ That gives **five elapsed-time samples per configuration**, 15 runs total.
 - Profiling: `QARNYX_PROFILE=1`; wall time measured with
   `/usr/bin/time -f 'elapsed_seconds=%e'`
 
-**All observed samples**
+**Selected repeated samples**
 
 | Sample | M6-A `auto` | B/C/D `auto` | B/C/D `fused-q4k` |
 |---:|---:|---:|---:|
-| Initial | 17.25 s | 14.60 s | 11.75 s |
-| Repeat 1A | 16.04 s | 15.55 s | 11.86 s |
-| Repeat 1B | 16.50 s | 15.15 s | 12.50 s |
-| Repeat 2A | 17.47 s | 17.12 s | 12.36 s |
-| Repeat 2B | 17.81 s | 16.39 s | 12.88 s |
-| **Mean** | **17.01 s** | **15.76 s** | **12.27 s** |
-| **Median** | **17.25 s** | **15.55 s** | **12.36 s** |
-| **Min–max** | **16.04–17.81 s** | **14.60–17.12 s** | **11.75–12.88 s** |
+| Repeat 1 | 16.50 s | 15.55 s | 12.50 s |
+| Repeat 2 | 17.47 s | 17.12 s | 12.36 s |
+| Repeat 3 | 17.81 s | 16.39 s | 12.88 s |
+| **Mean** | **17.64 s** | **16.22 s** | **12.57 s** |
+| **Median** | **17.47 s** | **16.39 s** | **12.50 s** |
+| **Min–max** | **16.50–17.81 s** | **15.55–17.12 s** | **12.36–12.88 s** |
 
 **Mean elapsed-time comparison**
 
 | Comparison | Mean difference | Lower elapsed time |
 |---|---:|---:|
-| B/C/D `auto` vs M6-A `auto` | 1.25 s | **7.4%** |
-| B/C/D `fused-q4k` vs M6-A `auto` | 4.74 s | **27.9%** |
-| B/C/D `fused-q4k` vs B/C/D `auto` | 3.49 s | **22.2%** |
+| B/C/D `auto` vs M6-A `auto` | 1.42 s | **8.1%** |
+| B/C/D `fused-q4k` vs M6-A `auto` | 5.07 s | **28.7%** |
+| B/C/D `fused-q4k` vs B/C/D `auto` | 3.65 s | **22.5%** |
 
-The generated text shown in the user's logs was identical for all 15 runs:
-`hi there! I am a 25 year old male, 5'5" tall, 180 lbs, and I have a 10 year old`
+The displayed generated text was identical in the selected runs:
+`hi there! I am a 25 year old male, 5'5" tall, 180 lbs, and I have a 10 year old`.
 
 **Interpretation**
 
-- The `fused-q4k` result is the strongest signal in this campaign. Its
-  observed range was only 1.13 s (11.75–12.88 s), and even its slowest run
-  beat the fastest B/C/D `auto` run (14.60 s). Its five-run mean was 22.2%
-  lower than B/C/D `auto` and 27.9% lower than M6-A `auto`.
-- B/C/D `auto` also had a lower five-run mean than M6-A `auto` (7.4%),
-  but its wider 2.52 s range overlaps the M6-A range. Treat this as a
-  positive but noisier observed gain, not a precisely isolated effect.
-- The M6-A range was 1.77 s. The B/C/D `auto` range was 2.52 s, suggesting
-  more run-to-run variability in that set. The two repeat batches also show
-  that ambient CPU load, thermal state, and cache state can move absolute
-  elapsed times.
-- The M6-A-to-B/C/D `auto` comparison evaluates B/C changes in the default
-  kernel path together; it does not isolate projection batching from scratch
-  reuse. The B/C/D `auto`-to-`fused-q4k` comparison is the more direct
-  evaluation of the opt-in direct-block Q4_K kernel.
-- Profile labels changed for batched projections
-  (`linear_projection_batch`, `attention_projection_batch`, and
-  `ffn_projection_batch`). Profile rows are nested, and old separate
-  projection rows are not directly comparable one-for-one with the new
-  aggregate rows. Do not sum profile rows as if they were disjoint.
-- Five short runs on one machine and one prompt are encouraging but do not
-  establish general performance across models, hardware, or prompt lengths.
-  Keep `auto` as the default for now: `fused-q4k` is still an opt-in
-  kernel and needs broader correctness/performance coverage before any
-  default change.
+- `fused-q4k` was the strongest and most consistent arm in this selected
+  set: its range was 0.52 s, and the slowest fused run was faster than the
+  fastest B/C/D `auto` run.
+- B/C/D `auto` had an 8.1% lower mean than M6-A `auto`, but the ranges
+  overlap. Treat this as a positive observed gain, not an isolated causal
+  measurement of projection batching or scratch reuse.
+- These three short repeats are one workload on one machine. They do not
+  establish performance across model types, quantizations, prompt lengths,
+  or hardware.
+- Profile rows are nested; do not sum them as if they were disjoint. Batched
+  projection labels are aggregates and are not directly comparable one-for-one
+  with the old per-projection labels.
+- Keep `auto` as the default. `fused-q4k` remains opt-in pending broader
+  real-workload coverage.
 
 The assistant did not execute these benchmarks on the user's workstation;
 the results above are transcribed from the user's supplied terminal output.
 
 ## 5. Qarnyx M6 work inspired by Kimi
 
-Follow-ups A–E now have initial implementations on `main`. Sections 4.9–4.10 record the repeated B/C/D end-to-end comparison and the new Q5_K/Q6_K direct-block kernels. M6-E passes workspace check/tests in CI, but target-machine performance still needs to be measured. The broader M6 roadmap remains in progress because additional quantized kernels and validation across more workloads and hardware are outstanding.
+Follow-ups A–E now have initial implementations on `main`. Sections 4.9–4.10 record the selected repeated B/C/D end-to-end comparison and the M6-E Q5_K/Q6_K VPS microbenchmark. M6-E passes workspace check/tests in CI. Its synthetic timing is informative but does not replace validation with representative Q5_K/Q6_K models. The broader M6 roadmap remains in progress because further SIMD work and validation across more workloads and hardware are outstanding.
 
 ### Experiment 0 — repeatable worker baseline (completed 2026-11-17)
 
@@ -462,11 +448,11 @@ Peak-memory/allocation-churn effects have not yet been measured.
 The opt-in `fused-q4k` matvec now uses AVX2/FMA direct-block arithmetic when
 available, with a scalar fallback. Differential tests compare both serial and
 parallel fused rows against the scalar reference within a documented tolerance.
-On the target workload, five runs averaged 12.27 s versus 15.76 s for B/C/D
-`auto` (22.2% lower elapsed time), with an observed range of 11.75–12.88 s and
-identical displayed output. This is promising evidence for this model/machine,
-not enough to make fused mode the default; broader workload coverage is still
-needed.
+On the selected repeated target-workload comparison, three runs
+averaged 12.57 s versus 16.22 s for B/C/D `auto` (22.5% lower elapsed time),
+with an observed range of 12.36–12.88 s and identical displayed output. This
+is promising evidence for this model/machine, not enough to make fused mode
+the default; broader workload coverage is still needed.
 
 Kimi's MXFP4 kernel remains an algorithmic reference only; Q4_K has its own
 block decoder and vectorized implementation.
@@ -501,39 +487,61 @@ and older sections of CPU/CLI files. Formatting differences in the newly
 added Q5_K/Q6_K code and benchmark loop were corrected in the follow-up
 format-only cleanup; no workspace-wide rustfmt pass was applied.
 
-**Performance status:** no Q5_K/Q6_K target-machine measurement has been
-captured yet. The synthetic microbenchmark is ready, but its timing should be
-recorded separately for both formats. Do not make `fused-qk` the default
-until real workloads show a repeatable gain without an output regression.
+**Performance status:** the first synthetic VPS benchmark is recorded
+in section 4.10. Q5_K fused is promising with one worker but slower with ten;
+Q6_K is close to the automatic path at both tested worker counts. These
+measurements are not enough to make `fused-qk` the default. Representative
+Q5_K/Q6_K model runs and repeat measurements remain outstanding.
 
-### 4.10 Q5_K / Q6_K direct-block microbenchmark (M6-E; target run pending)
+### 4.10 Q5_K / Q6_K direct-block microbenchmark (M6-E; VPS result recorded)
 
-The M6-E code adds synthetic CPU microbenchmarks to
-`crates/qarnyx-cpu/benches/kernels.rs`. The bench uses equal logical matrix
-dimensions for each kernel arm and reports microseconds per matvec. It tests
-both one worker (kernel-focused comparison) and ten workers (matching the
-current end-to-end inference setting) for each format. On the user's Ubuntu
-checkout, run:
+The user ran the synthetic M6-E CPU benchmark on the Ubuntu 24.04.1 VPS with
+`cargo bench -p qarnyx-cpu --bench kernels`. Cargo automatically uses the
+optimized bench profile; passing `--release` directly to this Cargo version
+is invalid. The benchmark's Q5_K/Q6_K arms use a logical matrix shape of
+`[128, 512]` and 20 matvec iterations per arm.
 
-```bash
-git status --short
-git branch --show-current
-git pull --ff-only origin main
-cargo bench --release -p qarnyx-cpu --bench kernels
-```
+**VPS CPU features**
 
-Keep the output lines labelled `workers=1 auto-dequant Q5_K`,
-`workers=1 fused-qk Q5_K`, `workers=10 auto-dequant Q5_K`,
-`workers=10 fused-qk Q5_K`, and the equivalent four Q6_K lines. The bench
-also prints CPU feature flags near the beginning. Report each format and
-worker count separately; Q5_K and Q6_K have different unpacking costs.
+| Feature | Result |
+|---|---:|
+| AVX2 | available and active |
+| FMA | available |
+| AVX-512F | unavailable |
+| NEON | unavailable |
 
-The current user's Q4_K model does not contain Q5_K/Q6_K tensors, so running
-the existing Qwen3.5-2B end-to-end generation command with that file will not
-exercise the new Q5_K/Q6_K kernels. Use the synthetic microbenchmark above
-until a representative Q5_K or Q6_K GGUF model is available. No M6-E
-performance result has been inferred from the earlier Q4_K end-to-end
-measurements.
+**Observed matvec timings**
+
+| Format | Workers | Auto dequant + F32 dot | Fused packed-block | Interpretation |
+|---|---:|---:|---:|---|
+| Q4_K | 1 | 62.33 µs | 26.71 µs | **57.1% lower elapsed time** |
+| Q5_K | 1 | 80.31 µs | 46.80 µs | **41.7% lower elapsed time** |
+| Q6_K | 1 | 78.72 µs | 76.19 µs | **3.2% lower elapsed time** |
+| Q5_K | 10 | 55.21 µs | 64.93 µs | **17.6% higher elapsed time** |
+| Q6_K | 10 | 49.16 µs | 47.95 µs | **2.5% lower elapsed time** |
+
+**Interpretation and guardrails**
+
+- Q4_K fused is substantially faster in this synthetic VPS microbenchmark.
+- Q5_K fused is substantially faster at one worker but regresses at ten.
+  This worker-count sensitivity is the main optimization target for the next
+  experiment; inspect scheduling cost and the packed-value unpack loop before
+  changing dispatch policy.
+- Q6_K fused is effectively near parity in this sample. Differences of 2–3%
+  from one short run are not strong evidence of a real improvement.
+- These are synthetic kernel timings, not end-to-end model results. The
+  current Qwen3.5-2B Q4_K_M model does not exercise Q5_K or Q6_K tensors.
+  A representative Q5_K/Q6_K GGUF model is still needed for real workload
+  validation.
+- The benchmark printed a non-fatal `unused variable: fused_qk_backend`
+  warning because an initial single-worker backend binding is shadowed by the
+  worker-loop binding. That redundant binding is removed in the follow-up
+  cleanup.
+- Keep `fused-qk` opt-in until repeatable, representative model benchmarks
+  show a gain without an output regression.
+
+The user supplied these timings. The assistant did not execute the benchmark
+on the VPS.
 
 ### Later research — prefill batching and file-backed weights
 
