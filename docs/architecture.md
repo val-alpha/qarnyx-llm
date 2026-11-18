@@ -257,15 +257,17 @@ Implemented on `main`:
   attention scores, recurrent output, and FFN intermediates.
 - Opt-in direct-block Q4_K matvec with AVX2/FMA on supported x86_64 CPUs and a
   scalar direct-block fallback, covered by scalar-reference differential tests.
-- Opt-in direct-block Q5_K/Q6_K matvec with AVX2 on supported x86_64 CPUs and
-  scalar direct-block fallbacks, covered by multi-block differential tests.
+- Opt-in direct-block Q5_K/Q6_K matvec with AVX2 and runtime FMA accumulation
+  when supported on x86_64 CPUs, plus AVX2-only and scalar direct-block
+  fallbacks, covered by multi-block differential tests.
 
 Still planned or awaiting target-machine evidence:
 - Benchmark `auto` against `fused-q4k` and compare M6-A against the B/C/D
   build on the target workstation. Do not assume either path is faster until
   the same workload is measured end to end.
-- Improve and re-measure Q5_K/Q6_K fused kernels where the synthetic VPS
-  benchmark shows worker-count sensitivity or no material gain.
+- Validate fused Q5_K/Q6_K on representative GGUF models; the current
+  synthetic VPS microbenchmark shows worker-dependent gains but is not an
+  end-to-end workload result.
 - Evaluate AVX-512 and add NEON where the target hardware warrants it.
 - Benchmark representative Q5_K/Q6_K model workloads plus prefill/decode
   tokens per second, latency, allocation behavior, and peak RSS.
