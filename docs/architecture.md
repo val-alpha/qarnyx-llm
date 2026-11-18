@@ -378,9 +378,18 @@ Known operational limits:
   conversation continuation. A caller must provide the conversation context
   again as part of the next prompt.
 
-Remaining validation:
-- Run the new runtime/model isolation tests and the full workspace suite on
-  the target Ubuntu host.
+Validation observed on CI:
+- At commit `5b5c8a4`, GitHub Actions completed `cargo check --workspace`
+  and `cargo test --workspace` successfully, including the new concurrency,
+  cache-isolation, and cancellation-token tests.
+- `cargo fmt --all -- --check` still fails on repository-wide formatting
+  differences in existing runtime/tokenizer code. No broad auto-format was
+  applied because it would introduce unrelated source churn.
+
+Remaining target validation:
+- Pull the latest `main` on the Ubuntu target and rerun
+  `cargo check --workspace`, `cargo test --workspace`, and
+  `cargo build --release -p qarnyx-cli`.
 - Capture a repeatable end-to-end benchmark result using the protocol in
   [docs/benchmarking.md](benchmarking.md). The procedure is documented, but
   benchmark numbers remain host-, model-, and kernel-specific.
