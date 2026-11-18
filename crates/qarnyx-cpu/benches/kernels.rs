@@ -155,7 +155,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let scalar_backend = CpuBackend::new_scalar(1)?;
     let auto_backend = CpuBackend::new(1)?;
     let fused_q4k_backend = CpuBackend::new_fused_q4k(1)?;
-    let fused_qk_backend = CpuBackend::new_fused_qk(1)?;
     let features = auto_backend.features();
     println!(
         "CPU features: avx2={} fma={} avx512f={} neon={} (AVX2 active: {})",
