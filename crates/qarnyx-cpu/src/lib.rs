@@ -546,7 +546,6 @@ unsafe fn dot_q5_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
     }
 }
 
-
 /// AVX2/FMA direct-block Q5_K dot. The packed values are expanded in
 /// temporary integer lanes, then accumulated with fused multiply-add.
 #[cfg(target_arch = "x86_64")]
@@ -664,7 +663,6 @@ unsafe fn dot_q6_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
         lanes.iter().sum()
     }
 }
-
 
 /// AVX2/FMA direct-block Q6_K dot with signed six-bit unpacking and
 /// fused multiply-add accumulation.
