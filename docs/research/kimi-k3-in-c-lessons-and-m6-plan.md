@@ -467,8 +467,10 @@ backward-compatible and still fuses only Q4_K.
   `qarnyx-quant`; they consume packed tensor blocks and do not allocate an
   intermediate F32 row.
 - Added AVX2 packed-block implementations for Q5_K and Q6_K in
-  `qarnyx-cpu`. Q4_K retains its AVX2/FMA path. Q5_K/Q6_K fall back to their
-  scalar direct-block reference where AVX2 is unavailable.
+  `qarnyx-cpu`. When FMA is available, the dispatcher selects an AVX2/FMA
+  accumulation variant; AVX2-only hosts retain the non-FMA vector path, and
+  hosts without AVX2 use the scalar direct-block reference. Q4_K retains its
+  AVX2/FMA path.
 - Added CLI selection `--cpu-kernel fused-qk`; `auto` remains unchanged.
 - Added a synthetic Q5_K/Q6_K microbenchmark comparing `auto` dequantization
   plus F32 dot against `fused-qk` direct-block matvec.
@@ -542,6 +544,25 @@ is invalid. The benchmark's Q5_K/Q6_K arms use a logical matrix shape of
 
 The user supplied these timings. The assistant did not execute the benchmark
 on the VPS.
+
+### M6 follow-up F — FMA accumulation for fused Q5_K / Q6_K (implemented; target re-benchmark pending)
+
+The first VPS benchmark showed that the direct-block Q5_K path was faster
+with one worker but slower than auto-dequantization with ten workers. Q6_K
+was close to parity in both settings. The current VPS advertises both AVX2
+and FMA, while the original Q5_K/Q6_K vector loops used separate multiply
+and add instructions.
+
+The fused Q5_K/Q6_K dispatch now selects AVX2/FMA accumulation when the
+runtime CPU feature check reports FMA. The existing AVX2 non-FMA implementation
+remains available for AVX2 hosts without FMA, and scalar direct-block
+fallbacks remain available where AVX2 is absent. The `auto` path is unchanged.
+
+The existing differential matvec tests exercise the selected runtime path
+against the scalar and dequantized references. The VPS benchmark must be
+re-run after updating the checkout to determine whether FMA improves the
+single-worker result and, especially, reduces the ten-worker Q5_K regression.
+No performance gain is claimed yet.
 
 ### Later research — prefill batching and file-backed weights
 
