@@ -3,7 +3,7 @@
 
 use qarnyx_core::{Backend, DType, TensorView};
 use qarnyx_gguf::{GgufFile, MetadataValue, TensorInfo};
-use qarnyx_quant::{dequantize, GgmlType};
+use qarnyx_quant::{dequantize, dequantize_into, GgmlType};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use crate::{ModelError, TensorLoadError};
@@ -506,26 +506,30 @@ fn recurrent_heads<B: Backend>(
     b.parallel_for_each_mut(state, LD * LD, &|head, head_state| {
         let key_head = &k[head * LD..(head + 1) * LD];
         let value_head = &v[head * LD..(head + 1) * LD];
-        let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+        let decay = head_decay(a[head], alpha[head], dt[head]);
         let beta_value = sigmoid(beta[head]);
 
-        for column in 0..LD {
-            for row in 0..LD {
-                head_state[row * LD + column] *= decay;
-            }
-        }
-
+        // State is [key_index][value_index] with value_index contiguous. Every
+        // loop below runs along the contiguous axis so it vectorizes, and the
+        // per-element operation order is unchanged (bitwise-identical results).
+        //
+        // Pass 1: decay the state and accumulate memory[v] = sum_k S[k][v] * key[k].
         let mut memory = [0.0_f32; LD];
-        for column in 0..LD {
-            for row in 0..LD {
-                memory[column] += head_state[row * LD + column] * key_head[row];
+        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
+            for (cell, slot) in state_row.iter_mut().zip(memory.iter_mut()) {
+                *cell *= decay;
+                *slot += *cell * *key;
             }
         }
 
-        for row in 0..LD {
-            let delta = (value_head[row] - memory[row]) * beta_value;
-            for column in 0..LD {
-                head_state[column * LD + row] += key_head[column] * delta;
+        // Pass 2: S[k][v] += key[k] * delta[v].
+        let mut delta = [0.0_f32; LD];
+        for ((slot, value), mem) in delta.iter_mut().zip(value_head).zip(&memory) {
+            *slot = (*value - *mem) * beta_value;
+        }
+        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
+            for (cell, change) in state_row.iter_mut().zip(&delta) {
+                *cell += *key * *change;
             }
         }
     })?;
@@ -538,9 +542,9 @@ fn recurrent_heads<B: Backend>(
         let query_head = &q[head * LD..(head + 1) * LD];
         let gate_head = &z[head * LD..(head + 1) * LD];
 
-        for column in 0..LD {
-            for row in 0..LD {
-                head_core[column] += head_state[row * LD + column] * query_head[row];
+        for (state_row, query) in head_state.chunks_exact(LD).zip(query_head) {
+            for (out, cell) in head_core.iter_mut().zip(state_row) {
+                *out += *cell * *query;
             }
         }
 
@@ -760,7 +764,7 @@ fn load_layer<'a>(g:&GgufFile,d:&'a[u8],c:&Qwen35Config,i:usize)->Result<Qwen35L
             gate:matrix(g,d,&format!("{p}.attn_gate.weight"),&[LIN,H])?,
             conv:matrix(g,d,&format!("{p}.ssm_conv1d.weight"),&[LIN*3,CONV])?,
             dt:Box::leak(vector(g,d,&format!("{p}.ssm_dt.bias"),&[LH])?.into_boxed_slice()),
-            a:Box::leak(vector(g,d,&format!("{p}.ssm_a"),&[LH])?.into_boxed_slice()),
+            a:ssm_a_vector(g,d,&format!("{p}.ssm_a"))?,
             beta:matrix(g,d,&format!("{p}.ssm_beta.weight"),&[LH,H])?,
             alpha:matrix(g,d,&format!("{p}.ssm_alpha.weight"),&[LH,H])?,
             ssm_norm:Box::leak(vector(g,d,&format!("{p}.ssm_norm.weight"),&[LD])?.into_boxed_slice()),
@@ -843,13 +847,39 @@ fn silu(x:f32)->f32{if x>=0.0{x/(1.0+(-x).exp())}else{let e=x.exp();x*e/(1.0+e)}
 fn sigmoid(x:f32)->f32{if x>=0.0{1.0/(1.0+(-x).exp())}else{let e=x.exp();e/(1.0+e)}}
 fn softplus(x:f32)->f32{if x>20.0{x}else if x< -20.0{x.exp()}else{(1.0+x.exp()).ln()}}
 
+/// Per-head recurrent state decay, `exp(ssm_a * softplus(alpha + dt_bias))`.
+///
+/// GGUF files converted by llama.cpp store `ssm_a` as `-exp(A_log)` and its graph
+/// multiplies by it directly, so no further `exp` is applied here.
+fn head_decay(a: f32, alpha: f32, dt: f32) -> f32 {
+    (a * softplus(alpha + dt)).exp()
+}
+
+/// `ssm_a` must be the pre-converted `-exp(A_log)`: finite and strictly negative.
+/// A raw `A_log` tensor would silently give a wrong decay, so reject it.
+fn check_ssm_a(name: &str, values: &[f32]) -> Result<(), TensorLoadError> {
+    if values.iter().any(|v| !v.is_finite() || *v >= 0.0) {
+        return Err(TensorLoadError::Config(format!(
+            "{name} must hold -exp(A_log) (finite, all values < 0); got raw A_log or corrupt data"
+        )));
+    }
+    Ok(())
+}
+
+fn ssm_a_vector(g: &GgufFile, d: &[u8], name: &str) -> Result<&'static [f32], TensorLoadError> {
+    let v = vector(g, d, name, &[LH])?;
+    check_ssm_a(name, &v)?;
+    Ok(Box::leak(v.into_boxed_slice()))
+}
+
 fn row(t:TensorView<'_>,r:usize,n:usize)->Result<Vec<f32>,ModelError>{let mut o=vec![0.0;n];decode_into(t,r,&mut o)?;Ok(o)}
 fn decode_into(t:TensorView<'_>,r:usize,o:&mut[f32])->Result<(),ModelError>{
     let ty=dtype_id(t.dtype).ok_or(ModelError::InvalidConfig("unsupported tensor dtype"))?;
     let rb=t.data.len()/t.shape[0];let s=r.checked_mul(rb).ok_or(ModelError::InvalidConfig("row overflow"))?;
     let e=s.checked_add(rb).ok_or(ModelError::InvalidConfig("row overflow"))?;
-    let v=dequantize(ty,&[o.len()as u64],t.data.get(s..e).ok_or(ModelError::InvalidConfig("row out of bounds"))?)
-        .map_err(|_|ModelError::InvalidConfig("dequantization failed"))?;o.copy_from_slice(&v);Ok(())
+    // Decode straight into the caller's buffer: no per-row heap allocation.
+    dequantize_into(ty,&[o.len()as u64],t.data.get(s..e).ok_or(ModelError::InvalidConfig("row out of bounds"))?,o)
+        .map_err(|_|ModelError::InvalidConfig("dequantization failed"))
 }
 fn matrix<'a>(g:&GgufFile,d:&'a[u8],name:&str,e:&[usize])->Result<TensorView<'a>,TensorLoadError>{let t=find(g,name)?;if t.dimensions.len()!=2||t.dimensions[0]!=e[1]as u64||t.dimensions[1]!=e[0]as u64{return Err(TensorLoadError::expected_shape(name,&t.dimensions,&[e[1],e[0]]));}let dt=dtype(t)?;Ok(TensorView::new(bytes(t,d)?,Box::leak(e.to_vec().into_boxed_slice()),dt))}
 fn vector(g:&GgufFile,d:&[u8],name:&str,e:&[usize])->Result<Vec<f32>,TensorLoadError>{let t=find(g,name)?;if t.dimensions!=e.iter().map(|x|*x as u64).collect::<Vec<_>>(){return Err(TensorLoadError::expected_shape(name,&t.dimensions,e));}dequantize(t.ggml_type,&t.dimensions,bytes(t,d)?).map_err(|source|TensorLoadError::Decode{name:name.into(),source})}
@@ -901,7 +931,7 @@ mod recurrent_head_tests {
             let head_state = &mut state[state_start..state_start + LD * LD];
             let key_head = &k[head * LD..(head + 1) * LD];
             let value_head = &v[head * LD..(head + 1) * LD];
-            let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+            let decay = (a[head] * softplus(alpha[head] + dt[head])).exp();
             let beta_value = sigmoid(beta[head]);
 
             for column in 0..LD {
@@ -1044,5 +1074,30 @@ mod recurrent_head_tests {
                 "head output differs with {workers} workers"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod decay_tests {
+    use super::*;
+
+    #[test]
+    fn head_decay_uses_preconverted_ssm_a_directly() {
+        // softplus(0) = ln 2, so exp(-1 * ln 2) = 0.5.
+        assert!((head_decay(-1.0, 0.0, 0.0) - 0.5).abs() < 1.0e-6);
+        // A more negative ssm_a decays faster; the factor never exceeds 1.
+        assert!(head_decay(-4.0, 0.3, 0.02) < head_decay(-0.5, 0.3, 0.02));
+        assert!(head_decay(-0.001, 5.0, 0.0) <= 1.0);
+        // Real value from a Qwen3.5-2B GGUF (blk.0 head 8): almost no decay per token.
+        assert!(head_decay(-0.0027223767, 0.0, 0.0) > 0.998);
+    }
+
+    #[test]
+    fn ssm_a_validation_rejects_raw_a_log_and_bad_values() {
+        assert!(check_ssm_a("x", &[-0.5, -3.0, -0.0027]).is_ok());
+        assert!(check_ssm_a("x", &[-0.5, 0.2]).is_err());
+        assert!(check_ssm_a("x", &[0.0]).is_err());
+        assert!(check_ssm_a("x", &[f32::NAN]).is_err());
+        assert!(check_ssm_a("x", &[f32::NEG_INFINITY]).is_err());
     }
 }

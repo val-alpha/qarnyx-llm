@@ -1,0 +1,1856 @@
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cli/src/main.rs b/crates/qarnyx-cli/src/main.rs
+--- a/crates/qarnyx-cli/src/main.rs	2026-11-17 10:05:25.000000000 +0000
++++ b/crates/qarnyx-cli/src/main.rs	2026-11-18 07:32:55.000000000 +0000
+@@ -1,6 +1,6 @@
++use std::fs;
+ use std::fs::File;
+ use std::io::BufReader;
+-use std::fs;
+ use std::path::PathBuf;
+ 
+ use clap::{Parser, Subcommand, ValueEnum};
+@@ -54,7 +54,8 @@
+         /// Worker count for the CPU backend.
+         #[arg(long, default_value_t = 1)]
+         workers: usize,
+-        /// CPU kernel implementation: automatic SIMD, experimental fused Q4_K, or scalar reference.
++        /// CPU kernel implementation: auto (direct-block K-quant SIMD), dequant (previous
++        /// decode-to-F32 baseline), fused-q4k (Q4_K only), or the scalar reference.
+         #[arg(long, value_enum, default_value = "auto")]
+         cpu_kernel: CpuKernelMode,
+         /// RNG seed.
+@@ -66,6 +67,7 @@
+ #[derive(Debug, Clone, Copy, ValueEnum)]
+ enum CpuKernelMode {
+     Auto,
++    Dequant,
+     FusedQ4k,
+     Scalar,
+ }
+@@ -76,8 +78,10 @@
+     match cli.command {
+         Some(Command::Status) | None => {
+             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
+-            println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
+-            println!("Use --cpu-kernel auto|fused-q4k|scalar to select CPU kernels.");
++            println!(
++                "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
++            );
++            println!("Use --cpu-kernel auto|dequant|fused-q4k|scalar to select CPU kernels.");
+         }
+         Some(Command::Inspect {
+             model,
+@@ -134,7 +138,12 @@
+         for tensor in &gguf.tensors {
+             println!(
+                 "  {:<36} shape={:?} ggml_type={} bytes={} offset={} file_offset={}",
+-                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.byte_len, tensor.offset, tensor.file_offset
++                tensor.name,
++                tensor.dimensions,
++                tensor.ggml_type,
++                tensor.byte_len,
++                tensor.offset,
++                tensor.file_offset
+             );
+         }
+     } else if !gguf.tensors.is_empty() {
+@@ -171,6 +180,7 @@
+     let tokenizer = GgufTokenizer::from_gguf(&gguf)?;
+     let backend = match cpu_kernel {
+         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
++        CpuKernelMode::Dequant => qarnyx_cpu::CpuBackend::new_dequant(workers)?,
+         CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
+         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
+     };
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cpu/Cargo.toml b/crates/qarnyx-cpu/Cargo.toml
+--- a/crates/qarnyx-cpu/Cargo.toml	2026-11-17 10:05:25.000000000 +0000
++++ b/crates/qarnyx-cpu/Cargo.toml	2026-11-17 10:58:24.000000000 +0000
+@@ -17,3 +17,7 @@
+ [[bench]]
+ name = "kernels"
+ harness = false
++
++[[bench]]
++name = "perf"
++harness = false
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cpu/benches/perf.rs b/crates/qarnyx-cpu/benches/perf.rs
+--- a/crates/qarnyx-cpu/benches/perf.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/qarnyx-cpu/benches/perf.rs	2026-11-18 07:32:18.000000000 +0000
+@@ -0,0 +1,165 @@
++//! Realistic-shape throughput benchmark (single backend, steady state).
++//!
++//! Run with: cargo bench -p qarnyx-cpu --bench perf
++//! Shapes follow Qwen3.5-2B: FFN [6144, 2048], attention/out [2048, 2048],
++//! and a slice of the Q6_K output head. Reports ms/op, weight GB/s and, for
++//! matmul, GFLOP/s. Weights are sized to exceed L2 so memory behaviour counts.
++
++use std::hint::black_box;
++use std::time::{Duration, Instant};
++
++use qarnyx_core::{Backend, DType, TensorView};
++use qarnyx_cpu::CpuBackend;
++
++fn next(state: &mut u64) -> u64 {
++    *state ^= *state << 13;
++    *state ^= *state >> 7;
++    *state ^= *state << 17;
++    *state
++}
++
++fn quant_rows(raw_type: u32, rows: usize, columns: usize) -> Vec<u8> {
++    let (block_elems, block_bytes, scale_offsets): (usize, usize, &[usize]) = match raw_type {
++        12 => (256, 144, &[0, 2]),
++        13 => (256, 176, &[0, 2]),
++        14 => (256, 210, &[208]),
++        _ => unreachable!(),
++    };
++    let mut state = 0x1234_5678_9abc_def1_u64 ^ raw_type as u64;
++    let mut bytes = vec![0_u8; rows * (columns / block_elems) * block_bytes];
++    for block in bytes.chunks_exact_mut(block_bytes) {
++        for byte in block.iter_mut() {
++            *byte = next(&mut state) as u8;
++        }
++        for &offset in scale_offsets {
++            block[offset..offset + 2].copy_from_slice(&0x2c00_u16.to_le_bytes());
++        }
++    }
++    bytes
++}
++
++fn f32_rows(rows: usize, columns: usize) -> Vec<u8> {
++    let mut state = 0x0bad_cafe_u64;
++    (0..rows * columns)
++        .flat_map(|_| (((next(&mut state) % 2001) as f32 / 1000.0) - 1.0).to_le_bytes())
++        .collect()
++}
++
++fn dtype_of(raw_type: u32) -> DType {
++    match raw_type {
++        0 => DType::F32,
++        12 => DType::Q4K,
++        13 => DType::Q5K,
++        _ => DType::Q6K,
++    }
++}
++
++/// Runs `op` until at least `budget` has elapsed; returns seconds per call (best of 3 windows).
++fn time(budget: Duration, mut op: impl FnMut()) -> f64 {
++    op(); // warm caches and thread-local scratch
++    let mut best = f64::MAX;
++    for _ in 0..3 {
++        let start = Instant::now();
++        let mut iterations = 0_u32;
++        while start.elapsed() < budget {
++            op();
++            iterations += 1;
++        }
++        best = best.min(start.elapsed().as_secs_f64() / f64::from(iterations));
++    }
++    best
++}
++
++fn backends(workers: usize) -> Vec<(&'static str, CpuBackend)> {
++    let all = vec![
++        ("scalar", CpuBackend::new_scalar(workers).unwrap()),
++        ("dequant", CpuBackend::new_dequant(workers).unwrap()), // DEQUANT
++        ("fused-q4k", CpuBackend::new_fused_q4k(workers).unwrap()),
++        ("default", CpuBackend::new(workers).unwrap()),
++    ];
++    // SKIP_SCALAR=1 drops the (very slow) scalar reference from repeated runs.
++    let skip = std::env::var_os("SKIP_SCALAR").is_some();
++    all.into_iter()
++        .filter(|(name, _)| !(skip && *name == "scalar"))
++        .collect()
++}
++
++fn main() {
++    let workers: usize = std::env::var("WORKERS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(1);
++    let budget = Duration::from_millis(300);
++    println!("workers={workers}\n\nMatvec (decode):");
++    let cases: [(&str, u32, usize, usize); 5] = [
++        ("Q4_K ffn_up   [6144, 2048]", 12, 6144, 2048),
++        ("Q5_K ffn_up   [6144, 2048]", 13, 6144, 2048),
++        ("Q6_K ffn_down [2048, 6144]", 14, 2048, 6144),
++        ("Q6_K lm_head  [16384, 2048]", 14, 16384, 2048),
++        ("F32  attn_out [2048, 2048]", 0, 2048, 2048),
++    ];
++    for (label, raw_type, rows, columns) in cases {
++        let bytes = if raw_type == 0 {
++            f32_rows(rows, columns)
++        } else {
++            quant_rows(raw_type, rows, columns)
++        };
++        let shape = [rows, columns];
++        let weights = TensorView::new(&bytes, &shape, dtype_of(raw_type));
++        let mut state = 7_u64;
++        let input: Vec<f32> = (0..columns)
++            .map(|_| ((next(&mut state) % 2001) as f32) / 1000.0 - 1.0)
++            .collect();
++        let mut output = vec![0.0_f32; rows];
++        println!("{label}  ({:.1} MB)", bytes.len() as f64 / 1e6);
++        for (name, backend) in backends(workers) {
++            let seconds = time(budget, || {
++                backend
++                    .matvec(weights, black_box(&input), &mut output)
++                    .unwrap();
++                black_box(&output);
++            });
++            println!(
++                "  {name:<10} {:>9.3} ms/op  {:>6.2} GB/s",
++                seconds * 1e3,
++                bytes.len() as f64 / seconds / 1e9
++            );
++        }
++    }
++
++    println!("\nMatmul (prefill, B is [k, n] f32):");
++    let cases: [(&str, u32, usize, usize, usize); 4] = [
++        ("F32  [2048,2048] x n=64 ", 0, 2048, 2048, 64),
++        ("Q4_K [2048,2048] x n=64 ", 12, 2048, 2048, 64),
++        ("Q4_K [2048,2048] x n=256", 12, 2048, 2048, 256),
++        ("Q6_K [2048,2048] x n=37 ", 14, 2048, 2048, 37),
++    ];
++    for (label, raw_type, m, k, n) in cases {
++        let bytes = if raw_type == 0 {
++            f32_rows(m, k)
++        } else {
++            quant_rows(raw_type, m, k)
++        };
++        let shape = [m, k];
++        let weights = TensorView::new(&bytes, &shape, dtype_of(raw_type));
++        let mut state = 11_u64;
++        let b: Vec<f32> = (0..k * n)
++            .map(|_| ((next(&mut state) % 2001) as f32) / 1000.0 - 1.0)
++            .collect();
++        let mut c = vec![0.0_f32; m * n];
++        println!("{label}");
++        for (name, backend) in backends(workers) {
++            let seconds = time(budget, || {
++                backend
++                    .matmul(weights, black_box(&b), &mut c, m, n, k)
++                    .unwrap();
++                black_box(&c);
++            });
++            println!(
++                "  {name:<10} {:>9.2} ms/op  {:>6.2} GFLOP/s",
++                seconds * 1e3,
++                2.0 * (m * n * k) as f64 / seconds / 1e9
++            );
++        }
++    }
++}
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cpu/src/gemm.rs b/crates/qarnyx-cpu/src/gemm.rs
+--- a/crates/qarnyx-cpu/src/gemm.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/qarnyx-cpu/src/gemm.rs	2026-11-18 07:32:18.000000000 +0000
+@@ -0,0 +1,90 @@
++//! Register-tiled F32 GEMM micro-kernel used by prompt prefill.
++//!
++//! Computes `C[4][n] = A[4][k] * B[k][n]` where `A` holds four already-decoded
++//! weight rows. Each `B` row segment is loaded once and reused for four weight
++//! rows, so `B` is streamed from cache `m/4` times instead of `m` times, and
++//! every loaded vector feeds four FMAs instead of one.
++
++#![cfg(target_arch = "x86_64")]
++
++use std::arch::x86_64::*;
++
++/// Rows of `A` handled per call.
++pub(crate) const TILE_ROWS: usize = 4;
++
++/// `c = a * b` for four rows. `a` is `[4, k]`, `b` is `[k, n]`, `c` is `[4, n]`,
++/// all row-major. The caller must have verified AVX2+FMA support.
++pub(crate) fn tile_4(a: &[f32], k: usize, b: &[f32], n: usize, c: &mut [f32]) {
++    assert_eq!(a.len(), TILE_ROWS * k, "A must hold exactly four rows");
++    assert_eq!(b.len(), k * n, "B must be [k, n]");
++    assert_eq!(c.len(), TILE_ROWS * n, "C must be [4, n]");
++    // SAFETY: lengths validated above; callers verified AVX2+FMA.
++    unsafe { tile_4_impl(a, k, b, n, c) }
++}
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn tile_4_impl(a: &[f32], k: usize, b: &[f32], n: usize, c: &mut [f32]) {
++    unsafe {
++        let mut column = 0;
++        while column + 16 <= n {
++            kernel::<2>(
++                a.as_ptr(),
++                k,
++                b.as_ptr().add(column),
++                n,
++                c.as_mut_ptr().add(column),
++            );
++            column += 16;
++        }
++        if column + 8 <= n {
++            kernel::<1>(
++                a.as_ptr(),
++                k,
++                b.as_ptr().add(column),
++                n,
++                c.as_mut_ptr().add(column),
++            );
++        }
++    }
++
++    // Fewer than eight columns remain: scalar.
++    for column in (n - n % 8)..n {
++        for row in 0..TILE_ROWS {
++            let mut sum = 0.0_f32;
++            for inner in 0..k {
++                sum += a[row * k + inner] * b[inner * n + column];
++            }
++            c[row * n + column] = sum;
++        }
++    }
++}
++
++/// 4 rows x (8 * NV) columns, accumulated in registers over the whole `k`.
++///
++/// # Safety
++/// `a` must address `4 * k` floats, `b` must address `k` rows of at least
++/// `8 * NV` floats at stride `n`, and `c` four rows of `8 * NV` floats at stride `n`.
++#[target_feature(enable = "avx2,fma")]
++unsafe fn kernel<const NV: usize>(a: *const f32, k: usize, b: *const f32, n: usize, c: *mut f32) {
++    unsafe {
++        let mut acc = [[_mm256_setzero_ps(); NV]; TILE_ROWS];
++        for inner in 0..k {
++            let b_row = b.add(inner * n);
++            let mut values = [_mm256_setzero_ps(); NV];
++            for (vector, slot) in values.iter_mut().enumerate() {
++                *slot = _mm256_loadu_ps(b_row.add(vector * 8));
++            }
++            for (row, row_acc) in acc.iter_mut().enumerate() {
++                let weight = _mm256_broadcast_ss(&*a.add(row * k + inner));
++                for (vector, slot) in row_acc.iter_mut().enumerate() {
++                    *slot = _mm256_fmadd_ps(weight, values[vector], *slot);
++                }
++            }
++        }
++        for (row, row_acc) in acc.iter().enumerate() {
++            for (vector, slot) in row_acc.iter().enumerate() {
++                _mm256_storeu_ps(c.add(row * n + vector * 8), *slot);
++            }
++        }
++    }
++}
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cpu/src/kq.rs b/crates/qarnyx-cpu/src/kq.rs
+--- a/crates/qarnyx-cpu/src/kq.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/qarnyx-cpu/src/kq.rs	2026-11-18 07:32:18.000000000 +0000
+@@ -0,0 +1,404 @@
++//! AVX2/FMA direct-block dot products for K-quant weight rows.
++//!
++//! Each kernel computes `dot(weight_row, input)` straight from the packed GGUF
++//! blocks. No F32 copy of the weight row is ever materialized, and the 4-bit /
++//! 5-bit / 6-bit values are unpacked with byte-wise SIMD rather than scalar loops.
++//!
++//! Design notes (why these are faster than the earlier fused Q4_K kernel):
++//! - Scales are applied once per 16/32-element group with a vector FMA, not once
++//!   per weight: `sum(d*sc*q*x - dmin*m*x)` is evaluated as
++//!   `d*sc*sum(q*x) - dmin*m*sum(x)`.
++//! - `sum(x)` per 32-element group is independent of the weight row, so callers
++//!   compute it once per matvec ([`group_sums`]) and reuse it for every row.
++//! - Several independent accumulators hide FMA latency.
++//!
++//! Every public function here is safe to call: it validates lengths with hard
++//! asserts and requires the caller to have verified AVX2+FMA support (see
++//! [`available`]).
++
++#![cfg(target_arch = "x86_64")]
++
++use std::arch::x86_64::*;
++
++/// Elements per K-quant super-block.
++pub(crate) const QK_K: usize = 256;
++const Q4K_BYTES: usize = 144;
++const Q5K_BYTES: usize = 176;
++const Q6K_BYTES: usize = 210;
++
++/// Returns whether the host can run these kernels.
++#[inline]
++pub(crate) fn available() -> bool {
++    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
++}
++
++/// Sums every 32-element group of `input` into `out` (`out.len() == input.len() / 32`).
++///
++/// Q4_K and Q5_K need `sum(x)` per 32-element group for their min term. It does
++/// not depend on the weights, so one pass per matvec serves every row.
++pub(crate) fn group_sums(input: &[f32], out: &mut [f32]) {
++    assert_eq!(input.len() % 32, 0, "input length must be a multiple of 32");
++    assert_eq!(out.len(), input.len() / 32, "one sum per 32-element group");
++    for (group, slot) in input.chunks_exact(32).zip(out.iter_mut()) {
++        let mut lanes = [0.0_f32; 8];
++        for chunk in group.chunks_exact(8) {
++            for (lane, value) in lanes.iter_mut().zip(chunk) {
++                *lane += *value;
++            }
++        }
++        *slot = lanes.iter().sum();
++    }
++}
++
++#[inline]
++fn half_to_f32(bits: u16) -> f32 {
++    let sign = u32::from(bits & 0x8000) << 16;
++    let exponent = (bits >> 10) & 0x1f;
++    let mantissa = u32::from(bits & 0x03ff);
++    let output = match exponent {
++        0 if mantissa == 0 => sign,
++        0 => {
++            let mut normalized = mantissa;
++            let mut unbiased = -14_i32;
++            while normalized & 0x0400 == 0 {
++                normalized <<= 1;
++                unbiased -= 1;
++            }
++            normalized &= 0x03ff;
++            sign | (((unbiased + 127) as u32) << 23) | (normalized << 13)
++        }
++        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
++        _ => sign | ((u32::from(exponent) + 112) << 23) | (mantissa << 13),
++    };
++    f32::from_bits(output)
++}
++
++#[inline]
++fn read_half(bytes: &[u8]) -> f32 {
++    half_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
++}
++
++/// GGML `get_scale_min_k4`: 6-bit scale and min for group `index` (0..8).
++#[inline]
++fn scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
++    if index < 4 {
++        (packed[index] & 0x3f, packed[index + 4] & 0x3f)
++    } else {
++        (
++            (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
++            (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
++        )
++    }
++}
++
++#[inline]
++#[target_feature(enable = "avx2,fma")]
++unsafe fn hsum(v: __m256) -> f32 {
++    let low = _mm256_castps256_ps128(v);
++    let high = _mm256_extractf128_ps::<1>(v);
++    let sum = _mm_add_ps(low, high);
++    let sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
++    let sum = _mm_add_ss(sum, _mm_shuffle_ps::<1>(sum, sum));
++    _mm_cvtss_f32(sum)
++}
++
++/// Loads 8 unsigned bytes starting at `lane` of a 32-byte vector, as `f32`.
++macro_rules! u8_lanes_to_f32 {
++    ($halves:expr, $chunk:expr) => {{
++        // `$halves` is [low128, high128]; chunk 0..4 selects an 8-byte slice.
++        let source = $halves[$chunk / 2];
++        let shifted = if $chunk % 2 == 0 {
++            source
++        } else {
++            _mm_srli_si128::<8>(source)
++        };
++        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(shifted))
++    }};
++}
++
++macro_rules! i8_lanes_to_f32 {
++    ($halves:expr, $chunk:expr) => {{
++        let source = $halves[$chunk / 2];
++        let shifted = if $chunk % 2 == 0 {
++            source
++        } else {
++            _mm_srli_si128::<8>(source)
++        };
++        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(shifted))
++    }};
++}
++
++#[inline]
++#[target_feature(enable = "avx2,fma")]
++unsafe fn halves(v: __m256i) -> [__m128i; 2] {
++    [_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v)]
++}
++
++/// Dot product of one Q4_K row with `input`.
++///
++/// `sums` must come from [`group_sums`] for the same `input`.
++pub(crate) fn dot_q4_k(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
++    let blocks = encoded.len() / Q4K_BYTES;
++    assert_eq!(encoded.len(), blocks * Q4K_BYTES, "partial Q4_K block");
++    assert_eq!(input.len(), blocks * QK_K, "input length must match blocks");
++    assert_eq!(sums.len(), blocks * 8, "one group sum per 32 inputs");
++    // SAFETY: lengths validated above; callers verified `available()`.
++    unsafe { dot_q4_k_impl(encoded, input, sums) }
++}
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn dot_q4_k_impl(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
++    unsafe {
++        let low_mask = _mm256_set1_epi8(0x0f);
++        let mut acc_even = _mm256_setzero_ps();
++        let mut acc_odd = _mm256_setzero_ps();
++        let mut min_total = 0.0_f32;
++
++        for (block_index, block) in encoded.chunks_exact(Q4K_BYTES).enumerate() {
++            let d = read_half(&block[0..2]);
++            let dmin = read_half(&block[2..4]);
++            let packed_scales = &block[4..16];
++            let quants = block.as_ptr().add(16);
++            let x_base = input.as_ptr().add(block_index * QK_K);
++            let sum_base = block_index * 8;
++
++            for pair in 0..4 {
++                let packed = _mm256_loadu_si256(quants.add(pair * 32).cast());
++                let low = halves(_mm256_and_si256(packed, low_mask));
++                let high = halves(_mm256_and_si256(_mm256_srli_epi16::<4>(packed), low_mask));
++
++                let x_even = x_base.add(pair * 64);
++                let x_odd = x_even.add(32);
++
++                // Even group: low nibbles. Two independent chains of two FMAs.
++                let mut a0 = _mm256_mul_ps(u8_lanes_to_f32!(low, 0), _mm256_loadu_ps(x_even));
++                let mut a1 =
++                    _mm256_mul_ps(u8_lanes_to_f32!(low, 1), _mm256_loadu_ps(x_even.add(8)));
++                a0 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(low, 2),
++                    _mm256_loadu_ps(x_even.add(16)),
++                    a0,
++                );
++                a1 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(low, 3),
++                    _mm256_loadu_ps(x_even.add(24)),
++                    a1,
++                );
++
++                // Odd group: high nibbles.
++                let mut b0 = _mm256_mul_ps(u8_lanes_to_f32!(high, 0), _mm256_loadu_ps(x_odd));
++                let mut b1 =
++                    _mm256_mul_ps(u8_lanes_to_f32!(high, 1), _mm256_loadu_ps(x_odd.add(8)));
++                b0 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(high, 2),
++                    _mm256_loadu_ps(x_odd.add(16)),
++                    b0,
++                );
++                b1 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(high, 3),
++                    _mm256_loadu_ps(x_odd.add(24)),
++                    b1,
++                );
++
++                let (sc_even, mn_even) = scale_min(pair * 2, packed_scales);
++                let (sc_odd, mn_odd) = scale_min(pair * 2 + 1, packed_scales);
++                acc_even = _mm256_fmadd_ps(
++                    _mm256_add_ps(a0, a1),
++                    _mm256_set1_ps(d * f32::from(sc_even)),
++                    acc_even,
++                );
++                acc_odd = _mm256_fmadd_ps(
++                    _mm256_add_ps(b0, b1),
++                    _mm256_set1_ps(d * f32::from(sc_odd)),
++                    acc_odd,
++                );
++                min_total += dmin * f32::from(mn_even) * sums[sum_base + pair * 2]
++                    + dmin * f32::from(mn_odd) * sums[sum_base + pair * 2 + 1];
++            }
++        }
++
++        hsum(_mm256_add_ps(acc_even, acc_odd)) - min_total
++    }
++}
++
++/// Dot product of one Q5_K row with `input`. `sums` as for [`dot_q4_k`].
++pub(crate) fn dot_q5_k(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
++    let blocks = encoded.len() / Q5K_BYTES;
++    assert_eq!(encoded.len(), blocks * Q5K_BYTES, "partial Q5_K block");
++    assert_eq!(input.len(), blocks * QK_K, "input length must match blocks");
++    assert_eq!(sums.len(), blocks * 8, "one group sum per 32 inputs");
++    // SAFETY: lengths validated above; callers verified `available()`.
++    unsafe { dot_q5_k_impl(encoded, input, sums) }
++}
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn dot_q5_k_impl(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
++    unsafe {
++        let low_mask = _mm256_set1_epi8(0x0f);
++        let sixteen = _mm256_set1_epi8(16);
++        let mut acc_even = _mm256_setzero_ps();
++        let mut acc_odd = _mm256_setzero_ps();
++        let mut min_total = 0.0_f32;
++
++        for (block_index, block) in encoded.chunks_exact(Q5K_BYTES).enumerate() {
++            let d = read_half(&block[0..2]);
++            let dmin = read_half(&block[2..4]);
++            let packed_scales = &block[4..16];
++            let high_bits = _mm256_loadu_si256(block.as_ptr().add(16).cast());
++            let quants = block.as_ptr().add(48);
++            let x_base = input.as_ptr().add(block_index * QK_K);
++            let sum_base = block_index * 8;
++
++            for pair in 0..4 {
++                let packed = _mm256_loadu_si256(quants.add(pair * 32).cast());
++                let mask_even = _mm256_set1_epi8((1_u8 << (pair * 2)) as i8);
++                let mask_odd = _mm256_set1_epi8((2_u8 << (pair * 2)) as i8);
++                let bit_even = _mm256_and_si256(
++                    _mm256_cmpeq_epi8(_mm256_and_si256(high_bits, mask_even), mask_even),
++                    sixteen,
++                );
++                let bit_odd = _mm256_and_si256(
++                    _mm256_cmpeq_epi8(_mm256_and_si256(high_bits, mask_odd), mask_odd),
++                    sixteen,
++                );
++                let low = halves(_mm256_or_si256(
++                    _mm256_and_si256(packed, low_mask),
++                    bit_even,
++                ));
++                let high = halves(_mm256_or_si256(
++                    _mm256_and_si256(_mm256_srli_epi16::<4>(packed), low_mask),
++                    bit_odd,
++                ));
++
++                let x_even = x_base.add(pair * 64);
++                let x_odd = x_even.add(32);
++
++                let mut a0 = _mm256_mul_ps(u8_lanes_to_f32!(low, 0), _mm256_loadu_ps(x_even));
++                let mut a1 =
++                    _mm256_mul_ps(u8_lanes_to_f32!(low, 1), _mm256_loadu_ps(x_even.add(8)));
++                a0 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(low, 2),
++                    _mm256_loadu_ps(x_even.add(16)),
++                    a0,
++                );
++                a1 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(low, 3),
++                    _mm256_loadu_ps(x_even.add(24)),
++                    a1,
++                );
++
++                let mut b0 = _mm256_mul_ps(u8_lanes_to_f32!(high, 0), _mm256_loadu_ps(x_odd));
++                let mut b1 =
++                    _mm256_mul_ps(u8_lanes_to_f32!(high, 1), _mm256_loadu_ps(x_odd.add(8)));
++                b0 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(high, 2),
++                    _mm256_loadu_ps(x_odd.add(16)),
++                    b0,
++                );
++                b1 = _mm256_fmadd_ps(
++                    u8_lanes_to_f32!(high, 3),
++                    _mm256_loadu_ps(x_odd.add(24)),
++                    b1,
++                );
++
++                let (sc_even, mn_even) = scale_min(pair * 2, packed_scales);
++                let (sc_odd, mn_odd) = scale_min(pair * 2 + 1, packed_scales);
++                acc_even = _mm256_fmadd_ps(
++                    _mm256_add_ps(a0, a1),
++                    _mm256_set1_ps(d * f32::from(sc_even)),
++                    acc_even,
++                );
++                acc_odd = _mm256_fmadd_ps(
++                    _mm256_add_ps(b0, b1),
++                    _mm256_set1_ps(d * f32::from(sc_odd)),
++                    acc_odd,
++                );
++                min_total += dmin * f32::from(mn_even) * sums[sum_base + pair * 2]
++                    + dmin * f32::from(mn_odd) * sums[sum_base + pair * 2 + 1];
++            }
++        }
++
++        hsum(_mm256_add_ps(acc_even, acc_odd)) - min_total
++    }
++}
++
++/// Dot product of one Q6_K row with `input`. No group sums are needed: the
++/// `-32` bias is removed in the integer domain before conversion to `f32`.
++pub(crate) fn dot_q6_k(encoded: &[u8], input: &[f32]) -> f32 {
++    let blocks = encoded.len() / Q6K_BYTES;
++    assert_eq!(encoded.len(), blocks * Q6K_BYTES, "partial Q6_K block");
++    assert_eq!(input.len(), blocks * QK_K, "input length must match blocks");
++    // SAFETY: lengths validated above; callers verified `available()`.
++    unsafe { dot_q6_k_impl(encoded, input) }
++}
++
++#[target_feature(enable = "avx2,fma")]
++unsafe fn dot_q6_k_impl(encoded: &[u8], input: &[f32]) -> f32 {
++    unsafe {
++        let low_mask = _mm256_set1_epi8(0x0f);
++        let bias = _mm256_set1_epi8(32);
++        let m03 = _mm256_set1_epi8(0x03);
++        let m0c = _mm256_set1_epi8(0x0c);
++        let m30 = _mm256_set1_epi8(0x30);
++        let mut acc0 = _mm256_setzero_ps();
++        let mut acc1 = _mm256_setzero_ps();
++
++        for (block_index, block) in encoded.chunks_exact(Q6K_BYTES).enumerate() {
++            let d = read_half(&block[208..210]);
++            let scales = &block[192..208];
++            let x_block = input.as_ptr().add(block_index * QK_K);
++
++            for half in 0..2 {
++                let ql = block.as_ptr().add(half * 64);
++                let qh = block.as_ptr().add(128 + half * 32);
++                let x_half = x_block.add(half * 128);
++
++                let l0 = _mm256_loadu_si256(ql.cast());
++                let l1 = _mm256_loadu_si256(ql.add(32).cast());
++                let h = _mm256_loadu_si256(qh.cast());
++
++                // Four 32-value planes: 128 weights per half block.
++                let h0 = _mm256_slli_epi16::<4>(_mm256_and_si256(h, m03));
++                let h1 = _mm256_slli_epi16::<2>(_mm256_and_si256(h, m0c));
++                let h2 = _mm256_and_si256(h, m30);
++                let h3 = _mm256_and_si256(_mm256_srli_epi16::<2>(h), m30);
++
++                let planes = [
++                    _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(l0, low_mask), h0), bias),
++                    _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(l1, low_mask), h1), bias),
++                    _mm256_sub_epi8(
++                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(l0), low_mask), h2),
++                        bias,
++                    ),
++                    _mm256_sub_epi8(
++                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(l1), low_mask), h3),
++                        bias,
++                    ),
++                ];
++
++                for (plane_index, plane) in planes.iter().enumerate() {
++                    let parts = halves(*plane);
++                    let x = x_half.add(plane_index * 32);
++                    let scale_low = f32::from(scales[half * 8 + plane_index * 2] as i8) * d;
++                    let scale_high = f32::from(scales[half * 8 + plane_index * 2 + 1] as i8) * d;
++
++                    // Bytes 0..16 use one scale, bytes 16..32 the next.
++                    let g0 = _mm256_fmadd_ps(
++                        i8_lanes_to_f32!(parts, 1),
++                        _mm256_loadu_ps(x.add(8)),
++                        _mm256_mul_ps(i8_lanes_to_f32!(parts, 0), _mm256_loadu_ps(x)),
++                    );
++                    let g1 = _mm256_fmadd_ps(
++                        i8_lanes_to_f32!(parts, 3),
++                        _mm256_loadu_ps(x.add(24)),
++                        _mm256_mul_ps(i8_lanes_to_f32!(parts, 2), _mm256_loadu_ps(x.add(16))),
++                    );
++                    acc0 = _mm256_fmadd_ps(g0, _mm256_set1_ps(scale_low), acc0);
++                    acc1 = _mm256_fmadd_ps(g1, _mm256_set1_ps(scale_high), acc1);
++                }
++            }
++        }
++
++        hsum(_mm256_add_ps(acc0, acc1))
++    }
++}
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-cpu/src/lib.rs b/crates/qarnyx-cpu/src/lib.rs
+--- a/crates/qarnyx-cpu/src/lib.rs	2026-11-17 10:05:25.000000000 +0000
++++ b/crates/qarnyx-cpu/src/lib.rs	2026-11-18 07:32:55.000000000 +0000
+@@ -9,11 +9,44 @@
+ 
+ use qarnyx_core::{Backend, BackendError, DType, TensorView};
+ use qarnyx_quant::{dequantize_into, dot_q4_k as dot_q4_k_scalar, encoded_len};
+-use rayon::prelude::*;
+ use rayon::ThreadPool;
++use rayon::prelude::*;
++use std::cell::RefCell;
+ use std::sync::Arc;
+ use thiserror::Error;
+ 
++#[cfg(target_arch = "x86_64")]
++mod gemm;
++#[cfg(target_arch = "x86_64")]
++mod kq;
++
++/// How quantized weight rows are multiplied.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum QuantMode {
++    /// Decode each row to F32 scratch, then run the F32 dot (reference baseline).
++    Dequant,
++    /// Direct-block kernel for Q4_K only (kept for A/B comparison).
++    FusedQ4K,
++    /// Direct-block kernels for Q4_K, Q5_K and Q6_K (default when AVX2+FMA exist).
++    FusedK,
++}
++
++/// Weight bytes below which a matrix op is not worth splitting across workers.
++const PARALLEL_MIN_BYTES: usize = 128 * 1024;
++/// Smallest slice of weights handed to one task.
++const CHUNK_MIN_BYTES: usize = 32 * 1024;
++/// Tasks per worker; more than one lets work stealing absorb noisy neighbours.
++const CHUNKS_PER_WORKER: usize = 4;
++/// Rows of the weight matrix handled per register tile in matmul.
++const MATMUL_ROW_TILE: usize = 4;
++/// Largest input (in 32-element groups) whose group sums live on the stack.
++const SUMS_STACK_GROUPS: usize = 512;
++
++thread_local! {
++    /// Per-thread decoded-row buffer reused across calls (pool threads persist).
++    static ROW_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
++}
++
+ /// Errors raised while constructing the CPU backend.
+ #[derive(Debug, Error, Clone, PartialEq, Eq)]
+ pub enum CpuBackendError {
+@@ -78,34 +111,43 @@
+     pool: Arc<ThreadPool>,
+     features: CpuFeatures,
+     simd_enabled: bool,
+-    fused_q4k_matvec: bool,
++    quant_mode: QuantMode,
++    /// True when the direct-block AVX2/FMA K-quant kernels may run.
++    avx2_fma: bool,
+ }
+ 
+ impl CpuBackend {
+     /// Creates the default backend with runtime SIMD dispatch.
+     ///
+-    /// Quantized rows use the reference dequantization path before the F32 dot.
++    /// On x86_64 with AVX2+FMA, Q4_K/Q5_K/Q6_K rows are multiplied directly
++    /// from their packed blocks. Other formats decode one row to F32 first.
+     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
+-        Self::with_options(worker_count, true, false)
++        Self::with_options(worker_count, true, QuantMode::FusedK)
++    }
++
++    /// Creates a SIMD backend that always decodes quantized rows to F32 first.
++    ///
++    /// This is the previous default; it is kept as the A/B baseline.
++    pub fn new_dequant(worker_count: usize) -> Result<Self, CpuBackendError> {
++        Self::with_options(worker_count, true, QuantMode::Dequant)
+     }
+ 
+     /// Creates a scalar-only backend for reference testing and benchmarks.
+     pub fn new_scalar(worker_count: usize) -> Result<Self, CpuBackendError> {
+-        Self::with_options(worker_count, false, false)
++        Self::with_options(worker_count, false, QuantMode::Dequant)
+     }
+ 
+-    /// Creates a runtime-SIMD backend with the experimental fused Q4_K matvec.
++    /// Creates a SIMD backend that fuses only Q4_K (Q5_K/Q6_K use the F32 path).
+     ///
+-    /// Q4_K rows are dotted directly from packed blocks using scalar arithmetic;
+-    /// other eligible F32 kernels retain their AVX2/FMA dispatch.
++    /// Without AVX2+FMA the Q4_K rows fall back to the scalar direct-block dot.
+     pub fn new_fused_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
+-        Self::with_options(worker_count, true, true)
++        Self::with_options(worker_count, true, QuantMode::FusedQ4K)
+     }
+ 
+     fn with_options(
+         worker_count: usize,
+         simd_enabled: bool,
+-        fused_q4k_matvec: bool,
++        quant_mode: QuantMode,
+     ) -> Result<Self, CpuBackendError> {
+         if worker_count == 0 {
+             return Err(CpuBackendError::ZeroWorkers);
+@@ -117,12 +159,18 @@
+             .build()
+             .map_err(|error| CpuBackendError::WorkerPoolBuild(error.to_string()))?;
+ 
++        #[cfg(target_arch = "x86_64")]
++        let avx2_fma = simd_enabled && kq::available();
++        #[cfg(not(target_arch = "x86_64"))]
++        let avx2_fma = false;
++
+         Ok(Self {
+             worker_count,
+             pool: Arc::new(pool),
+             features: CpuFeatures::detect(),
+             simd_enabled,
+-            fused_q4k_matvec,
++            quant_mode,
++            avx2_fma,
+         })
+     }
+ 
+@@ -157,19 +205,68 @@
+         dot_scalar(lhs, rhs)
+     }
+ 
+-    fn fused_q4k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
+-        if self.simd_enabled && self.features.avx2 {
+-            #[cfg(target_arch = "x86_64")]
+-            unsafe {
+-                if self.features.fma {
+-                    return Ok(dot_q4_k_avx2_fma(encoded, input));
+-                }
+-                return Ok(dot_q4_k_avx2(encoded, input));
+-            }
++    /// Whether `dtype` rows are multiplied directly from packed blocks.
++    fn use_fused(&self, dtype: DType) -> bool {
++        match (self.quant_mode, dtype) {
++            (QuantMode::FusedQ4K, DType::Q4K) => true,
++            (QuantMode::FusedK, DType::Q4K | DType::Q5K | DType::Q6K) => self.avx2_fma,
++            _ => false,
++        }
++    }
++
++    /// Dot of one packed row with `input`. `sums` are the per-32 input group
++    /// sums (only read by Q4_K/Q5_K) and are empty when `avx2_fma` is false.
++    fn fused_row_dot(
++        &self,
++        dtype: DType,
++        encoded: &[u8],
++        input: &[f32],
++        sums: &[f32],
++    ) -> Result<f32, BackendError> {
++        #[cfg(target_arch = "x86_64")]
++        if self.avx2_fma {
++            return match dtype {
++                DType::Q4K => Ok(kq::dot_q4_k(encoded, input, sums)),
++                DType::Q5K => Ok(kq::dot_q5_k(encoded, input, sums)),
++                DType::Q6K => Ok(kq::dot_q6_k(encoded, input)),
++                _ => Err(shape_mismatch("matvec", "no fused kernel for this dtype")),
++            };
++        }
++
++        dot_q4_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
++    }
++
++    /// Rows per parallel task, or `None` when the op should stay on one thread.
++    ///
++    /// Work is sized in weight bytes (rows x row size), not rows alone, and is
++    /// split into several tasks per worker so a slow core does not stall the op.
++    fn rows_per_task(&self, rows: usize, row_bytes: usize, multiple_of: usize) -> Option<usize> {
++        let total = rows.checked_mul(row_bytes)?;
++        if self.worker_count <= 1 || total < PARALLEL_MIN_BYTES {
++            return None;
++        }
++        let by_balance = rows.div_ceil(self.worker_count * CHUNKS_PER_WORKER);
++        let by_size = (CHUNK_MIN_BYTES / row_bytes.max(1)).max(1);
++        let chunk = by_balance.max(by_size).next_multiple_of(multiple_of);
++        (chunk < rows).then_some(chunk)
++    }
++
++    /// Multiplies `tile` decoded weight rows (`a`, `[tile, k]`) by `b` (`[k, n]`).
++    fn matmul_tile(&self, a: &[f32], tile: usize, k: usize, b: &[f32], c: &mut [f32], n: usize) {
++        #[cfg(target_arch = "x86_64")]
++        if tile == gemm::TILE_ROWS && self.avx2_fma && n >= 8 {
++            gemm::tile_4(a, k, b, n, c);
++            return;
+         }
+ 
+-        dot_q4_k_scalar(encoded, input)
+-            .map_err(|error| shape_mismatch("matvec", error.to_string()))
++        for row in 0..tile {
++            self.matmul_row(
++                &a[row * k..(row + 1) * k],
++                b,
++                &mut c[row * n..(row + 1) * n],
++                n,
++            );
++        }
+     }
+ 
+     fn matmul_row(&self, row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
+@@ -296,148 +393,8 @@
+ }
+ 
+ #[cfg(target_arch = "x86_64")]
+-fn q4k_read_half(bytes: &[u8]) -> f32 {
+-    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+-    let sign = u32::from(bits & 0x8000) << 16;
+-    let exponent = (bits >> 10) & 0x1f;
+-    let mantissa = u32::from(bits & 0x03ff);
+-    let output = match exponent {
+-        0 if mantissa == 0 => sign,
+-        0 => {
+-            let mut normalized = mantissa;
+-            let mut unbiased_exponent = -14_i32;
+-            while normalized & 0x0400 == 0 {
+-                normalized <<= 1;
+-                unbiased_exponent -= 1;
+-            }
+-            normalized &= 0x03ff;
+-            sign | (((unbiased_exponent + 127) as u32) << 23) | (normalized << 13)
+-        }
+-        0x1f => sign | 0x7f80_0000 | (mantissa << 13),
+-        _ => sign | ((u32::from(exponent) + 112) << 23) | (mantissa << 13),
+-    };
+-    f32::from_bits(output)
+-}
+-
+-#[cfg(target_arch = "x86_64")]
+-fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
+-    if index < 4 {
+-        (packed[index] & 0x3f, packed[index + 4] & 0x3f)
+-    } else {
+-        (
+-            (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
+-            (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
+-        )
+-    }
+-}
+-
+-/// AVX2 direct-block Q4_K dot. Quantized values are expanded only in vector
+-/// registers; no F32 weight row or per-row heap scratch is materialized.
+-#[cfg(target_arch = "x86_64")]
+-#[target_feature(enable = "avx2")]
+-unsafe fn dot_q4_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
+-    use std::arch::x86_64::*;
+-
+-    unsafe {
+-        let mut accumulator = _mm256_setzero_ps();
+-        for (block_index, block) in encoded.chunks_exact(144).enumerate() {
+-            let d = q4k_read_half(&block[..2]);
+-            let min_scale = q4k_read_half(&block[2..4]);
+-            let packed_scales = &block[4..16];
+-            let quants = &block[16..144];
+-            let input_base = block_index * 256;
+-
+-            for group in 0..8 {
+-                let pair = group / 2;
+-                let high_nibble = group % 2 != 0;
+-                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+-                let scale = _mm256_set1_ps(d * f32::from(local_scale));
+-                let min = _mm256_set1_ps(min_scale * f32::from(local_min));
+-                let quant_bytes = &quants[pair * 32..pair * 32 + 32];
+-                let input_offset = input_base + group * 32;
+-
+-                for offset in (0..32).step_by(8) {
+-                    let mut values = [0_i32; 8];
+-                    for lane in 0..8 {
+-                        let packed = quant_bytes[offset + lane];
+-                        values[lane] = i32::from(if high_nibble {
+-                            packed >> 4
+-                        } else {
+-                            packed & 0x0f
+-                        });
+-                    }
+-                    let integers = _mm256_loadu_si256(values.as_ptr().cast());
+-                    let quant = _mm256_cvtepi32_ps(integers);
+-                    let weights = _mm256_sub_ps(_mm256_mul_ps(quant, scale), min);
+-                    let x = _mm256_loadu_ps(input.as_ptr().add(input_offset + offset));
+-                    accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(weights, x));
+-                }
+-            }
+-        }
+-
+-        let mut lanes = [0.0_f32; 8];
+-        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+-        lanes.iter().sum()
+-    }
+-}
+-
+-/// AVX2/FMA direct-block Q4_K dot with fused multiply-add accumulation.
+-#[cfg(target_arch = "x86_64")]
+-#[target_feature(enable = "avx2,fma")]
+-unsafe fn dot_q4_k_avx2_fma(encoded: &[u8], input: &[f32]) -> f32 {
+-    use std::arch::x86_64::*;
+-
+-    unsafe {
+-        let mut accumulator = _mm256_setzero_ps();
+-        for (block_index, block) in encoded.chunks_exact(144).enumerate() {
+-            let d = q4k_read_half(&block[..2]);
+-            let min_scale = q4k_read_half(&block[2..4]);
+-            let packed_scales = &block[4..16];
+-            let quants = &block[16..144];
+-            let input_base = block_index * 256;
+-
+-            for group in 0..8 {
+-                let pair = group / 2;
+-                let high_nibble = group % 2 != 0;
+-                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+-                let scale = _mm256_set1_ps(d * f32::from(local_scale));
+-                let min = _mm256_set1_ps(min_scale * f32::from(local_min));
+-                let quant_bytes = &quants[pair * 32..pair * 32 + 32];
+-                let input_offset = input_base + group * 32;
+-
+-                for offset in (0..32).step_by(8) {
+-                    let mut values = [0_i32; 8];
+-                    for lane in 0..8 {
+-                        let packed = quant_bytes[offset + lane];
+-                        values[lane] = i32::from(if high_nibble {
+-                            packed >> 4
+-                        } else {
+-                            packed & 0x0f
+-                        });
+-                    }
+-                    let integers = _mm256_loadu_si256(values.as_ptr().cast());
+-                    let quant = _mm256_cvtepi32_ps(integers);
+-                    let weights = _mm256_sub_ps(_mm256_mul_ps(quant, scale), min);
+-                    let x = _mm256_loadu_ps(input.as_ptr().add(input_offset + offset));
+-                    accumulator = _mm256_fmadd_ps(weights, x, accumulator);
+-                }
+-            }
+-        }
+-
+-        let mut lanes = [0.0_f32; 8];
+-        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+-        lanes.iter().sum()
+-    }
+-}
+-
+-#[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+-unsafe fn matmul_row_avx2(
+-    row: &[f32],
+-    input: &[f32],
+-    output: &mut [f32],
+-    columns: usize,
+-) {
++unsafe fn matmul_row_avx2(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
+     use std::arch::x86_64::*;
+ 
+     unsafe {
+@@ -463,12 +420,7 @@
+ 
+ #[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2,fma")]
+-unsafe fn matmul_row_avx2_fma(
+-    row: &[f32],
+-    input: &[f32],
+-    output: &mut [f32],
+-    columns: usize,
+-) {
++unsafe fn matmul_row_avx2_fma(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
+     use std::arch::x86_64::*;
+ 
+     unsafe {
+@@ -589,29 +541,68 @@
+     Ok(scratch)
+ }
+ 
+-fn decode_weight_row(
++/// Runs `body` with a per-thread scratch buffer of exactly `elements` floats.
++///
++/// The buffer is retained between calls, so steady-state decoding performs no
++/// heap allocation. Contents are unspecified on entry. If the thread-local is
++/// already borrowed (re-entrancy), a temporary buffer is used instead.
++fn with_row_scratch<R>(
+     operation: &'static str,
+-    raw_type: u32,
+-    columns: u64,
+-    row_bytes: usize,
++    elements: usize,
++    body: impl FnOnce(&mut [f32]) -> Result<R, BackendError>,
++) -> Result<R, BackendError> {
++    ROW_SCRATCH.with(|cell| match cell.try_borrow_mut() {
++        Ok(mut buffer) => {
++            if buffer.len() < elements {
++                let missing = elements - buffer.len();
++                buffer
++                    .try_reserve_exact(missing)
++                    .map_err(|_| BackendError::AllocationFailed {
++                        operation,
++                        elements,
++                    })?;
++                buffer.resize(elements, 0.0);
++            }
++            body(&mut buffer[..elements])
++        }
++        Err(_) => {
++            let mut temporary = allocate_row_scratch(operation, elements)?;
++            body(&mut temporary)
++        }
++    })
++}
++
++fn encoded_row<'a>(
++    operation: &'static str,
++    weights: &TensorView<'a>,
+     row_index: usize,
+-    weights: &TensorView<'_>,
+-    scratch: &mut [f32],
+-) -> Result<(), BackendError> {
++    row_bytes: usize,
++) -> Result<&'a [u8], BackendError> {
+     let start = row_index
+         .checked_mul(row_bytes)
+         .ok_or_else(|| shape_mismatch(operation, "encoded row offset overflowed usize"))?;
+     let end = start
+         .checked_add(row_bytes)
+         .ok_or_else(|| shape_mismatch(operation, "encoded row end overflowed usize"))?;
+-    let encoded_row = weights.data.get(start..end).ok_or_else(|| {
++    weights.data.get(start..end).ok_or_else(|| {
+         shape_mismatch(
+             operation,
+             "encoded weight row is outside the tensor byte range",
+         )
+-    })?;
++    })
++}
+ 
+-    dequantize_into(raw_type, &[columns], encoded_row, scratch)
++fn decode_weight_row(
++    operation: &'static str,
++    raw_type: u32,
++    columns: u64,
++    row_bytes: usize,
++    row_index: usize,
++    weights: &TensorView<'_>,
++    scratch: &mut [f32],
++) -> Result<(), BackendError> {
++    let encoded = encoded_row(operation, weights, row_index, row_bytes)?;
++    dequantize_into(raw_type, &[columns], encoded, scratch)
+         .map_err(|error| shape_mismatch(operation, error.to_string()))
+ }
+ 
+@@ -652,113 +643,64 @@
+ 
+         let (raw_type, columns, row_bytes) =
+             matrix_row_layout(&weights, out_features, in_features, "matvec")?;
++        let dtype = weights.dtype;
++        let fused = self.use_fused(dtype);
+ 
+-        let workers = self.worker_count.min(out_features);
+-        let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
+-        let fused = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
+-
+-        if fused {
+-            if parallel {
+-                let chunk_rows = out_features.div_ceil(workers);
+-                return self.pool.install(|| {
+-                    output
+-                        .par_chunks_mut(chunk_rows)
+-                        .enumerate()
+-                        .try_for_each(|(chunk_index, output_chunk)| {
+-                            let first_row = chunk_index * chunk_rows;
+-                            for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
+-                                let row_index = first_row + local_row;
+-                                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
+-                                    shape_mismatch(
+-                                        "matvec",
+-                                        "encoded weight row offset overflowed usize",
+-                                    )
+-                                })?;
+-                                let end = start.checked_add(row_bytes).ok_or_else(|| {
+-                                    shape_mismatch(
+-                                        "matvec",
+-                                        "encoded weight row end overflowed usize",
+-                                    )
+-                                })?;
+-                                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
+-                                    shape_mismatch(
+-                                        "matvec",
+-                                        "encoded weight row is outside the tensor byte range",
+-                                    )
+-                                })?;
+-                                *output_value = self.fused_q4k_dot(encoded_row, input)?;
+-                            }
+-                            Ok(())
+-                        })
+-                });
+-            }
+-
+-            for (row_index, output_value) in output.iter_mut().enumerate() {
+-                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
+-                    shape_mismatch("matvec", "encoded weight row offset overflowed usize")
+-                })?;
+-                let end = start.checked_add(row_bytes).ok_or_else(|| {
+-                    shape_mismatch("matvec", "encoded weight row end overflowed usize")
+-                })?;
+-                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
+-                    shape_mismatch("matvec", "encoded weight row is outside the tensor byte range")
+-                })?;
+-                *output_value = self.fused_q4k_dot(encoded_row, input)?;
+-            }
+-            return Ok(());
++        // Per-32 input group sums, computed once and shared by every row.
++        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
++        let mut sums_stack = [0.0_f32; SUMS_STACK_GROUPS];
++        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
++        let mut sums_heap: Vec<f32>;
++        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
++        let mut sums: &[f32] = &[];
++        #[cfg(target_arch = "x86_64")]
++        if fused && self.avx2_fma && matches!(dtype, DType::Q4K | DType::Q5K) {
++            let groups = in_features / 32;
++            let buffer: &mut [f32] = if groups <= SUMS_STACK_GROUPS {
++                &mut sums_stack[..groups]
++            } else {
++                sums_heap = allocate_row_scratch("matvec", groups)?;
++                &mut sums_heap[..]
++            };
++            kq::group_sums(input, buffer);
++            sums = &*buffer;
+         }
+ 
+-        if parallel {
+-            let chunk_rows = out_features.div_ceil(workers);
+-            let simd_enabled = self.simd_enabled;
+-            let features = self.features;
++        let run = |first_row: usize, rows: &mut [f32]| -> Result<(), BackendError> {
++            if fused {
++                for (offset, value) in rows.iter_mut().enumerate() {
++                    let encoded = encoded_row("matvec", &weights, first_row + offset, row_bytes)?;
++                    *value = self.fused_row_dot(dtype, encoded, input, sums)?;
++                }
++                Ok(())
++            } else {
++                with_row_scratch("matvec", in_features, |row| {
++                    for (offset, value) in rows.iter_mut().enumerate() {
++                        decode_weight_row(
++                            "matvec",
++                            raw_type,
++                            columns,
++                            row_bytes,
++                            first_row + offset,
++                            &weights,
++                            row,
++                        )?;
++                        *value = self.dot_product(row, input);
++                    }
++                    Ok(())
++                })
++            }
++        };
+ 
+-            return self.pool.install(|| {
++        match self.rows_per_task(out_features, row_bytes, 1) {
++            Some(chunk) => self.pool.install(|| {
+                 output
+-                    .par_chunks_mut(chunk_rows)
++                    .par_chunks_mut(chunk)
+                     .enumerate()
+-                    .try_for_each(|(chunk_index, output_chunk)| {
+-                        let first_row = chunk_index * chunk_rows;
+-                        let mut row = allocate_row_scratch("matvec", in_features)?;
+-                        for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
+-                            let row_index = first_row + local_row;
+-                            decode_weight_row(
+-                                "matvec",
+-                                raw_type,
+-                                columns,
+-                                row_bytes,
+-                                row_index,
+-                                &weights,
+-                                &mut row,
+-                            )?;
+-                            *output_value = if simd_enabled && features.avx2 {
+-                                #[cfg(target_arch = "x86_64")]
+-                                unsafe {
+-                                    if features.fma {
+-                                        dot_avx2_fma(&row, input)
+-                                    } else {
+-                                        dot_avx2(&row, input)
+-                                    }
+-                                }
+-                                #[cfg(not(target_arch = "x86_64"))]
+-                                dot_scalar(&row, input)
+-                            } else {
+-                                dot_scalar(&row, input)
+-                            };
+-                        }
+-                        Ok(())
+-                    })
+-            });
+-        }
+-
+-        let mut row = allocate_row_scratch("matvec", in_features)?;
+-        for (row_index, output_value) in output.iter_mut().enumerate() {
+-            decode_weight_row(
+-                "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
+-            )?;
+-            *output_value = self.dot_product(&row, input);
++                    .try_for_each(|(index, part)| run(index * chunk, part))
++            }),
++            None => run(0, output),
+         }
+-        Ok(())
+     }
+ 
+     fn matvec_batch(
+@@ -838,59 +780,47 @@
+         }
+ 
+         let (raw_type, columns, row_bytes) = matrix_row_layout(&weights, m, k, "matmul")?;
+-        let workers = self.worker_count.min(m);
+-        let parallel = workers > 1 && m >= workers.saturating_mul(2);
+ 
+-        if parallel {
+-            let chunk_rows = m.div_ceil(workers);
+-            return self.pool.install(|| {
++        let run = |first_row: usize, out: &mut [f32]| -> Result<(), BackendError> {
++            let rows = out.len() / n;
++            with_row_scratch("matmul", MATMUL_ROW_TILE * k, |scratch| {
++                let mut done = 0;
++                while done < rows {
++                    let tile = (rows - done).min(MATMUL_ROW_TILE);
++                    for slot in 0..tile {
++                        decode_weight_row(
++                            "matmul",
++                            raw_type,
++                            columns,
++                            row_bytes,
++                            first_row + done + slot,
++                            &weights,
++                            &mut scratch[slot * k..(slot + 1) * k],
++                        )?;
++                    }
++                    self.matmul_tile(
++                        &scratch[..tile * k],
++                        tile,
++                        k,
++                        input,
++                        &mut out[done * n..(done + tile) * n],
++                        n,
++                    );
++                    done += tile;
++                }
++                Ok(())
++            })
++        };
++
++        match self.rows_per_task(m, row_bytes, MATMUL_ROW_TILE) {
++            Some(chunk) => self.pool.install(|| {
+                 output
+-                    .par_chunks_mut(chunk_rows * n)
++                    .par_chunks_mut(chunk * n)
+                     .enumerate()
+-                    .try_for_each(|(chunk_index, output_chunk)| {
+-                        let first_row = chunk_index * chunk_rows;
+-                        let mut row = allocate_row_scratch("matmul", k)?;
+-                        let rows_in_chunk = output_chunk.len() / n;
+-
+-                        for local_row in 0..rows_in_chunk {
+-                            let row_index = first_row + local_row;
+-                            decode_weight_row(
+-                                "matmul",
+-                                raw_type,
+-                                columns,
+-                                row_bytes,
+-                                row_index,
+-                                &weights,
+-                                &mut row,
+-                            )?;
+-                            let output_start = local_row * n;
+-                            self.matmul_row(
+-                                &row,
+-                                input,
+-                                &mut output_chunk[output_start..output_start + n],
+-                                n,
+-                            );
+-                        }
+-                        Ok(())
+-                    })
+-            });
++                    .try_for_each(|(index, part)| run(index * chunk, part))
++            }),
++            None => run(0, output),
+         }
+-
+-        let mut row = allocate_row_scratch("matmul", k)?;
+-        for row_index in 0..m {
+-            decode_weight_row(
+-                "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
+-            )?;
+-
+-            let output_start = row_index * n;
+-            self.matmul_row(
+-                &row,
+-                input,
+-                &mut output[output_start..output_start + n],
+-                n,
+-            );
+-        }
+-        Ok(())
+     }
+ 
+     fn parallel_for_each_mut(
+@@ -1108,9 +1038,7 @@
+             })
+             .unwrap();
+ 
+-        let expected = (0..32)
+-            .map(|index| (index / 8) as f32)
+-            .collect::<Vec<_>>();
++        let expected = (0..32).map(|index| (index / 8) as f32).collect::<Vec<_>>();
+         assert_eq!(values, expected);
+     }
+ 
+@@ -1179,7 +1107,7 @@
+             .map(|index| ((index * 7 % 41) as f32 - 20.0) / 23.0)
+             .collect::<Vec<_>>();
+         let scalar = CpuBackend::new_scalar(1).unwrap();
+-        let simd_dequant = CpuBackend::new(1).unwrap();
++        let simd_dequant = CpuBackend::new_dequant(1).unwrap();
+         let fused = CpuBackend::new_fused_q4k(1).unwrap();
+         let mut expected = [0.0_f32; 2];
+         let mut dequant_output = [0.0_f32; 2];
+@@ -1289,10 +1217,7 @@
+             .matvec(weights, &vector, &mut automatic_vector_output)
+             .unwrap();
+ 
+-        for (expected, actual) in scalar_vector_output
+-            .iter()
+-            .zip(&automatic_vector_output)
+-        {
++        for (expected, actual) in scalar_vector_output.iter().zip(&automatic_vector_output) {
+             assert!(
+                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
+                 "matvec mismatch: scalar={expected}, automatic={actual}"
+@@ -1308,10 +1233,7 @@
+             .matmul(weights, &matrix, &mut automatic_matrix_output, m, n, k)
+             .unwrap();
+ 
+-        for (expected, actual) in scalar_matrix_output
+-            .iter()
+-            .zip(&automatic_matrix_output)
+-        {
++        for (expected, actual) in scalar_matrix_output.iter().zip(&automatic_matrix_output) {
+             assert!(
+                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
+                 "matmul mismatch: scalar={expected}, automatic={actual}"
+@@ -1333,7 +1255,9 @@
+         let mut second = [0.0_f32; 3];
+         let mut outputs: [&mut [f32]; 2] = [&mut first, &mut second];
+ 
+-        backend.matvec_batch(&weights, &input, &mut outputs).unwrap();
++        backend
++            .matvec_batch(&weights, &input, &mut outputs)
++            .unwrap();
+ 
+         assert_eq!(first, [4.5, 9.0]);
+         assert_eq!(second, [-1.0, 4.5, 6.0]);
+@@ -1627,3 +1551,269 @@
+         ));
+     }
+ }
++
++#[cfg(test)]
++mod kernel_tests {
++    //! Property-style checks of the direct-block kernels and the tiled matmul
++    //! against an f64 reference built from the scalar dequantizers.
++
++    use super::*;
++    use qarnyx_quant::dequantize;
++
++    fn next(state: &mut u64) -> u64 {
++        *state ^= *state << 13;
++        *state ^= *state >> 7;
++        *state ^= *state << 17;
++        *state
++    }
++
++    fn unit(state: &mut u64) -> f32 {
++        (next(state) % 2001) as f32 / 1000.0 - 1.0
++    }
++
++    /// Random packed rows with valid, moderate f16 scale fields.
++    fn random_rows(raw_type: u32, rows: usize, blocks: usize, seed: u64) -> Vec<u8> {
++        let (block_bytes, scale_offsets): (usize, &[usize]) = match raw_type {
++            12 => (144, &[0, 2]),
++            13 => (176, &[0, 2]),
++            14 => (210, &[208]),
++            _ => panic!("unsupported test type"),
++        };
++        let halves = [0x2c00_u16, 0x2800, 0x3000, 0x2a00]; // 0.0625 .. 0.125
++        let mut state = seed | 1;
++        let mut bytes = vec![0_u8; rows * blocks * block_bytes];
++        for block in bytes.chunks_exact_mut(block_bytes) {
++            for byte in block.iter_mut() {
++                *byte = next(&mut state) as u8;
++            }
++            for &offset in scale_offsets {
++                let bits = halves[(next(&mut state) % 4) as usize];
++                block[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
++            }
++        }
++        bytes
++    }
++
++    fn dtype_of(raw_type: u32) -> DType {
++        match raw_type {
++            12 => DType::Q4K,
++            13 => DType::Q5K,
++            _ => DType::Q6K,
++        }
++    }
++
++    /// f64 `W * x` plus a tolerance scaled by sum(|w * x|) per output.
++    fn reference_matvec(
++        raw_type: u32,
++        bytes: &[u8],
++        rows: usize,
++        columns: usize,
++        input: &[f32],
++    ) -> Vec<(f64, f64)> {
++        let row_bytes = bytes.len() / rows;
++        (0..rows)
++            .map(|row| {
++                let weights = dequantize(
++                    raw_type,
++                    &[columns as u64],
++                    &bytes[row * row_bytes..(row + 1) * row_bytes],
++                )
++                .unwrap();
++                let mut sum = 0.0_f64;
++                let mut magnitude = 0.0_f64;
++                for (w, x) in weights.iter().zip(input) {
++                    let term = f64::from(*w) * f64::from(*x);
++                    sum += term;
++                    magnitude += term.abs();
++                }
++                (sum, magnitude)
++            })
++            .collect()
++    }
++
++    fn assert_close(label: &str, actual: &[f32], expected: &[(f64, f64)]) {
++        for (index, (value, (sum, magnitude))) in actual.iter().zip(expected).enumerate() {
++            let tolerance = 1.0e-4 * magnitude + 1.0e-6;
++            assert!(
++                (f64::from(*value) - sum).abs() <= tolerance,
++                "{label}: row {index}: got {value}, expected {sum} (tolerance {tolerance})"
++            );
++        }
++    }
++
++    #[test]
++    fn direct_block_kernels_match_reference_single_thread() {
++        for raw_type in [12_u32, 13, 14] {
++            for blocks in [1_usize, 2, 5] {
++                let rows = 7;
++                let columns = blocks * 256;
++                let bytes = random_rows(raw_type, rows, blocks, 0x9e37_79b9 + raw_type as u64);
++                let mut state = 42_u64 + blocks as u64;
++                let input: Vec<f32> = (0..columns).map(|_| unit(&mut state)).collect();
++                let shape = [rows, columns];
++                let weights = TensorView::new(&bytes, &shape, dtype_of(raw_type));
++                let expected = reference_matvec(raw_type, &bytes, rows, columns, &input);
++
++                for (label, backend) in [
++                    ("default", CpuBackend::new(1).unwrap()),
++                    ("dequant", CpuBackend::new_dequant(1).unwrap()),
++                    ("scalar", CpuBackend::new_scalar(1).unwrap()),
++                ] {
++                    let mut output = vec![0.0_f32; rows];
++                    backend.matvec(weights, &input, &mut output).unwrap();
++                    assert_close(
++                        &format!("type {raw_type} blocks {blocks} {label}"),
++                        &output,
++                        &expected,
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn direct_block_kernels_match_reference_in_parallel() {
++        // Large enough (>128 KiB of weights) to be split into several tasks.
++        for raw_type in [12_u32, 13, 14] {
++            let (rows, blocks) = (601, 2);
++            let columns = blocks * 256;
++            let bytes = random_rows(raw_type, rows, blocks, 0xdead_beef + raw_type as u64);
++            let mut state = 7_u64;
++            let input: Vec<f32> = (0..columns).map(|_| unit(&mut state)).collect();
++            let shape = [rows, columns];
++            let weights = TensorView::new(&bytes, &shape, dtype_of(raw_type));
++            let expected = reference_matvec(raw_type, &bytes, rows, columns, &input);
++
++            let backend = CpuBackend::new(4).unwrap();
++            assert!(
++                backend.rows_per_task(rows, bytes.len() / rows, 1).is_some(),
++                "test must exercise the parallel path"
++            );
++            let mut output = vec![0.0_f32; rows];
++            backend.matvec(weights, &input, &mut output).unwrap();
++            assert_close(&format!("parallel type {raw_type}"), &output, &expected);
++        }
++    }
++
++    #[test]
++    fn inputs_larger_than_the_stack_sum_buffer_work() {
++        // 512 groups of 32 fit on the stack; 20 blocks = 160 groups do, so use
++        // enough blocks (> 16384 columns) to force the heap path.
++        let (rows, blocks) = (2, 65);
++        let columns = blocks * 256;
++        assert!(columns / 32 > SUMS_STACK_GROUPS);
++        let bytes = random_rows(12, rows, blocks, 99);
++        let mut state = 5_u64;
++        let input: Vec<f32> = (0..columns).map(|_| unit(&mut state)).collect();
++        let shape = [rows, columns];
++        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
++        let expected = reference_matvec(12, &bytes, rows, columns, &input);
++        let mut output = vec![0.0_f32; rows];
++        CpuBackend::new(1)
++            .unwrap()
++            .matvec(weights, &input, &mut output)
++            .unwrap();
++        assert_close("heap sums", &output, &expected);
++    }
++
++    #[test]
++    fn tiled_matmul_matches_reference_for_odd_shapes() {
++        // m not a multiple of 4 (leftover rows), n around the 8/16 tile edges.
++        for raw_type in [12_u32, 14] {
++            for (m, n) in [
++                (11_usize, 5_usize),
++                (8, 8),
++                (13, 19),
++                (6, 40),
++                (4, 16),
++                (9, 33),
++            ] {
++                let k = 512;
++                let bytes = random_rows(raw_type, m, k / 256, 1234 + (m * 31 + n) as u64);
++                let mut state = 17_u64 + n as u64;
++                let b: Vec<f32> = (0..k * n).map(|_| unit(&mut state)).collect();
++                let shape = [m, k];
++                let weights = TensorView::new(&bytes, &shape, dtype_of(raw_type));
++
++                let row_bytes = bytes.len() / m;
++                let mut expected = vec![(0.0_f64, 0.0_f64); m * n];
++                for row in 0..m {
++                    let w = dequantize(
++                        raw_type,
++                        &[k as u64],
++                        &bytes[row * row_bytes..(row + 1) * row_bytes],
++                    )
++                    .unwrap();
++                    for col in 0..n {
++                        let (mut sum, mut magnitude) = (0.0_f64, 0.0_f64);
++                        for inner in 0..k {
++                            let term = f64::from(w[inner]) * f64::from(b[inner * n + col]);
++                            sum += term;
++                            magnitude += term.abs();
++                        }
++                        expected[row * n + col] = (sum, magnitude);
++                    }
++                }
++
++                for workers in [1_usize, 4] {
++                    let backend = CpuBackend::new(workers).unwrap();
++                    let mut output = vec![0.0_f32; m * n];
++                    backend.matmul(weights, &b, &mut output, m, n, k).unwrap();
++                    assert_close(
++                        &format!("matmul type {raw_type} m={m} n={n} workers={workers}"),
++                        &output,
++                        &expected,
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn tiled_matmul_parallel_f32_matches_scalar() {
++        let (m, k, n) = (1030_usize, 64_usize, 21_usize);
++        let mut state = 3_u64;
++        let values: Vec<f32> = (0..m * k).map(|_| unit(&mut state)).collect();
++        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
++        let b: Vec<f32> = (0..k * n).map(|_| unit(&mut state)).collect();
++        let shape = [m, k];
++        let weights = TensorView::new(&bytes, &shape, DType::F32);
++
++        let scalar = CpuBackend::new_scalar(1).unwrap();
++        let fast = CpuBackend::new(4).unwrap();
++        assert!(fast.rows_per_task(m, k * 4, gemm::TILE_ROWS).is_some());
++        let mut expected = vec![0.0_f32; m * n];
++        let mut actual = vec![0.0_f32; m * n];
++        scalar.matmul(weights, &b, &mut expected, m, n, k).unwrap();
++        fast.matmul(weights, &b, &mut actual, m, n, k).unwrap();
++        for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
++            assert!(
++                (a - e).abs() <= 1.0e-4 * (1.0 + e.abs()),
++                "index {index}: {a} vs {e}"
++            );
++        }
++    }
++
++    #[test]
++    fn task_sizing_is_work_based_and_tile_aligned() {
++        let backend = CpuBackend::new(4).unwrap();
++        // Tiny matrices stay on one thread regardless of row count.
++        assert_eq!(backend.rows_per_task(64, 16, 1), None);
++        // Big ones split into several tasks per worker, aligned to the tile.
++        let chunk = backend.rows_per_task(6144, 1152, 4).unwrap();
++        assert_eq!(chunk % 4, 0);
++        assert!(6144_usize.div_ceil(chunk) >= 4);
++        // One worker never splits.
++        assert_eq!(
++            CpuBackend::new(1).unwrap().rows_per_task(6144, 1152, 1),
++            None
++        );
++    }
++
++    #[test]
++    fn row_scratch_is_reused_across_calls() {
++        let first = with_row_scratch("test", 128, |row| Ok(row.as_ptr() as usize)).unwrap();
++        let second = with_row_scratch("test", 64, |row| Ok(row.as_ptr() as usize)).unwrap();
++        assert_eq!(first, second, "steady-state calls must not reallocate");
++    }
++}
+diff -ruN '--exclude=Cargo.lock' a/crates/qarnyx-models/src/qwen35.rs b/crates/qarnyx-models/src/qwen35.rs
+--- a/crates/qarnyx-models/src/qwen35.rs	2026-11-17 10:05:25.000000000 +0000
++++ b/crates/qarnyx-models/src/qwen35.rs	2026-11-18 07:32:55.000000000 +0000
+@@ -3,7 +3,7 @@
+ 
+ use qarnyx_core::{Backend, DType, TensorView};
+ use qarnyx_gguf::{GgufFile, MetadataValue, TensorInfo};
+-use qarnyx_quant::{dequantize, GgmlType};
++use qarnyx_quant::{dequantize, dequantize_into, GgmlType};
+ use std::collections::BTreeMap;
+ use std::time::{Duration, Instant};
+ use crate::{ModelError, TensorLoadError};
+@@ -509,23 +509,27 @@
+         let decay = (-a[head].exp() * softplus(alpha[head] + dt[head])).exp();
+         let beta_value = sigmoid(beta[head]);
+ 
+-        for column in 0..LD {
+-            for row in 0..LD {
+-                head_state[row * LD + column] *= decay;
+-            }
+-        }
+-
++        // State is [key_index][value_index] with value_index contiguous. Every
++        // loop below runs along the contiguous axis so it vectorizes, and the
++        // per-element operation order is unchanged (bitwise-identical results).
++        //
++        // Pass 1: decay the state and accumulate memory[v] = sum_k S[k][v] * key[k].
+         let mut memory = [0.0_f32; LD];
+-        for column in 0..LD {
+-            for row in 0..LD {
+-                memory[column] += head_state[row * LD + column] * key_head[row];
++        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
++            for (cell, slot) in state_row.iter_mut().zip(memory.iter_mut()) {
++                *cell *= decay;
++                *slot += *cell * *key;
+             }
+         }
+ 
+-        for row in 0..LD {
+-            let delta = (value_head[row] - memory[row]) * beta_value;
+-            for column in 0..LD {
+-                head_state[column * LD + row] += key_head[column] * delta;
++        // Pass 2: S[k][v] += key[k] * delta[v].
++        let mut delta = [0.0_f32; LD];
++        for ((slot, value), mem) in delta.iter_mut().zip(value_head).zip(&memory) {
++            *slot = (*value - *mem) * beta_value;
++        }
++        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
++            for (cell, change) in state_row.iter_mut().zip(&delta) {
++                *cell += *key * *change;
+             }
+         }
+     })?;
+@@ -538,9 +542,9 @@
+         let query_head = &q[head * LD..(head + 1) * LD];
+         let gate_head = &z[head * LD..(head + 1) * LD];
+ 
+-        for column in 0..LD {
+-            for row in 0..LD {
+-                head_core[column] += head_state[row * LD + column] * query_head[row];
++        for (state_row, query) in head_state.chunks_exact(LD).zip(query_head) {
++            for (out, cell) in head_core.iter_mut().zip(state_row) {
++                *out += *cell * *query;
+             }
+         }
+ 
+@@ -848,8 +852,9 @@
+     let ty=dtype_id(t.dtype).ok_or(ModelError::InvalidConfig("unsupported tensor dtype"))?;
+     let rb=t.data.len()/t.shape[0];let s=r.checked_mul(rb).ok_or(ModelError::InvalidConfig("row overflow"))?;
+     let e=s.checked_add(rb).ok_or(ModelError::InvalidConfig("row overflow"))?;
+-    let v=dequantize(ty,&[o.len()as u64],t.data.get(s..e).ok_or(ModelError::InvalidConfig("row out of bounds"))?)
+-        .map_err(|_|ModelError::InvalidConfig("dequantization failed"))?;o.copy_from_slice(&v);Ok(())
++    // Decode straight into the caller's buffer: no per-row heap allocation.
++    dequantize_into(ty,&[o.len()as u64],t.data.get(s..e).ok_or(ModelError::InvalidConfig("row out of bounds"))?,o)
++        .map_err(|_|ModelError::InvalidConfig("dequantization failed"))
+ }
+ fn matrix<'a>(g:&GgufFile,d:&'a[u8],name:&str,e:&[usize])->Result<TensorView<'a>,TensorLoadError>{let t=find(g,name)?;if t.dimensions.len()!=2||t.dimensions[0]!=e[1]as u64||t.dimensions[1]!=e[0]as u64{return Err(TensorLoadError::expected_shape(name,&t.dimensions,&[e[1],e[0]]));}let dt=dtype(t)?;Ok(TensorView::new(bytes(t,d)?,Box::leak(e.to_vec().into_boxed_slice()),dt))}
+ fn vector(g:&GgufFile,d:&[u8],name:&str,e:&[usize])->Result<Vec<f32>,TensorLoadError>{let t=find(g,name)?;if t.dimensions!=e.iter().map(|x|*x as u64).collect::<Vec<_>>(){return Err(TensorLoadError::expected_shape(name,&t.dimensions,e));}dequantize(t.ggml_type,&t.dimensions,bytes(t,d)?).map_err(|source|TensorLoadError::Decode{name:name.into(),source})}
