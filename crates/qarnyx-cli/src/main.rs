@@ -299,7 +299,7 @@ fn generate_model(
             let generated_ids = &result.token_ids[prompt_tokens.len()..];
             let generated_content = tokenizer.decode(generated_ids)?;
             let generated_text = if thinking {
-                format!("<think>\\n{generated_content}")
+                format!("<think>\n{generated_content}")
             } else {
                 generated_content
             };
