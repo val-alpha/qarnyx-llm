@@ -188,6 +188,9 @@ impl CpuBackend {
         if self.simd_enabled && self.features.avx2 {
             #[cfg(target_arch = "x86_64")]
             unsafe {
+                if self.features.fma {
+                    return Ok(dot_q5_k_avx2_fma(encoded, input));
+                }
                 return Ok(dot_q5_k_avx2(encoded, input));
             }
         }
@@ -199,6 +202,9 @@ impl CpuBackend {
         if self.simd_enabled && self.features.avx2 {
             #[cfg(target_arch = "x86_64")]
             unsafe {
+                if self.features.fma {
+                    return Ok(dot_q6_k_avx2_fma(encoded, input));
+                }
                 return Ok(dot_q6_k_avx2(encoded, input));
             }
         }
@@ -540,6 +546,66 @@ unsafe fn dot_q5_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
     }
 }
 
+
+/// AVX2/FMA direct-block Q5_K dot. The packed values are expanded in
+/// temporary integer lanes, then accumulated with fused multiply-add.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q5_k_avx2_fma(encoded: &[u8], input: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mut accumulator = _mm256_setzero_ps();
+        for (block_index, block) in encoded.chunks_exact(176).enumerate() {
+            let d = q4k_read_half(&block[..2]);
+            let min_scale = q4k_read_half(&block[2..4]);
+            let packed_scales = &block[4..16];
+            let high_bits = &block[16..48];
+            let low_bits = &block[48..176];
+            let input_base = block_index * 256;
+
+            for group in 0..8 {
+                let pair = group / 2;
+                let half = group % 2;
+                let mask = 1_u8 << (pair * 2 + half);
+                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+                let scale = _mm256_set1_ps(d * f32::from(local_scale));
+                let min = _mm256_set1_ps(min_scale * f32::from(local_min));
+                let quant_offset = pair * 32;
+                let input_offset = input_base + group * 32;
+
+                for offset in (0..32).step_by(8) {
+                    let mut values = [0_i32; 8];
+                    for lane in 0..8 {
+                        let index = offset + lane;
+                        let packed = low_bits[quant_offset + index];
+                        let low = if half == 0 {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
+                        let high = if high_bits[index] & mask != 0 {
+                            1_i32
+                        } else {
+                            0_i32
+                        };
+                        values[lane] = i32::from(low) | (high << 4);
+                    }
+                    let integers = _mm256_loadu_si256(values.as_ptr().cast());
+                    let quant = _mm256_cvtepi32_ps(integers);
+                    let weights = _mm256_sub_ps(_mm256_mul_ps(quant, scale), min);
+                    let x = _mm256_loadu_ps(input.as_ptr().add(input_offset + offset));
+                    accumulator = _mm256_fmadd_ps(weights, x, accumulator);
+                }
+            }
+        }
+
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        lanes.iter().sum()
+    }
+}
+
 /// AVX2 direct-block Q6_K dot. Signed six-bit values and per-16-value
 /// scale groups are expanded in vector registers only.
 #[cfg(target_arch = "x86_64")]
@@ -588,6 +654,66 @@ unsafe fn dot_q6_k_avx2(encoded: &[u8], input: &[f32]) -> f32 {
                         let input_offset = output_base + group * 32 + offset;
                         let x = _mm256_loadu_ps(input.as_ptr().add(input_offset));
                         accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(weights, x));
+                    }
+                }
+            }
+        }
+
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        lanes.iter().sum()
+    }
+}
+
+
+/// AVX2/FMA direct-block Q6_K dot with signed six-bit unpacking and
+/// fused multiply-add accumulation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q6_k_avx2_fma(encoded: &[u8], input: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mut accumulator = _mm256_setzero_ps();
+        for (block_index, block) in encoded.chunks_exact(210).enumerate() {
+            let low_bits = &block[..128];
+            let high_bits = &block[128..192];
+            let scales = &block[192..208];
+            let d = q4k_read_half(&block[208..210]);
+            let input_base = block_index * 256;
+
+            for half_block in 0..2 {
+                let low_offset = half_block * 64;
+                let high_offset = half_block * 32;
+                let scale_offset = half_block * 8;
+                let output_base = input_base + half_block * 128;
+
+                for group in 0..4 {
+                    for offset in (0..32).step_by(8) {
+                        let mut values = [0_i32; 8];
+                        for lane in 0..8 {
+                            let index = offset + lane;
+                            let high = high_bits[high_offset + index];
+                            let low_a = low_bits[low_offset + index];
+                            let low_b = low_bits[low_offset + index + 32];
+                            let quant = match group {
+                                0 => i32::from((low_a & 0x0f) | ((high & 0x03) << 4)),
+                                1 => i32::from((low_b & 0x0f) | (((high >> 2) & 0x03) << 4)),
+                                2 => i32::from((low_a >> 4) | (((high >> 4) & 0x03) << 4)),
+                                _ => i32::from((low_b >> 4) | (((high >> 6) & 0x03) << 4)),
+                            };
+                            values[lane] = quant - 32;
+                        }
+
+                        let scale_index = scale_offset + offset / 16 + group * 2;
+                        let signed_scale = (scales[scale_index] as i8) as f32;
+                        let weight_scale = _mm256_set1_ps(d * signed_scale);
+                        let integers = _mm256_loadu_si256(values.as_ptr().cast());
+                        let quant = _mm256_cvtepi32_ps(integers);
+                        let weights = _mm256_mul_ps(quant, weight_scale);
+                        let input_offset = output_base + group * 32 + offset;
+                        let x = _mm256_loadu_ps(input.as_ptr().add(input_offset));
+                        accumulator = _mm256_fmadd_ps(weights, x, accumulator);
                     }
                 }
             }
