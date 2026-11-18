@@ -386,10 +386,14 @@ Validation observed on CI:
   differences in existing runtime/tokenizer code. No broad auto-format was
   applied because it would introduce unrelated source churn.
 
+Validation confirmed on the target Ubuntu host (user-reported):
+- Fast-forward pull from `4a3f772` to `3063b52` completed cleanly.
+- `cargo check --workspace`: passed.
+- `cargo test --workspace`: 89 passed, 0 failed (CLI 4, core 3, CPU 26,
+  GGUF 14, models 12, quant 14, runtime 9, tokenizer 7; doc-tests also passed).
+- `cargo build --release -p qarnyx-cli`: passed.
+
 Remaining target validation:
-- Pull the latest `main` on the Ubuntu target and rerun
-  `cargo check --workspace`, `cargo test --workspace`, and
-  `cargo build --release -p qarnyx-cli`.
 - Capture a repeatable end-to-end benchmark result using the protocol in
   [docs/benchmarking.md](benchmarking.md). The procedure is documented, but
   benchmark numbers remain host-, model-, and kernel-specific.
