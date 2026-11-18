@@ -199,6 +199,10 @@ faster than all available vCPUs.
   generation task. Cancellation is checked between complete token evaluations;
   the in-flight token finishes, then request-local state is dropped. The CLI
   maps Ctrl+C to this signal and emits no partial generated text.
+- The Qwen3.5 CLI path applies a single-turn text ChatML prompt with the
+  assistant generation prefix from the model's chat template, and prints only
+  newly generated text. Control-token spellings found in the vocabulary are
+  encoded as their atomic token IDs instead of ordinary byte-level text.
 - Activations: reusable scratch buffers sized from model configuration.
 - Sessions: bounded; do not create unbounded per-request caches.
 - Ownership: shared immutable model data, session-owned mutable state.

@@ -83,16 +83,69 @@ impl GgufTokenizer {
 
     /// Encodes text using the tokenizer family declared by GGUF metadata.
     ///
-    /// The current implementation supports the deterministic vocabulary
-    /// matcher for metadata without merges. Merge-based tokenizers use the
-    /// BPE path below; byte-level pre-tokenization remains intentionally
-    /// separate so we do not silently claim LLaMA compatibility we have not
-    /// implemented yet.
+    /// Recognized control-token spellings present in the vocabulary are
+    /// emitted as their dedicated token IDs, rather than being split into
+    /// ordinary byte-level pieces.
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
-        if self.merges.is_empty() {
-            return self.encode_vocab_pieces(text);
+        let mut special_tokens = self
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| is_special_token_spelling(token))
+            .map(|(id, token)| (id, token.as_str()))
+            .collect::<Vec<_>>();
+        special_tokens.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        let mut output = Vec::new();
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let next = special_tokens
+                .iter()
+                .filter_map(|&(id, marker)| {
+                    text[cursor..].find(marker).map(|relative| {
+                        (cursor + relative, id, marker)
+                    })
+                })
+                .min_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| b.2.len().cmp(&a.2.len()))
+                });
+
+            let Some((position, token_id, marker)) = next else {
+                output.extend(self.encode_plain(&text[cursor..])?);
+                break;
+            };
+
+            output.extend(self.encode_plain(&text[cursor..position])?);
+            output.push(token_id);
+            cursor = position + marker.len();
         }
-        self.encode_bpe(text)
+
+        Ok(output)
+    }
+
+    fn encode_plain(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
+        if self.merges.is_empty() {
+            self.encode_vocab_pieces(text)
+        } else {
+            self.encode_bpe(text)
+        }
+    }
+
+    /// Formats a single-turn, text-only Qwen3.5 chat prompt with thinking
+    /// disabled, then encodes its control tokens atomically.
+    pub fn encode_qwen35_chat_prompt(
+        &self,
+        prompt: &str,
+    ) -> Result<Vec<usize>, TokenizerError> {
+        if self.model != "gpt2" || self.pre.as_deref() != Some("qwen35") {
+            return Err(TokenizerError::UnsupportedModel(self.model.clone()));
+        }
+
+        let formatted = format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        self.encode(&formatted)
     }
 
     fn encode_vocab_pieces(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
@@ -248,6 +301,14 @@ impl GgufTokenizer {
     }
 }
 
+
+fn is_special_token_spelling(token: &str) -> bool {
+    (token.starts_with("<|") && token.ends_with("|>"))
+        || matches!(
+            token,
+            "<think>" | "</think>" | "<tool_call>" | "</tool_call>"
+        )
+}
 
 fn byte_to_unicode(text: &str) -> String {
     let map = gpt2_byte_map();
@@ -491,6 +552,57 @@ mod tests {
         };
 
         assert_eq!(tokenizer.encode("hello").unwrap(), [6]);
+    }
+
+    #[test]
+    fn encodes_chat_control_tokens_as_atomic_vocabulary_entries() {
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![
+                "h".into(),
+                "i".into(),
+                "<|im_start|>".into(),
+                "<|im_end|>".into(),
+            ],
+            scores: vec![0.0; 4],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        assert_eq!(
+            tokenizer.encode("<|im_start|>hi<|im_end|>").unwrap(),
+            [2, 0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn qwen35_chat_prompt_uses_non_thinking_assistant_prefix() {
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![
+                "<|im_start|>".into(),
+                "<|im_end|>".into(),
+                "<think>".into(),
+                "</think>".into(),
+                "user".into(),
+                "\n".into(),
+                "hi".into(),
+                "assistant".into(),
+                "\n\n".into(),
+            ],
+            scores: vec![0.0; 9],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        assert_eq!(
+            tokenizer.encode_qwen35_chat_prompt("hi").unwrap(),
+            [0, 4, 5, 6, 1, 5, 0, 7, 5, 2, 8, 3, 8]
+        );
     }
 
     #[test]

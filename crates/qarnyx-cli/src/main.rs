@@ -274,11 +274,12 @@ fn generate_model(
         Some("qwen35") => {
             let model = Qwen35Model::from_gguf(&gguf, &data)?;
             let mut generator = Qwen35Generator::new(seed);
-            let result = match generator.generate_with_cancellation(
+            let prompt_tokens = tokenizer.encode_qwen35_chat_prompt(prompt)?;
+            let result = match generator.generate_ids_with_cancellation(
                 &model,
                 &tokenizer,
                 &backend,
-                prompt,
+                &prompt_tokens,
                 config,
                 &cancellation,
             ) {
@@ -289,7 +290,9 @@ fn generate_model(
                 }
                 Err(error) => return Err(error.into()),
             };
-            println!("{}", result.text);
+            let generated_ids = &result.token_ids[prompt_tokens.len()..];
+            let generated_text = tokenizer.decode(generated_ids)?;
+            println!("{generated_text}");
         }
         Some("llama") => {
             let model = LlamaModel::from_gguf(&gguf, &data)?;

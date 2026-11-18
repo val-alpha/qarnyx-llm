@@ -133,6 +133,10 @@ budget, not a process-wide RSS guarantee: parser metadata, tokenizer data,
 transient logits/outputs, allocator overhead, and other process memory are
 excluded.
 
+For Qwen3.5 text generation, the CLI encodes a single-turn chat prompt using
+the model's ChatML control tokens and the non-thinking assistant prefix. It
+prints only newly generated token text, not the input prompt.
+
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its
 request-local cache is released. The CLI does not print partial generated text.
