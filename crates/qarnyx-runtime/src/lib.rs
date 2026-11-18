@@ -19,6 +19,15 @@ pub enum GenerationError {
     #[error("generation configuration is invalid: {0}")]
     InvalidConfig(&'static str),
 
+    #[error(
+        "requested sequence ({prompt_tokens} prompt + {max_new_tokens} new tokens) exceeds context limit {limit}"
+    )]
+    ContextLimitExceeded {
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        limit: usize,
+    },
+
     #[error("logits contain non-finite values")]
     NonFiniteLogits,
 }
@@ -27,6 +36,8 @@ pub enum GenerationError {
 #[derive(Debug, Clone, Copy)]
 pub struct GenerationConfig {
     pub max_new_tokens: usize,
+    /// Maximum combined prompt and generated sequence length.
+    pub max_context_tokens: usize,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -37,6 +48,7 @@ impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
             max_new_tokens: 128,
+            max_context_tokens: 4096,
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
@@ -50,11 +62,29 @@ impl GenerationConfig {
         if self.max_new_tokens == 0 {
             return Err(GenerationError::InvalidConfig("max_new_tokens must be non-zero"));
         }
+        if self.max_context_tokens == 0 {
+            return Err(GenerationError::InvalidConfig(
+                "max_context_tokens must be non-zero",
+            ));
+        }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(GenerationError::InvalidConfig("temperature must be finite and >= 0"));
         }
         if self.top_p <= 0.0 || self.top_p > 1.0 || !self.top_p.is_finite() {
             return Err(GenerationError::InvalidConfig("top_p must be in (0, 1]"));
+        }
+        Ok(())
+    }
+
+    fn validate_context(&self, prompt_tokens: usize) -> Result<(), GenerationError> {
+        if prompt_tokens > self.max_context_tokens
+            || self.max_new_tokens > self.max_context_tokens - prompt_tokens
+        {
+            return Err(GenerationError::ContextLimitExceeded {
+                prompt_tokens,
+                max_new_tokens: self.max_new_tokens,
+                limit: self.max_context_tokens,
+            });
         }
         Ok(())
     }
@@ -141,6 +171,7 @@ mod tests {
         let result = generator
             .generate(&model, &tokenizer, &backend, "a", GenerationConfig {
                 max_new_tokens: 3,
+                max_context_tokens: 8,
                 temperature: 0.0,
                 top_k: 0,
                 top_p: 1.0,
@@ -158,6 +189,7 @@ mod tests {
         let mut generator = LlamaGenerator::new(7);
         let config = GenerationConfig {
             max_new_tokens: 1,
+            max_context_tokens: 8,
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -170,6 +202,7 @@ mod tests {
     fn seeded_sampling_repeats() {
         let config = GenerationConfig {
             max_new_tokens: 1,
+            max_context_tokens: 8,
             temperature: 1.0,
             top_k: 3,
             top_p: 1.0,
@@ -190,6 +223,31 @@ mod tests {
             ..GenerationConfig::default()
         };
         assert!(config.validate().is_err());
+
+        let zero_context = GenerationConfig {
+            max_context_tokens: 0,
+            ..GenerationConfig::default()
+        };
+        assert!(zero_context.validate().is_err());
+    }
+
+    #[test]
+    fn context_limit_accepts_exact_fit_and_rejects_overflow() {
+        let config = GenerationConfig {
+            max_new_tokens: 4,
+            max_context_tokens: 8,
+            ..GenerationConfig::default()
+        };
+
+        assert!(config.validate_context(4).is_ok());
+        assert!(matches!(
+            config.validate_context(5),
+            Err(GenerationError::ContextLimitExceeded {
+                prompt_tokens: 5,
+                max_new_tokens: 4,
+                limit: 8,
+            })
+        ));
     }
 }
 
@@ -214,6 +272,7 @@ impl LlamaGenerator {
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
         }
+        config.validate_context(prompt.len())?;
 
         let mut cache = LlamaKvCache::new(&model.config);
         let mut generated = prompt.to_vec();
@@ -349,6 +408,7 @@ impl Qwen35Generator {
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
         }
+        config.validate_context(prompt.len())?;
         let mut cache = Qwen35Cache::new(&model.config);
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
