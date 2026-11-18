@@ -202,9 +202,79 @@ pub struct LlamaGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qarnyx_core::{DType, TensorView};
+    use qarnyx_core::{Backend, BackendError, DType, TensorView};
     use qarnyx_models::{LlamaConfig, LlamaLayerStorage, LlamaModel};
     use qarnyx_tokenizer::GgufTokenizer;
+
+    struct CancellingBackend {
+        inner: qarnyx_cpu::CpuBackend,
+        cancellation: CancellationToken,
+    }
+
+    impl Backend for CancellingBackend {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn matvec(
+            &self,
+            weights: TensorView<'_>,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), BackendError> {
+            self.inner.matvec(weights, input, output)?;
+            self.cancellation.cancel();
+            Ok(())
+        }
+
+        fn matmul(
+            &self,
+            weights: TensorView<'_>,
+            input: &[f32],
+            output: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> Result<(), BackendError> {
+            self.inner.matmul(weights, input, output, m, n, k)
+        }
+
+        fn rms_norm(
+            &self,
+            input: &[f32],
+            weight: &[f32],
+            output: &mut [f32],
+            epsilon: f32,
+        ) -> Result<(), BackendError> {
+            self.inner.rms_norm(input, weight, output, epsilon)
+        }
+
+        fn rope(
+            &self,
+            input: &mut [f32],
+            position: usize,
+            head_dim: usize,
+            theta: f32,
+        ) -> Result<(), BackendError> {
+            self.inner.rope(input, position, head_dim, theta)
+        }
+
+        fn softmax(&self, input: &mut [f32]) -> Result<(), BackendError> {
+            self.inner.softmax(input)
+        }
+
+        fn silu_mul(&self, gate: &mut [f32], up: &[f32]) -> Result<(), BackendError> {
+            self.inner.silu_mul(gate, up)
+        }
+
+        fn residual_add(
+            &self,
+            target: &mut [f32],
+            residual: &[f32],
+        ) -> Result<(), BackendError> {
+            self.inner.residual_add(target, residual)
+        }
+    }
 
     fn matrix(data: &[f32], rows: usize, cols: usize) -> TensorView<'_> {
         let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -283,19 +353,23 @@ mod tests {
         assert_eq!(result.text, "aaaa");
 
         let cancellation = CancellationToken::new();
-        cancellation.cancel();
+        let cancelling_backend = CancellingBackend {
+            inner: qarnyx_cpu::CpuBackend::new(1).unwrap(),
+            cancellation: cancellation.clone(),
+        };
         let mut cancelled_generator = LlamaGenerator::new(123);
         assert!(matches!(
             cancelled_generator.generate_with_cancellation(
                 &model,
                 &tokenizer,
-                &backend,
+                &cancelling_backend,
                 "a",
                 config,
                 &cancellation,
             ),
             Err(GenerationError::Cancelled)
         ));
+        assert!(cancellation.is_cancelled());
     }
 
 
