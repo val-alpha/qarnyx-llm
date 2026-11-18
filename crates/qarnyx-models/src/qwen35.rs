@@ -116,6 +116,48 @@ impl Qwen35Config {
         }
         Ok(c)
     }
+
+    /// Estimates the retained per-session Qwen3.5 cache and scratch capacity.
+    ///
+    /// This includes recurrent/ convolution state, attention K/V capacity, and
+    /// reusable activation workspaces. Model weights and transient logits are
+    /// intentionally excluded.
+    pub fn estimated_cache_bytes(&self, context_tokens: usize) -> Option<usize> {
+        if self.recurrent_layers.len() < self.block_count {
+            return None;
+        }
+
+        let recurrent_layers = self.recurrent_layers[..self.block_count]
+            .iter()
+            .filter(|&&is_recurrent| is_recurrent)
+            .count();
+        let attention_layers = self.block_count.checked_sub(recurrent_layers)?;
+
+        let recurrent_floats = recurrent_layers.checked_mul(LH.checked_mul(LD)?.checked_mul(LD)?)?;
+        let convolution_floats = recurrent_layers
+            .checked_mul(LIN.checked_mul(3)?.checked_mul(CONV.checked_sub(1)?)?)?;
+        let kv_floats = attention_layers
+            .checked_mul(context_tokens.checked_mul(KV.checked_mul(2)?)?)?;
+
+        // Retained hidden ping-pong and every reusable workspace buffer.
+        let workspace_floats = [
+            H.checked_mul(4)?,
+            LIN.checked_mul(8)?,
+            LH.checked_mul(2)?,
+            FF.checked_mul(2)?,
+            Q.checked_mul(5)?,
+            KV.checked_mul(2)?,
+            context_tokens,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)?;
+
+        recurrent_floats
+            .checked_add(convolution_floats)?
+            .checked_add(kv_floats)?
+            .checked_add(workspace_floats)?
+            .checked_mul(std::mem::size_of::<f32>())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,15 +219,94 @@ pub struct Qwen35Cache {
 }
 impl Qwen35Cache {
     pub fn new(c: &Qwen35Config) -> Self {
-        let state = LH * LD * LD;
-        Self {
-            sequence_len: 0,
-            recurrent: (0..c.block_count).map(|_| vec![0.0; state]).collect(),
-            conv: (0..c.block_count).map(|_| vec![0.0; LIN * 3 * (CONV-1)]).collect(),
-            keys: (0..c.block_count).map(|_| Vec::new()).collect(),
-            values: (0..c.block_count).map(|_| Vec::new()).collect(),
-            scratch: Qwen35Scratch::default(),
+        Self::with_context_capacity(c, 0)
+            .expect("Qwen3.5 cache dimensions must fit in memory")
+    }
+
+    /// Creates a session cache with K/V and workspace capacity reserved up front.
+    pub fn with_context_capacity(
+        c: &Qwen35Config,
+        context_tokens: usize,
+    ) -> Result<Self, ModelError> {
+        if c.recurrent_layers.len() < c.block_count {
+            return Err(ModelError::InvalidConfig(
+                "Qwen3.5 recurrent layer map is shorter than block_count",
+            ));
         }
+        let kv_capacity = context_tokens
+            .checked_mul(KV)
+            .ok_or(ModelError::InvalidConfig("Qwen3.5 KV cache capacity overflow"))?;
+        let state = LH * LD * LD;
+        let convolution = LIN * 3 * (CONV - 1);
+        let recurrent = (0..c.block_count)
+            .map(|index| {
+                if c.recurrent_layers[index] {
+                    vec![0.0; state]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let conv = (0..c.block_count)
+            .map(|index| {
+                if c.recurrent_layers[index] {
+                    vec![0.0; convolution]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let keys = (0..c.block_count)
+            .map(|index| {
+                if c.recurrent_layers[index] {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(kv_capacity)
+                }
+            })
+            .collect();
+        let values = (0..c.block_count)
+            .map(|index| {
+                if c.recurrent_layers[index] {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(kv_capacity)
+                }
+            })
+            .collect();
+
+        let workspace = Qwen35Workspace {
+            norm: Vec::with_capacity(H),
+            qkv: Vec::with_capacity(LIN * 3),
+            z: Vec::with_capacity(LIN),
+            beta: Vec::with_capacity(LH),
+            alpha: Vec::with_capacity(LH),
+            conv_output: Vec::with_capacity(LIN * 3),
+            core: Vec::with_capacity(LIN),
+            layer_hidden: Vec::with_capacity(H),
+            ffn_gate: Vec::with_capacity(FF),
+            ffn_up: Vec::with_capacity(FF),
+            qg: Vec::with_capacity(Q * 2),
+            k: Vec::with_capacity(KV),
+            v: Vec::with_capacity(KV),
+            q: Vec::with_capacity(Q),
+            gate: Vec::with_capacity(Q),
+            attention: Vec::with_capacity(Q),
+            scores: Vec::with_capacity(context_tokens),
+        };
+
+        Ok(Self {
+            sequence_len: 0,
+            recurrent,
+            conv,
+            keys,
+            values,
+            scratch: Qwen35Scratch {
+                hidden_a: Vec::with_capacity(H),
+                hidden_b: Vec::with_capacity(H),
+                workspace,
+            },
+        })
     }
     pub fn clear(&mut self) {
         self.sequence_len = 0;
@@ -1008,6 +1129,43 @@ mod recurrent_head_tests {
         assert!(ssm_decay_factor(0.1, 0.0, 0.0).is_err());
         assert!(ssm_decay_factor(f32::NAN, 0.0, 0.0).is_err());
         assert!(ssm_decay_factor(-0.1, f32::INFINITY, 0.0).is_err());
+    }
+
+    #[test]
+    fn qwen_cache_estimate_tracks_attention_context_and_checks_overflow() {
+        let config = Qwen35Config {
+            block_count: 2,
+            embedding_length: H,
+            feed_forward_length: FF,
+            attention_head_count: FH,
+            attention_head_count_kv: 2,
+            attention_key_length: FHD,
+            attention_value_length: FHD,
+            rms_epsilon: 1.0e-5,
+            rope_theta: 1.0,
+            rope_dimension: ROPE,
+            conv_kernel: CONV,
+            state_size: LD,
+            group_count: LH,
+            time_step_rank: LH,
+            inner_size: LIN,
+            recurrent_layers: vec![true, false],
+        };
+
+        let base = config.estimated_cache_bytes(0).unwrap();
+        let two_tokens = config.estimated_cache_bytes(2).unwrap();
+        assert_eq!(
+            two_tokens - base,
+            2 * KV * 2 * std::mem::size_of::<f32>()
+        );
+        assert!(config.estimated_cache_bytes(usize::MAX).is_none());
+
+        let cache = Qwen35Cache::with_context_capacity(&config, 2).unwrap();
+        assert_eq!(cache.recurrent[0].len(), LH * LD * LD);
+        assert!(cache.recurrent[1].is_empty());
+        assert!(cache.keys[0].is_empty());
+        assert_eq!(cache.keys[1].capacity(), 2 * KV);
+        assert_eq!(cache.values[1].capacity(), 2 * KV);
     }
 
     #[test]
