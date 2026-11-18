@@ -117,10 +117,13 @@ opt-in pending broader validation. `scalar` remains the non-SIMD correctness
 reference.
 
 Generation is capped at 4096 combined prompt and requested output tokens by
-default. Use `--max-context-tokens N` to set a different per-request limit;
-the runtime checks the requested length before allocating the generation
-cache. This is an operational safety limit, not a declaration of the model's
-native context window.
+default. Use `--max-context-tokens N` to set a different per-request limit.
+The retained per-session KV/recurrent cache and Qwen3.5 workspace also have a
+512 MiB default budget; use `--max-cache-mib N` to adjust it. Both limits are
+checked before cache allocation, and cache/workspace capacity is reserved up
+front. The cache budget excludes model weights and transient logits/outputs;
+it is not a process-wide RSS limit. Neither default changes the model's native
+context window.
 
 ## Development
 
@@ -164,10 +167,11 @@ portable binaries without an appropriate dispatch/build strategy.
    are also implemented and covered by differential tests. Three-round VPS
    microbenchmarks show median gains for Q5_K/Q6_K, varying by worker count;
    representative-model validation, AVX-512, and NEON remain outstanding.
-8. **M7 - Operational hardening:** an initial combined prompt/output context
-   cap (default 4096, configurable from the CLI) is implemented before cache
-   allocation. Broader memory budgets, cancellation, session isolation,
-   stress tests, and reproducible benchmarks remain planned.
+8. **M7 - Operational hardening:** combined prompt/output context cap
+   (default 4096) and a per-session cache/workspace memory budget (default
+   512 MiB) are implemented before cache allocation. Broader process memory
+   budgets, cancellation, session isolation, stress tests, and reproducible
+   benchmarks remain planned.
 
 ## Non-goals for the first milestone
 
