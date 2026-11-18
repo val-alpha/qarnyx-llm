@@ -570,6 +570,41 @@ worker is near parity. Keep the fused mode opt-in until representative real
 models confirm output correctness and end-to-end gains. No default kernel
 selection was changed by M6-F.
 
+### Qwen3.5 SSM decay correction — implemented; target validation pending
+
+The Qwen3.5 GGUF converter transforms each Hugging Face `A_log` tensor into
+`ssm_a = -exp(A_log)` before writing the GGUF. Qarnyx loads `ssm_a` directly
+from that GGUF tensor, so it is already the non-positive decay coefficient.
+The recurrent update must therefore use:
+
+```text
+decay = exp(ssm_a * softplus(alpha + dt))
+```
+
+The previous Qarnyx expression applied `exp()` to `ssm_a` again, treating the
+pre-transformed GGUF value as raw `A_log`. This was a semantic correctness
+bug, not a performance optimization. The implementation now computes the
+decay factor once per head before dispatch, rejects positive/non-finite
+`ssm_a` values and non-finite `alpha + dt`, and uses the same formula in the
+serial test reference. Regression tests distinguish the corrected formula
+from the previous double-exponential interpretation.
+
+**Implementation:** commit
+`bd8f30522005d214b1d297948f2f2fd87de5b3f6` on `main`.
+
+**Validation status:** the source change and regression tests are committed,
+but this session could not run `cargo check` or `cargo test` because the
+isolated environment could not resolve GitHub for a repository checkout.
+Run workspace check/tests on the target Ubuntu machine, then compare a fixed
+greedy Qwen3.5 prompt against a known-good reference such as llama.cpp.
+Because this is a correctness fix, output differing from the old Qarnyx
+binary is not by itself a failure; compare against the reference implementation
+and inspect token IDs / generated text under matched settings.
+
+Reference: llama.cpp's Qwen converter maps tensors ending in `.A_log` to
+`-torch.exp(data_torch)` before writing GGUF:
+<https://github.com/ggml-org/llama.cpp/blob/master/conversion/qwen.py>.
+
 ### Later research — prefill batching and file-backed weights
 
 These are larger follow-on projects:
