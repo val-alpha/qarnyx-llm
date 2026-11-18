@@ -117,6 +117,59 @@ production recommendation.
 - Synthetic kernel benchmarks are useful for kernel comparisons but do not
   replace a representative GGUF end-to-end run.
 
+
+## User-reported VPS Q4_K end-to-end comparison (2026-11-19)
+
+A three-run comparison was reported from an Ubuntu VPS using the release CLI
+and the following workload:
+
+- Model: `Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf`
+- Prompt: `model apa kamu`
+- Generated tokens: 32, greedy sampling (`temperature=0`, `top-k=0`,
+  `top-p=1`)
+- Workers: 10
+- Kernel modes: `scalar`, `auto`, and `fused-q4k`
+- Limits: `max-context-tokens=4096`, `max-cache-mib=512`,
+  `max-memory-mib=8192`
+- Trials: three per kernel, with no separate warm-up trial reported
+- Measurement: GNU `/usr/bin/time` elapsed wall time (`%e`) and peak RSS
+  (`%M`)
+
+| Kernel | Run 1 (s) | Run 2 (s) | Run 3 (s) | Mean (s) | Median (s) |
+|---|---:|---:|---:|---:|---:|
+| scalar | 28.74 | 29.19 | 29.20 | 29.04 | 29.19 |
+| auto | 18.73 | 19.30 | 19.36 | 19.13 | 19.30 |
+| fused-q4k | 15.23 | 15.52 | 16.15 | 15.63 | 15.52 |
+
+Using the three-run means, `auto` reduced end-to-end wall time by about
+34.1% versus `scalar`. `fused-q4k` reduced it by about 46.2% versus
+`scalar`, and by about 18.3% versus `auto`.
+
+All nine runs produced the same output SHA-256:
+
+```text
+c5413d2a495ace3cbb7d89f3729c1a408cd77316add0fb50fa986736a559cb11
+```
+
+The highest observed peak RSS across these runs was 1,362,372 KiB (about
+1.30 GiB). The observed peak RSS values were close across kernel modes.
+
+**Interpretation:** these are whole-process timings, not isolated kernel
+timings. They include model reading, GGUF/tokenizer setup, backend
+initialization, and generation. The elapsed values were printed to 0.01-second
+precision by GNU `time`. The benchmark log did not record the VPS CPU model,
+available vCPUs, Rust/Cargo versions, exact source revision, or a separate
+warm-up, so this is a useful host-specific preliminary result rather than a
+fully specified cross-machine benchmark.
+
+The `scalar` mode disables SIMD arithmetic, but it does **not** disable the
+Rayon worker pool. The run configured 10 workers for all three modes; eligible
+large matvec/matmul row work and projection batches can still use the shared
+persistent pool. Small operations may remain sequential. Therefore this
+comparison measures kernel modes under the same configured worker-pool policy;
+it is not a comparison of single-thread scalar against multithreaded SIMD.
+
+
 ## Known benchmark limitations
 
 The current CLI runs one blocking generation per process and prints the final
