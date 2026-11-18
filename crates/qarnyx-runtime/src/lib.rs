@@ -266,20 +266,36 @@ mod tests {
         let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
         let mut generator = LlamaGenerator::new(123);
 
+        let config = GenerationConfig {
+            max_new_tokens: 3,
+            max_context_tokens: 8,
+            max_cache_mib: 512,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 123,
+        };
         let result = generator
-            .generate(&model, &tokenizer, &backend, "a", GenerationConfig {
-                max_new_tokens: 3,
-                max_context_tokens: 8,
-                max_cache_mib: 512,
-                temperature: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                seed: 123,
-            })
+            .generate(&model, &tokenizer, &backend, "a", config)
             .unwrap();
 
         assert_eq!(result.token_ids, [0, 0, 0, 0]);
         assert_eq!(result.text, "aaaa");
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut cancelled_generator = LlamaGenerator::new(123);
+        assert!(matches!(
+            cancelled_generator.generate_with_cancellation(
+                &model,
+                &tokenizer,
+                &backend,
+                "a",
+                config,
+                &cancellation,
+            ),
+            Err(GenerationError::Cancelled)
+        ));
     }
 
 
@@ -447,6 +463,7 @@ impl LlamaGenerator {
         for _ in 0..config.max_new_tokens {
             cancellation.check()?;
             let next = self.sample(&logits, config)?;
+            cancellation.check()?;
             generated.push(next);
             if tokenizer.eos_token_id == Some(next) {
                 break;
@@ -456,6 +473,7 @@ impl LlamaGenerator {
             logits = model.forward_logits(backend, next, position, &mut cache)?;
         }
 
+        cancellation.check()?;
         let text = tokenizer.decode(&generated)?;
         Ok(GenerationResult {
             token_ids: generated,
@@ -638,6 +656,7 @@ impl Qwen35Generator {
         for _ in 0..config.max_new_tokens {
             cancellation.check()?;
             let next = self.sample(&logits, config)?;
+            cancellation.check()?;
             generated.push(next);
             if tokenizer.eos_token_id == Some(next) {
                 break;
@@ -652,6 +671,7 @@ impl Qwen35Generator {
             }
         }
 
+        cancellation.check()?;
         if profiling {
             eprintln!("{}", profile.report());
         }
