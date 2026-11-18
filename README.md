@@ -80,10 +80,12 @@ The CPU backend executes matrix-vector and matrix-matrix operations with all
 currently registered storage types. The default `auto` backend dequantizes
 Q4_K rows into reusable F32 scratch before the AVX2/FMA dot product.
 The opt-in `fused-q4k` mode evaluates Q4_K directly from packed blocks using
-runtime AVX2/FMA on supported x86_64 CPUs, with the scalar direct-block kernel
-as fallback; it does not materialize an F32 weight row. Other quantized formats
-still decode one active row at a time, and the full weight matrix is never
-expanded.
+runtime AVX2/FMA on supported x86_64 CPUs. The opt-in `fused-qk` mode extends
+direct-block matvec to Q4_K, Q5_K, and Q6_K, using AVX2 for Q5_K/Q6_K on
+supported x86_64 CPUs and scalar direct-block fallbacks elsewhere. These
+experimental paths do not materialize an F32 weight row. Other quantized
+formats still decode one active row at a time, and the full weight matrix is
+never expanded.
 
 Large matvec/matmul output rows and independent Qwen3.5 projection batches use
 the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
@@ -93,8 +95,10 @@ and reused across tokens/layers rather than repeatedly allocating the same
 intermediate buffers.
 
 Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
-The harness compares the scalar reference, default runtime dispatch, and
-opt-in fused Q4_K matvec paths.
+The harness compares scalar/reference and runtime-dispatched matvec paths,
+including opt-in fused Q4_K/Q5_K/Q6_K comparisons at selected worker counts.
+Cargo's bench profile is optimized by default; do not pass `--release` to
+`cargo bench`.
 
 To compare end-to-end generation using the same model and prompt, select a
 kernel mode explicitly:
@@ -103,12 +107,14 @@ kernel mode explicitly:
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-q4k
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-qk
 ```
 
 The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
-`fused-q4k` enables the experimental direct-block Q4_K matvec while retaining
-AVX2/FMA for other eligible kernels. `scalar` remains the non-SIMD
-correctness reference.
+`fused-q4k` enables the experimental direct-block Q4_K matvec;
+`fused-qk` enables direct-block Q4_K/Q5_K/Q6_K matvecs. Both modes remain
+opt-in pending broader validation. `scalar` remains the non-SIMD correctness
+reference.
 
 ## Development
 
@@ -148,9 +154,10 @@ portable binaries without an appropriate dispatch/build strategy.
    Rayon pool, parallel Qwen3.5 recurrent heads, shared-pool multi-projection
    scheduling, per-session activation scratch reuse, and opt-in direct-block
    Q4_K AVX2/FMA are implemented with scalar fallbacks and correctness tests.
-   Target-machine before/after measurements for the B/C/D additions are still
-   pending. Fused Q5_K/Q6_K kernels, further SIMD work, AVX-512, and NEON remain
-   planned.
+   Opt-in direct-block Q5_K/Q6_K AVX2 matvecs are also implemented and covered
+   by differential tests. Target-machine microbenchmarks have been captured,
+   but Q5_K is worker-count-sensitive and Q6_K is near parity; broader
+   representative-model validation, AVX-512, and NEON remain outstanding.
 8. **M7 - Operational hardening:** add resource limits, cancellation, session
    isolation, stress tests, and reproducible benchmarks.
 
