@@ -136,8 +136,13 @@ pub struct LlamaKvCache {
 
 impl LlamaKvCache {
     pub fn new(config: &LlamaConfig) -> Self {
-        Self::with_context_capacity(config, 1)
-            .expect("LLaMA KV cache dimensions must fit in memory")
+        let key_width = config.attention_head_count_kv * config.attention_key_length;
+        let value_width = config.attention_head_count_kv * config.attention_value_length;
+        Self {
+            keys: vec![Vec::with_capacity(key_width); config.block_count],
+            values: vec![Vec::with_capacity(value_width); config.block_count],
+            sequence_len: 0,
+        }
     }
 
     /// Creates a KV cache with per-layer capacity reserved for the full context.
