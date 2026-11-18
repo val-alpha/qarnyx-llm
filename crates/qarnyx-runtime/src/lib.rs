@@ -464,9 +464,9 @@ mod tests {
                     for request_id in 0..REQUESTS_PER_SESSION {
                         let result = generator
                             .generate_ids(
-                                &model,
-                                &tokenizer,
-                                &backend,
+                                model.as_ref(),
+                                tokenizer.as_ref(),
+                                backend.as_ref(),
                                 &[prompt_id],
                                 config,
                             )
