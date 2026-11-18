@@ -52,6 +52,9 @@ enum Command {
         /// Maximum accounted model-file plus session-cache budget in MiB.
         #[arg(long, default_value_t = 8192)]
         max_memory_mib: usize,
+        /// Enable Qwen3.5 reasoning output (disabled by default).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        thinking: bool,
         /// Sampling temperature; zero selects greedy decoding.
         #[arg(long, default_value_t = 0.8)]
         temperature: f32,
@@ -101,6 +104,7 @@ fn main() -> anyhow::Result<()> {
             max_context_tokens,
             max_cache_mib,
             max_memory_mib,
+            thinking,
             temperature,
             top_k,
             top_p,
@@ -114,6 +118,7 @@ fn main() -> anyhow::Result<()> {
             max_context_tokens,
             max_cache_mib,
             max_memory_mib,
+            thinking,
             temperature,
             top_k,
             top_p,
@@ -239,6 +244,7 @@ fn generate_model(
     max_context_tokens: usize,
     max_cache_mib: usize,
     max_memory_mib: usize,
+    thinking: bool,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -274,7 +280,7 @@ fn generate_model(
         Some("qwen35") => {
             let model = Qwen35Model::from_gguf(&gguf, &data)?;
             let mut generator = Qwen35Generator::new(seed);
-            let prompt_tokens = tokenizer.encode_qwen35_chat_prompt(prompt)?;
+            let prompt_tokens = tokenizer.encode_qwen35_chat_prompt(prompt, thinking)?;
             let result = match generator.generate_ids_with_cancellation(
                 &model,
                 &tokenizer,
@@ -295,6 +301,9 @@ fn generate_model(
             println!("{generated_text}");
         }
         Some("llama") => {
+            if thinking {
+                anyhow::bail!("--thinking is currently supported only for Qwen3.5");
+            }
             let model = LlamaModel::from_gguf(&gguf, &data)?;
             let mut generator = LlamaGenerator::new(seed);
             let result = match generator.generate_with_cancellation(
@@ -344,5 +353,39 @@ mod memory_budget_tests {
         assert!(model_file_budget_bytes(0, 1).is_err());
         assert!(model_file_budget_bytes(8192, 0).is_err());
         assert!(model_file_budget_bytes(usize::MAX, 1).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_is_disabled_by_default_and_can_be_enabled() {
+        let default_cli = Cli::try_parse_from([
+            "qarnyx",
+            "generate",
+            "model.gguf",
+            "hello",
+        ])
+        .unwrap();
+        assert!(matches!(
+            default_cli.command,
+            Some(Command::Generate { thinking: false, .. })
+        ));
+
+        let thinking_cli = Cli::try_parse_from([
+            "qarnyx",
+            "generate",
+            "model.gguf",
+            "hello",
+            "--thinking",
+        ])
+        .unwrap();
+        assert!(matches!(
+            thinking_cli.command,
+            Some(Command::Generate { thinking: true, .. })
+        ));
     }
 }

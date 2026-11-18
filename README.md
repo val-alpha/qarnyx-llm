@@ -110,6 +110,9 @@ kernel mode explicitly:
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-qk
 ```
 
+For Qwen3.5, add `--thinking` to enable model reasoning output; without the
+flag the CLI uses the non-thinking prefix.
+
 The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
 `fused-q4k` enables the experimental direct-block Q4_K matvec;
 `fused-qk` enables direct-block Q4_K/Q5_K/Q6_K matvecs. Both modes remain
@@ -134,8 +137,10 @@ transient logits/outputs, allocator overhead, and other process memory are
 excluded.
 
 For Qwen3.5 text generation, the CLI encodes a single-turn chat prompt using
-the model's ChatML control tokens and the non-thinking assistant prefix. It
-prints only newly generated token text, not the input prompt.
+the model's ChatML control tokens. Non-thinking is the default; pass
+`--thinking` to leave the reasoning block open and include generated reasoning
+in the output. The CLI prints only newly generated text, excluding the input
+prompt and turn-ending control tokens.
 
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its

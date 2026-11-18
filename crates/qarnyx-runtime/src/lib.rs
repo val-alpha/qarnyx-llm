@@ -538,10 +538,10 @@ impl LlamaGenerator {
             cancellation.check()?;
             let next = self.sample(&logits, config)?;
             cancellation.check()?;
-            generated.push(next);
-            if tokenizer.eos_token_id == Some(next) {
+            if tokenizer.is_end_of_turn(next) {
                 break;
             }
+            generated.push(next);
 
             let position = cache.sequence_len();
             logits = model.forward_logits(backend, next, position, &mut cache)?;
@@ -731,10 +731,10 @@ impl Qwen35Generator {
             cancellation.check()?;
             let next = self.sample(&logits, config)?;
             cancellation.check()?;
-            generated.push(next);
-            if tokenizer.eos_token_id == Some(next) {
+            if tokenizer.is_end_of_turn(next) {
                 break;
             }
+            generated.push(next);
             let position = cache.sequence_len;
             if profiling {
                 logits = model.forward_logits_profiled(

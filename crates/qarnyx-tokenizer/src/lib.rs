@@ -132,20 +132,40 @@ impl GgufTokenizer {
         }
     }
 
-    /// Formats a single-turn, text-only Qwen3.5 chat prompt with thinking
-    /// disabled, then encodes its control tokens atomically.
+    /// Formats a single-turn, text-only Qwen3.5 chat prompt.
+    ///
+    /// Thinking mode leaves the assistant inside its reasoning block.
+    /// Non-thinking mode prefills an empty reasoning block before the answer.
     pub fn encode_qwen35_chat_prompt(
         &self,
         prompt: &str,
+        enable_thinking: bool,
     ) -> Result<Vec<usize>, TokenizerError> {
         if self.model != "gpt2" || self.pre.as_deref() != Some("qwen35") {
             return Err(TokenizerError::UnsupportedModel(self.model.clone()));
         }
 
+        let assistant_prefix = if enable_thinking {
+            "<think>\n"
+        } else {
+            "<think>\n\n</think>\n\n"
+        };
         let formatted = format!(
-            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{assistant_prefix}"
         );
         self.encode(&formatted)
+    }
+
+    /// Returns whether a token terminates an assistant turn.
+    ///
+    /// Qwen3.5 GGUFs may expose the turn-ending marker separately from the
+    /// tokenizer's single EOS ID, so recognize known end markers by spelling.
+    pub fn is_end_of_turn(&self, token_id: usize) -> bool {
+        self.eos_token_id == Some(token_id)
+            || matches!(
+                self.tokens.get(token_id).map(String::as_str),
+                Some("<|im_end|>" | "<|fim_suffix|>" | "<|endoftext|>")
+            )
     }
 
     fn encode_vocab_pieces(&self, text: &str) -> Result<Vec<usize>, TokenizerError> {
@@ -600,9 +620,60 @@ mod tests {
         };
 
         assert_eq!(
-            tokenizer.encode_qwen35_chat_prompt("hi").unwrap(),
+            tokenizer.encode_qwen35_chat_prompt("hi", false).unwrap(),
             [0, 4, 5, 6, 1, 5, 0, 7, 5, 2, 8, 3, 8]
         );
+    }
+
+    #[test]
+    fn qwen35_chat_prompt_leaves_reasoning_open_when_enabled() {
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![
+                "<|im_start|>".into(),
+                "<|im_end|>".into(),
+                "<think>".into(),
+                "</think>".into(),
+                "user".into(),
+                "\n".into(),
+                "hi".into(),
+                "assistant".into(),
+                "\n\n".into(),
+            ],
+            scores: vec![0.0; 9],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+
+        assert_eq!(
+            tokenizer.encode_qwen35_chat_prompt("hi", true).unwrap(),
+            [0, 4, 5, 6, 1, 5, 0, 7, 5, 2, 5]
+        );
+    }
+
+    #[test]
+    fn recognizes_qwen35_turn_end_markers() {
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![
+                "<|im_end|>".into(),
+                "<|fim_suffix|>".into(),
+                "ordinary".into(),
+                "<|endoftext|>".into(),
+            ],
+            scores: vec![0.0; 4],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: Some(2),
+        };
+
+        assert!(tokenizer.is_end_of_turn(0));
+        assert!(tokenizer.is_end_of_turn(1));
+        assert!(tokenizer.is_end_of_turn(2));
+        assert!(tokenizer.is_end_of_turn(3));
     }
 
     #[test]
