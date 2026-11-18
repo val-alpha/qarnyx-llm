@@ -42,6 +42,9 @@ enum Command {
         /// Maximum number of generated tokens.
         #[arg(long, default_value_t = 128)]
         max_new_tokens: usize,
+        /// Maximum combined prompt and generated sequence length.
+        #[arg(long, default_value_t = 4096)]
+        max_context_tokens: usize,
         /// Sampling temperature; zero selects greedy decoding.
         #[arg(long, default_value_t = 0.8)]
         temperature: f32,
@@ -88,6 +91,7 @@ fn main() -> anyhow::Result<()> {
             model,
             prompt,
             max_new_tokens,
+            max_context_tokens,
             temperature,
             top_k,
             top_p,
@@ -98,6 +102,7 @@ fn main() -> anyhow::Result<()> {
             &model,
             &prompt,
             max_new_tokens,
+            max_context_tokens,
             temperature,
             top_k,
             top_p,
@@ -160,6 +165,7 @@ fn generate_model(
     path: &std::path::Path,
     prompt: &str,
     max_new_tokens: usize,
+    max_context_tokens: usize,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -178,6 +184,7 @@ fn generate_model(
     };
     let config = GenerationConfig {
         max_new_tokens,
+        max_context_tokens,
         temperature,
         top_k,
         top_p,
