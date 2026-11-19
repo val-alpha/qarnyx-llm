@@ -402,7 +402,7 @@ fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
 struct Q8KBlock {
     d: f32,
     qs: [i8; 256],
-    bsums: [i16; 16],
+    sums32: [i16; 8],
 }
 
 fn quantize_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>, BackendError> {
@@ -440,7 +440,7 @@ fn quantize_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>, BackendError> {
         let mut block = Q8KBlock {
             d,
             qs: [0; 256],
-            bsums: [0; 16],
+            sums32: [0; 8],
         };
 
         if d > 0.0 {
@@ -449,9 +449,9 @@ fn quantize_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>, BackendError> {
             }
         }
 
-        for group in 0..16 {
-            let start = group * 16;
-            block.bsums[group] = block.qs[start..start + 16]
+        for group in 0..8 {
+            let start = group * 32;
+            block.sums32[group] = block.qs[start..start + 32]
                 .iter()
                 .map(|value| i16::from(*value))
                 .sum();
@@ -493,8 +493,7 @@ fn dot_q4_k_q8_k_scalar(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 dot += i32::from(quant) * i32::from(activations.qs[input_offset + index]);
             }
 
-            let input_sum = i32::from(activations.bsums[group * 2])
-                + i32::from(activations.bsums[group * 2 + 1]);
+            let input_sum = i32::from(activations.sums32[group]);
             total += scaled_d * f32::from(local_scale) * dot as f32
                 - scaled_min_d * f32::from(local_min) * input_sum as f32;
         }
@@ -539,11 +538,14 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 );
                 let products = _mm256_maddubs_epi16(unpacked, activation_bytes);
                 let pair_sums = _mm256_madd_epi16(products, ones);
-                let mut lanes = [0_i32; 8];
-                _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), pair_sums);
-                let dot = lanes.iter().map(|value| i64::from(*value)).sum::<i64>() as f32;
-                let input_sum = i32::from(activations.bsums[group * 2])
-                    + i32::from(activations.bsums[group * 2 + 1]);
+                let pair_sums = _mm256_hadd_epi32(pair_sums, pair_sums);
+                let pair_sums = _mm256_hadd_epi32(pair_sums, pair_sums);
+                let dot_lanes = _mm_add_epi32(
+                    _mm256_castsi256_si128(pair_sums),
+                    _mm256_extracti128_si256::<1>(pair_sums),
+                );
+                let dot = _mm_cvtsi128_si32(dot_lanes) as f32;
+                let input_sum = i32::from(activations.sums32[group]);
 
                 total += d * f32::from(local_scale) * dot
                     - min_d * f32::from(local_min) * input_sum as f32;
