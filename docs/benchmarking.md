@@ -170,6 +170,73 @@ comparison measures kernel modes under the same configured worker-pool policy;
 it is not a comparison of single-thread scalar against multithreaded SIMD.
 
 
+
+## User-reported VPS Rayon worker scaling (2026-11-19)
+
+A clean 18-run matrix was reported from the Ubuntu VPS. The script validated
+exactly 18 data rows, six kernel/worker groups, runs 1-3 in every group, and
+one output hash shared by all runs.
+
+Workload:
+
+- Model: `Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf`
+- Prompt: `model apa kamu`
+- Generated tokens: 32, greedy sampling (`temperature=0`, `top-k=0`,
+  `top-p=1`)
+- Kernel modes: `scalar`, `auto`, and `fused-q4k`
+- Worker counts: 1 and 10
+- Limits: `max-context-tokens=4096`, `max-cache-mib=512`,
+  `max-memory-mib=8192`
+- Trials: three per kernel/worker combination; no separate warm-up trial
+  reported
+- Measurement: GNU `/usr/bin/time` elapsed wall time (`%e`) and peak RSS
+  (`%M`)
+
+| Kernel | Workers | Run 1 (s) | Run 2 (s) | Run 3 (s) | Mean (s) | Median (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| scalar | 1 | 200.47 | 201.76 | 209.48 | 203.90 | 201.76 |
+| scalar | 10 | 35.64 | 35.47 | 34.70 | 35.27 | 35.47 |
+| auto | 1 | 106.05 | 106.40 | 105.55 | 106.00 | 106.05 |
+| auto | 10 | 25.48 | 26.83 | 28.68 | 27.00 | 26.83 |
+| fused-q4k | 1 | 83.16 | 85.11 | 89.36 | 85.88 | 85.11 |
+| fused-q4k | 10 | 21.24 | 20.71 | 19.71 | 20.55 | 20.71 |
+
+Based on the three-run means, moving from 1 to 10 configured workers reduced
+whole-process wall time by approximately:
+
+- `scalar`: 5.78x speedup (82.7% less elapsed time)
+- `auto`: 3.93x speedup (74.5% less elapsed time)
+- `fused-q4k`: 4.18x speedup (76.1% less elapsed time)
+
+All 18 runs produced the same output SHA-256:
+
+```text
+c5413d2a495ace3cbb7d89f3729c1a408cd77316add0fb50fa986736a559cb11
+```
+
+The highest observed peak RSS in this matrix was 1,363,780 KiB (about
+1.30 GiB). RSS remained in a similar range across worker counts and kernels.
+
+**Interpretation:** the result shows a substantial benefit from the 10-worker
+configuration on this host for this workload. It is not a pure measurement of
+Rayon overhead: each CLI process also reads the model, initializes the GGUF
+and tokenizer, constructs the backend, and performs generation. The
+`scalar` mode disables SIMD arithmetic, not the worker pool; with 10 workers,
+eligible large row operations can still use Rayon. With one configured worker,
+the backend owns a one-thread pool and its parallel helpers take sequential
+paths where appropriate. Small operations can remain sequential at either
+worker count.
+
+The measured times differ from the earlier three-kernel, 10-worker comparison
+in this document (notably for `auto` and `fused-q4k`). Treat these results as
+a separate run rather than combining the two samples. Whole-process timings
+can vary with VPS contention and scheduling. The VPS CPU model, available
+vCPUs, Rust/Cargo versions, and exact source revision were not recorded, and
+there was no separate warm-up; repeat on a quiet host before selecting a
+permanent worker default. This matrix compares only 1 and 10 workers and does
+not establish whether 2, 4, 6, or 8 workers would be optimal.
+
+
 ## Known benchmark limitations
 
 The current CLI runs one blocking generation per process and prints the final
