@@ -85,7 +85,7 @@ pub struct CpuBackend {
     simd_enabled: bool,
     fused_q4k_matvec: bool,
     fused_q5k_q6k_matvec: bool,
-    fused_q4k_fma_matvec: bool,
+    fused_kq_fma_matvec: bool,
 }
 
 impl CpuBackend {
@@ -117,11 +117,11 @@ impl CpuBackend {
         Self::with_options(worker_count, true, true, true, false)
     }
 
-    /// Creates an experimental Q4_K AVX2/FMA path using the original F32 input.
+    /// Creates experimental AVX2/FMA direct-block kernels for Q4_K, Q5_K, and Q6_K.
     ///
-    /// This is an A/B alternative to the Q4_K x Q8_K integer kernel selected by
-    /// new_fused_q4k. It is intended for benchmarking, not as the default.
-    pub fn new_fused_q4k_fma(worker_count: usize) -> Result<Self, CpuBackendError> {
+    /// These consume the original F32 activation vector and are an A/B alternative
+    /// to the existing direct-block kernels. They are not selected by default.
+    pub fn new_fused_kq_fma(worker_count: usize) -> Result<Self, CpuBackendError> {
         Self::with_options(worker_count, true, false, false, true)
     }
 
@@ -130,7 +130,7 @@ impl CpuBackend {
         simd_enabled: bool,
         fused_q4k_matvec: bool,
         fused_q5k_q6k_matvec: bool,
-        fused_q4k_fma_matvec: bool,
+        fused_kq_fma_matvec: bool,
     ) -> Result<Self, CpuBackendError> {
         if worker_count == 0 {
             return Err(CpuBackendError::ZeroWorkers);
@@ -149,7 +149,7 @@ impl CpuBackend {
             simd_enabled,
             fused_q4k_matvec,
             fused_q5k_q6k_matvec,
-            fused_q4k_fma_matvec,
+            fused_kq_fma_matvec,
         })
     }
 
@@ -209,18 +209,27 @@ impl CpuBackend {
         dot_q4_k_q8_k_scalar(encoded, input)
     }
 
-    fn fused_q4k_fma_dot(
+    fn fused_kq_fma_dot(
         &self,
+        dtype: DType,
         encoded: &[u8],
         input: &[f32],
         group_sums: &[f32],
     ) -> Result<f32, BackendError> {
         #[cfg(target_arch = "x86_64")]
         if self.simd_enabled && self.features.avx2 && self.features.fma {
-            return Ok(kq::dot_q4_k(encoded, input, group_sums));
+            return match dtype {
+                DType::Q4K => Ok(kq::dot_q4_k(encoded, input, group_sums)),
+                DType::Q5K => Ok(kq::dot_q5_k(encoded, input, group_sums)),
+                DType::Q6K => Ok(kq::dot_q6_k(encoded, input)),
+                _ => Err(invalid_parameter(
+                    "matvec",
+                    "experimental fused K-quantized dot received a non K-quantized tensor",
+                )),
+            };
         }
 
-        self.fused_q4k_dot(encoded, input)
+        self.fused_k_dot(dtype, encoded, input)
     }
 
     fn fused_q5k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
@@ -1164,19 +1173,20 @@ impl Backend for CpuBackend {
 
         let workers = self.worker_count.min(out_features);
         let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
-        let fused_q4k_fma = self.fused_q4k_fma_matvec && weights.dtype == DType::Q4K;
+        let fused_kq_fma = self.fused_kq_fma_matvec
+            && matches!(weights.dtype, DType::Q4K | DType::Q5K | DType::Q6K);
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
         // Q8_K activation quantization pays off for the wide hidden dimensions
         // used by Qwen3.5 and is performed once per matvec, not once per row.
-        let q8k_input = if fused_q4k && !fused_q4k_fma && in_features >= 2048 && self.uses_avx2() {
+        let q8k_input = if fused_q4k && !fused_kq_fma && in_features >= 2048 && self.uses_avx2() {
             Some(quantize_q8_k(input)?)
         } else {
             None
         };
 
-        // The alternative F32-input Q4_K kernel needs one sum per 32-element
-        // activation group. Compute those once per matvec and share them with
-        // every output row, mirroring the reference branch's K-quant strategy.
+        // The alternative F32-input Q4_K/Q5_K kernels need one sum per
+        // 32-element activation group. Compute those once per matvec and share
+        // them with every output row.
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
         let mut q4k_sums_stack = [0.0_f32; 512];
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
@@ -1184,7 +1194,12 @@ impl Backend for CpuBackend {
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut q4k_sums: &[f32] = &[];
         #[cfg(target_arch = "x86_64")]
-        if fused_q4k_fma && self.simd_enabled && self.features.avx2 && self.features.fma {
+        if fused_kq_fma
+            && matches!(weights.dtype, DType::Q4K | DType::Q5K)
+            && self.simd_enabled
+            && self.features.avx2
+            && self.features.fma
+        {
             let groups = in_features / 32;
             let buffer: &mut [f32] = if groups <= q4k_sums_stack.len() {
                 &mut q4k_sums_stack[..groups]
@@ -1198,7 +1213,7 @@ impl Backend for CpuBackend {
 
         let fused_q5k_q6k =
             self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
-        let fused = fused_q4k || fused_q4k_fma || fused_q5k_q6k;
+        let fused = fused_q4k || fused_kq_fma || fused_q5k_q6k;
 
         if fused {
             if parallel {
@@ -1232,8 +1247,8 @@ impl Backend for CpuBackend {
                                     Some(quantized_input) => {
                                         self.fused_q4k_q8k_dot(encoded_row, quantized_input)
                                     }
-                                    None if fused_q4k_fma => {
-                                        self.fused_q4k_fma_dot(encoded_row, input, q4k_sums)?
+                                    None if fused_kq_fma => {
+                                        self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
                                     }
                                     None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
                                 };
@@ -1259,8 +1274,8 @@ impl Backend for CpuBackend {
                 })?;
                 *output_value = match q8k_input.as_deref() {
                     Some(quantized_input) => self.fused_q4k_q8k_dot(encoded_row, quantized_input),
-                    None if fused_q4k_fma => {
-                        self.fused_q4k_fma_dot(encoded_row, input, q4k_sums)?
+                    None if fused_kq_fma => {
+                        self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
                     }
                     None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
                 };
@@ -1900,7 +1915,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn fused_q4k_fma_matvec_matches_scalar_reference() {
+    fn fused_kq_fma_matvec_matches_scalar_reference() {
         if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
             return;
         }
@@ -1923,7 +1938,7 @@ mod tests {
             .map(|index| ((index * 13 % 97) as f32 - 48.0) / 49.0)
             .collect::<Vec<_>>();
         let reference = CpuBackend::new_scalar(1).unwrap();
-        let optimized = CpuBackend::new_fused_q4k_fma(4).unwrap();
+        let optimized = CpuBackend::new_fused_kq_fma(4).unwrap();
         let mut expected = [0.0_f32; 4];
         let mut actual = [0.0_f32; 4];
 
