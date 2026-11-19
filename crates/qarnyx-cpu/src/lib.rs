@@ -525,8 +525,7 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 let pair = group / 2;
                 let high_nibble = group % 2 != 0;
                 let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
-                let packed =
-                    _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
                 let unpacked = if high_nibble {
                     _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask)
                 } else {
