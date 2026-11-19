@@ -725,9 +725,11 @@ unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f3
         let mut lanes = [0.0_f32; 8];
         _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
         let main_sum = lanes.iter().sum::<f32>();
+        let min_pair_sums =
+            _mm_add_ps(min_accumulator, _mm_movehl_ps(min_accumulator, min_accumulator));
         let min_sum = _mm_cvtss_f32(_mm_add_ss(
-            _mm_add_ps(min_accumulator, _mm_movehl_ps(min_accumulator, min_accumulator)),
-            _mm_shuffle_ps::<1>(min_accumulator, min_accumulator),
+            min_pair_sums,
+            _mm_shuffle_ps::<1>(min_pair_sums, min_pair_sums),
         ));
         main_sum + min_sum
     }
