@@ -191,4 +191,3 @@ unsafe fn dot_q4_k_impl(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
         hsum(_mm256_add_ps(acc_even, acc_odd)) - min_total
     }
 }
-
