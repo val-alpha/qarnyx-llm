@@ -2155,11 +2155,14 @@ mod tests {
             .collect::<Vec<_>>();
         let reference = CpuBackend::new_scalar(1).unwrap();
         let optimized = CpuBackend::new_fused_q4k(4).unwrap();
+        let llama_style = CpuBackend::new_llama_q4k(4).unwrap();
         let mut expected = [0.0_f32; 4];
         let mut actual = [0.0_f32; 4];
+        let mut llama_output = [0.0_f32; 4];
 
         reference.matvec(weights, &input, &mut expected).unwrap();
         optimized.matvec(weights, &input, &mut actual).unwrap();
+        llama_style.matvec(weights, &input, &mut llama_output).unwrap();
 
         for row in 0..4 {
             let tolerance = 3.0e-2 * (1.0 + expected[row].abs());
@@ -2168,6 +2171,12 @@ mod tests {
                 "Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
                 expected[row],
                 actual[row]
+            );
+            assert!(
+                (llama_output[row] - expected[row]).abs() <= tolerance,
+                "llama-style Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                llama_output[row]
             );
         }
     }
