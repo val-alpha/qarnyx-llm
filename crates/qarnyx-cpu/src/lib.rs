@@ -511,8 +511,8 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
 
     unsafe {
         let nibble_mask = _mm256_set1_epi8(0x0f);
-        let ones = _mm256_set1_epi16(1);
-        let mut total = 0.0_f32;
+        let mut accumulator = _mm256_setzero_ps();
+        let mut min_total = 0.0_f32;
 
         for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
             let activations = &input[block_index];
@@ -520,12 +520,18 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
             let min_d = q4k_read_half(&weights[2..4]) * activations.d;
             let packed_scales = &weights[4..16];
             let quants = &weights[16..144];
+            let mut scaled_dot = _mm256_setzero_si256();
+            let mut scaled_min_sum = 0_i64;
 
+            // Keep the eight partial dot-product lanes in the integer domain.
+            // This mirrors the main AVX2 Q4_K x Q8_K strategy used by ggml:
+            // apply each Q4_K sub-block scale before the final float conversion.
             for group in 0..8 {
                 let pair = group / 2;
                 let high_nibble = group % 2 != 0;
                 let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
-                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let packed =
+                    _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
                 let unpacked = if high_nibble {
                     _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask)
                 } else {
@@ -533,23 +539,28 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 };
                 let activation_bytes =
                     _mm256_loadu_si256(activations.qs.as_ptr().add(group * 32).cast::<__m256i>());
-                let products = _mm256_maddubs_epi16(unpacked, activation_bytes);
-                let pair_sums = _mm256_madd_epi16(products, ones);
-                let pair_sums = _mm256_hadd_epi32(pair_sums, pair_sums);
-                let pair_sums = _mm256_hadd_epi32(pair_sums, pair_sums);
-                let dot_lanes = _mm_add_epi32(
-                    _mm256_castsi256_si128(pair_sums),
-                    _mm256_extracti128_si256::<1>(pair_sums),
-                );
-                let dot = _mm_cvtsi128_si32(dot_lanes) as f32;
-                let input_sum = i32::from(activations.sums32[group]);
 
-                total += d * f32::from(local_scale) * dot
-                    - min_d * f32::from(local_min) * input_sum as f32;
+                let pair_products = _mm256_maddubs_epi16(unpacked, activation_bytes);
+                let scale_lanes = _mm256_set1_epi16(i16::from(local_scale));
+                let scaled_group = _mm256_madd_epi16(pair_products, scale_lanes);
+                scaled_dot = _mm256_add_epi32(scaled_dot, scaled_group);
+
+                scaled_min_sum +=
+                    i64::from(local_min) * i64::from(activations.sums32[group]);
             }
+
+            let integer_lanes = _mm256_cvtepi32_ps(scaled_dot);
+            let block_scale = _mm256_set1_ps(d);
+            accumulator = _mm256_add_ps(
+                accumulator,
+                _mm256_mul_ps(integer_lanes, block_scale),
+            );
+            min_total += min_d * scaled_min_sum as f32;
         }
 
-        total
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        lanes.iter().sum::<f32>() - min_total
     }
 }
 
