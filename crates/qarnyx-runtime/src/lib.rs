@@ -189,10 +189,30 @@ fn estimate_llama_cache_bytes(
 }
 
 /// Result of an autoregressive generation run.
+///
+/// For backward compatibility, token_ids and text include the prompt followed
+/// by generated tokens. GenerationEvent values contain generated tokens only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerationResult {
     pub token_ids: Vec<usize>,
     pub text: String,
+}
+
+/// Protocol-neutral events emitted by a generation stream.
+///
+/// Token events contain generated tokens only; prompt tokens and end-of-turn
+/// markers are not emitted. A text delta can be empty while a byte-level
+/// tokenizer is buffering an incomplete UTF-8 sequence. Any final lossy
+/// replacement text is emitted as a TextDelta event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationEvent {
+    Token {
+        token_id: usize,
+        text_delta: String,
+    },
+    TextDelta {
+        text: String,
+    },
 }
 
 /// Sampling state for one generation stream.
@@ -606,6 +626,91 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn generation_events_emit_only_generated_tokens_and_incremental_text() {
+        let (model, tokenizer) = tiny_llama_fixture();
+        let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
+        let cancellation = CancellationToken::new();
+        let config = GenerationConfig {
+            max_new_tokens: 3,
+            max_context_tokens: 8,
+            max_cache_mib: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 123,
+        };
+        let mut generator = LlamaGenerator::new(123);
+        let mut events = Vec::new();
+
+        let result = generator
+            .generate_ids_with_events(
+                &model,
+                &tokenizer,
+                &backend,
+                &[0],
+                config,
+                &cancellation,
+                |event| events.push(event),
+            )
+            .unwrap();
+
+        assert_eq!(
+            events,
+            [
+                GenerationEvent::Token {
+                    token_id: 0,
+                    text_delta: "a".into(),
+                },
+                GenerationEvent::Token {
+                    token_id: 0,
+                    text_delta: "a".into(),
+                },
+                GenerationEvent::Token {
+                    token_id: 0,
+                    text_delta: "a".into(),
+                },
+            ]
+        );
+        assert_eq!(result.token_ids, [0, 0, 0, 0]);
+        assert_eq!(result.text, "aaaa");
+    }
+
+    #[test]
+    fn generation_event_callback_can_request_cancellation() {
+        let (model, tokenizer) = tiny_llama_fixture();
+        let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
+        let cancellation = CancellationToken::new();
+        let config = GenerationConfig {
+            max_new_tokens: 3,
+            max_context_tokens: 8,
+            max_cache_mib: 1,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 123,
+        };
+        let mut generator = LlamaGenerator::new(123);
+        let mut events = Vec::new();
+
+        let result = generator.generate_ids_with_events(
+            &model,
+            &tokenizer,
+            &backend,
+            &[0],
+            config,
+            &cancellation,
+            |event| {
+                events.push(event);
+                cancellation.cancel();
+            },
+        );
+
+        assert!(matches!(result, Err(GenerationError::Cancelled)));
+        assert_eq!(events.len(), 1);
+        assert!(cancellation.is_cancelled());
+    }
+
 }
 
 
@@ -645,6 +750,37 @@ impl LlamaGenerator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
+        self.generate_ids_with_events(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            |_| {},
+        )
+    }
+
+    /// Generates tokens while emitting protocol-neutral events synchronously.
+    ///
+    /// The callback runs on the generation thread after each selected token.
+    /// It can request cancellation through the shared CancellationToken.
+    /// Implementations that bridge to async/HTTP transports should keep the
+    /// callback bounded, for example by sending events to a channel.
+    pub fn generate_ids_with_events<B, F>(
+        &mut self,
+        model: &LlamaModel<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        mut on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
         config.validate()?;
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
@@ -660,6 +796,7 @@ impl LlamaGenerator {
             LlamaKvCache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
+        let mut decoder = tokenizer.stream_decoder();
 
         for (position, &token_id) in prompt.iter().enumerate() {
             cancellation.check()?;
@@ -673,13 +810,25 @@ impl LlamaGenerator {
             if tokenizer.is_end_of_turn(next) {
                 break;
             }
+
             generated.push(next);
+            let text_delta = decoder.push(next)?;
+            on_event(GenerationEvent::Token {
+                token_id: next,
+                text_delta,
+            });
+            cancellation.check()?;
 
             let position = cache.sequence_len();
             logits = model.forward_logits(backend, next, position, &mut cache)?;
         }
 
+        let final_delta = decoder.finish();
+        if !final_delta.is_empty() {
+            on_event(GenerationEvent::TextDelta { text: final_delta });
+        }
         cancellation.check()?;
+
         let text = tokenizer.decode(&generated)?;
         Ok(GenerationResult {
             token_ids: generated,
@@ -710,10 +859,42 @@ impl LlamaGenerator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
+        self.generate_with_events(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            |_| {},
+        )
+    }
+
+    /// Tokenizes a prompt and emits generated-token events as they become available.
+    pub fn generate_with_events<B, F>(
+        &mut self,
+        model: &LlamaModel<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &str,
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
         cancellation.check()?;
         let prompt_tokens = tokenizer.encode(prompt)?;
-        self.generate_ids_with_cancellation(
-            model, tokenizer, backend, &prompt_tokens, config, cancellation,
+        self.generate_ids_with_events(
+            model,
+            tokenizer,
+            backend,
+            &prompt_tokens,
+            config,
+            cancellation,
+            on_event,
         )
     }
 
@@ -830,6 +1011,37 @@ impl Qwen35Generator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
+        self.generate_ids_with_events(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            |_| {},
+        )
+    }
+
+    /// Generates tokens while emitting protocol-neutral events synchronously.
+    ///
+    /// The callback runs on the generation thread after each selected token.
+    /// It can request cancellation through the shared CancellationToken.
+    /// Implementations that bridge to async/HTTP transports should keep the
+    /// callback bounded, for example by sending events to a channel.
+    pub fn generate_ids_with_events<B, F>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        mut on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
         config.validate()?;
         if prompt.is_empty() {
             return Err(GenerationError::EmptyPrompt);
@@ -849,6 +1061,7 @@ impl Qwen35Generator {
             Qwen35Cache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
+        let mut decoder = tokenizer.stream_decoder();
         let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
         let mut profile = Qwen35Profile::default();
 
@@ -870,7 +1083,15 @@ impl Qwen35Generator {
             if tokenizer.is_end_of_turn(next) {
                 break;
             }
+
             generated.push(next);
+            let text_delta = decoder.push(next)?;
+            on_event(GenerationEvent::Token {
+                token_id: next,
+                text_delta,
+            });
+            cancellation.check()?;
+
             let position = cache.sequence_len;
             if profiling {
                 logits = model.forward_logits_profiled(
@@ -881,6 +1102,10 @@ impl Qwen35Generator {
             }
         }
 
+        let final_delta = decoder.finish();
+        if !final_delta.is_empty() {
+            on_event(GenerationEvent::TextDelta { text: final_delta });
+        }
         cancellation.check()?;
         if profiling {
             eprintln!("{}", profile.report());
@@ -914,9 +1139,43 @@ impl Qwen35Generator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
+        self.generate_with_events(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            |_| {},
+        )
+    }
+
+    /// Tokenizes a prompt and emits generated-token events as they become available.
+    pub fn generate_with_events<B, F>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &str,
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
         cancellation.check()?;
         let ids = tokenizer.encode(prompt)?;
-        self.generate_ids_with_cancellation(model, tokenizer, backend, &ids, config, cancellation)
+        self.generate_ids_with_events(
+            model,
+            tokenizer,
+            backend,
+            &ids,
+            config,
+            cancellation,
+            on_event,
+        )
     }
 
     fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {

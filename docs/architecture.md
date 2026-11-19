@@ -421,9 +421,13 @@ Native Qarnyx ─┘                         │
 ```
 
 Planned work:
-- M8-A Streaming: define a runtime streaming/event primitive that can expose
-  token deltas without coupling the runtime to HTTP, JSON, SSE, or a specific
-  vendor protocol.
+- M8-A Streaming (implementation in progress): the runtime now has a
+  protocol-neutral GenerationEvent callback path for both LLaMA and Qwen3.5.
+  Token events expose generated token IDs and incremental text deltas; a
+  tokenizer-owned stream decoder buffers split UTF-8 sequences. Existing
+  blocking generation methods remain compatible wrappers. Callback delivery
+  is synchronous on the generation thread, and consumers can request
+  cooperative cancellation through the shared CancellationToken.
 - M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
   the common generation request and map results/events back to the expected
   response or stream format.

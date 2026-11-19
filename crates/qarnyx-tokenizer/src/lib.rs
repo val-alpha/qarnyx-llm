@@ -44,6 +44,17 @@ pub struct GgufTokenizer {
     pub eos_token_id: Option<usize>,
 }
 
+/// Stateful incremental text decoder for generated token streams.
+///
+/// Qwen3.5 uses GPT-2 byte-to-Unicode token spellings. A UTF-8 character may
+/// span multiple tokens, so this decoder retains an incomplete trailing
+/// sequence until a later token completes it.
+#[derive(Debug, Clone)]
+pub struct TokenizerStreamDecoder<'a> {
+    tokenizer: &'a GgufTokenizer,
+    pending_utf8: Vec<u8>,
+}
+
 impl GgufTokenizer {
     /// Loads the GGUF tokenizer metadata and validates array lengths.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -318,6 +329,80 @@ impl GgufTokenizer {
             bytes.extend_from_slice(&unicode_to_bytes(token));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Creates a decoder that yields text deltas as generated tokens arrive.
+    pub fn stream_decoder(&self) -> TokenizerStreamDecoder<'_> {
+        TokenizerStreamDecoder {
+            tokenizer: self,
+            pending_utf8: Vec::new(),
+        }
+    }
+}
+
+impl<'a> TokenizerStreamDecoder<'a> {
+    /// Decodes one generated token into the next available valid text delta.
+    ///
+    /// The returned string can be empty when a token ends in an incomplete
+    /// UTF-8 sequence. Call finish when generation ends to flush any
+    /// remaining bytes using the same lossy policy as GgufTokenizer::decode.
+    pub fn push(&mut self, token_id: usize) -> Result<String, TokenizerError> {
+        let token = self
+            .tokenizer
+            .tokens
+            .get(token_id)
+            .ok_or(TokenizerError::TokenIdOutOfRange(token_id))?;
+
+        if self.tokenizer.model != "gpt2" || self.tokenizer.pre.as_deref() != Some("qwen35") {
+            return Ok(token.clone());
+        }
+
+        self.pending_utf8.extend_from_slice(&unicode_to_bytes(token));
+        Ok(self.drain_valid_utf8())
+    }
+
+    /// Flushes an incomplete trailing byte sequence at end of stream.
+    pub fn finish(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.pending_utf8)).into_owned()
+    }
+
+    fn drain_valid_utf8(&mut self) -> String {
+        let mut output = String::new();
+
+        loop {
+            let (valid_up_to, error_len, is_valid) =
+                match std::str::from_utf8(&self.pending_utf8) {
+                    Ok(_) => (self.pending_utf8.len(), None, true),
+                    Err(error) => (
+                        error.valid_up_to(),
+                        error.error_len(),
+                        false,
+                    ),
+                };
+
+            if is_valid {
+                let bytes = std::mem::take(&mut self.pending_utf8);
+                output.push_str(
+                    &String::from_utf8(bytes).expect("validated UTF-8 bytes must decode"),
+                );
+                return output;
+            }
+
+            if valid_up_to > 0 {
+                let prefix = std::str::from_utf8(&self.pending_utf8[..valid_up_to])
+                    .expect("UTF-8 valid_up_to must identify a valid prefix");
+                output.push_str(prefix);
+                self.pending_utf8.drain(..valid_up_to);
+            }
+
+            match error_len {
+                Some(invalid_len) => {
+                    output.push('\u{FFFD}');
+                    self.pending_utf8.drain(..invalid_len);
+                }
+                None => return output,
+            }
+        }
     }
 }
 
@@ -731,5 +816,84 @@ mod tests {
         assert_eq!(tokenizer.bos_token_id, Some(1));
         assert_eq!(tokenizer.decode(&[1]).unwrap(), "hello");
         assert_eq!(tokenizer.encode("hello").unwrap(), [1]);
+    }
+    #[test]
+    fn stream_decoder_preserves_plain_token_text() {
+        let tokenizer = GgufTokenizer {
+            model: "test".into(),
+            pre: None,
+            tokens: vec!["hello".into(), " world".into()],
+            scores: vec![0.0; 2],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let mut decoder = tokenizer.stream_decoder();
+
+        assert_eq!(decoder.push(0).unwrap(), "hello");
+        assert_eq!(decoder.push(1).unwrap(), " world");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn qwen35_stream_decoder_buffers_split_utf8_sequences() {
+        let encoded = byte_to_unicode("é");
+        let mut chars = encoded.chars();
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![
+                chars.next().unwrap().to_string(),
+                chars.next().unwrap().to_string(),
+            ],
+            scores: vec![0.0; 2],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let mut decoder = tokenizer.stream_decoder();
+
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "é");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn qwen35_stream_decoder_flushes_incomplete_utf8_lossily() {
+        let encoded = byte_to_unicode("é");
+        let first_byte = encoded.chars().next().unwrap().to_string();
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec![first_byte],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let mut decoder = tokenizer.stream_decoder();
+
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.finish(), "�");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn stream_decoder_rejects_out_of_range_token_ids() {
+        let tokenizer = GgufTokenizer {
+            model: "test".into(),
+            pre: None,
+            tokens: vec!["hello".into()],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let mut decoder = tokenizer.stream_decoder();
+
+        assert!(matches!(
+            decoder.push(1),
+            Err(TokenizerError::TokenIdOutOfRange(1))
+        ));
     }
 }
