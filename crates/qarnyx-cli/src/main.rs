@@ -270,7 +270,7 @@ fn generate_model(
     let backend = match cpu_kernel {
         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
         CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
-        CpuKernelMode::FusedQ4kFma => qarnyx_cpu::CpuBackend::new_fused_kq_fma(workers)?,
+        CpuKernelMode::FusedKqFma => qarnyx_cpu::CpuBackend::new_fused_kq_fma(workers)?,
         CpuKernelMode::FusedQk => qarnyx_cpu::CpuBackend::new_fused_qk(workers)?,
         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
     };
