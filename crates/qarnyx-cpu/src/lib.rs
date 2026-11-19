@@ -1247,9 +1247,12 @@ impl Backend for CpuBackend {
                                     Some(quantized_input) => {
                                         self.fused_q4k_q8k_dot(encoded_row, quantized_input)
                                     }
-                                    None if fused_kq_fma => {
-                                        self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
-                                    }
+                                    None if fused_kq_fma => self.fused_kq_fma_dot(
+                                        weights.dtype,
+                                        encoded_row,
+                                        input,
+                                        q4k_sums,
+                                    )?,
                                     None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
                                 };
                             }
