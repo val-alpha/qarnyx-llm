@@ -1238,7 +1238,11 @@ impl Qwen35Generator {
         )
     }
 
-    fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        config: GenerationConfig,
+    ) -> Result<usize, GenerationError> {
         if logits.is_empty() || logits.iter().any(|v| !v.is_finite()) {
             return Err(GenerationError::NonFiniteLogits);
         }
