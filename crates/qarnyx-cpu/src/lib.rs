@@ -670,19 +670,21 @@ unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f3
             // Same pairwise min correction used by the llama.cpp x86 kernel:
             // min[group] * sum(q8[group]) for all eight 32-element groups.
             let min_lanes = _mm_setr_epi16(
-                mins[0], mins[1], mins[2], mins[3],
-                mins[4], mins[5], mins[6], mins[7],
+                mins[0], mins[1], mins[2], mins[3], mins[4], mins[5], mins[6], mins[7],
             );
             let sum_lanes = _mm_setr_epi16(
-                activations.sums32[0], activations.sums32[1],
-                activations.sums32[2], activations.sums32[3],
-                activations.sums32[4], activations.sums32[5],
-                activations.sums32[6], activations.sums32[7],
+                activations.sums32[0],
+                activations.sums32[1],
+                activations.sums32[2],
+                activations.sums32[3],
+                activations.sums32[4],
+                activations.sums32[5],
+                activations.sums32[6],
+                activations.sums32[7],
             );
             let min_products = _mm_madd_epi16(min_lanes, sum_lanes);
             let min_values = _mm_cvtepi32_ps(min_products);
-            min_accumulator =
-                _mm_fmadd_ps(_mm_set1_ps(min_scale), min_values, min_accumulator);
+            min_accumulator = _mm_fmadd_ps(_mm_set1_ps(min_scale), min_values, min_accumulator);
 
             let mut scaled_dot = _mm256_setzero_si256();
             for pair in 0..4 {
@@ -693,26 +695,27 @@ unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f3
                 let low_quants = _mm256_and_si256(packed, nibble_mask);
                 let high_quants = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
                 let low_activations = _mm256_loadu_si256(
-                    activations.qs.as_ptr().add(low_group * 32).cast::<__m256i>(),
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(low_group * 32)
+                        .cast::<__m256i>(),
                 );
                 let high_activations = _mm256_loadu_si256(
-                    activations.qs.as_ptr().add(high_group * 32).cast::<__m256i>(),
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(high_group * 32)
+                        .cast::<__m256i>(),
                 );
 
                 let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
                 let high_products = _mm256_maddubs_epi16(high_quants, high_activations);
-                let low_scaled = _mm256_madd_epi16(
-                    low_products,
-                    _mm256_set1_epi16(scales[low_group]),
-                );
-                let high_scaled = _mm256_madd_epi16(
-                    high_products,
-                    _mm256_set1_epi16(scales[high_group]),
-                );
-                scaled_dot = _mm256_add_epi32(
-                    scaled_dot,
-                    _mm256_add_epi32(low_scaled, high_scaled),
-                );
+                let low_scaled =
+                    _mm256_madd_epi16(low_products, _mm256_set1_epi16(scales[low_group]));
+                let high_scaled =
+                    _mm256_madd_epi16(high_products, _mm256_set1_epi16(scales[high_group]));
+                scaled_dot = _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
             }
 
             accumulator = _mm256_fmadd_ps(
@@ -725,8 +728,10 @@ unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f3
         let mut lanes = [0.0_f32; 8];
         _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
         let main_sum = lanes.iter().sum::<f32>();
-        let min_pair_sums =
-            _mm_add_ps(min_accumulator, _mm_movehl_ps(min_accumulator, min_accumulator));
+        let min_pair_sums = _mm_add_ps(
+            min_accumulator,
+            _mm_movehl_ps(min_accumulator, min_accumulator),
+        );
         let min_sum = _mm_cvtss_f32(_mm_add_ss(
             min_pair_sums,
             _mm_shuffle_ps::<1>(min_pair_sums, min_pair_sums),
@@ -2164,7 +2169,9 @@ mod tests {
 
         reference.matvec(weights, &input, &mut expected).unwrap();
         optimized.matvec(weights, &input, &mut actual).unwrap();
-        llama_style.matvec(weights, &input, &mut llama_output).unwrap();
+        llama_style
+            .matvec(weights, &input, &mut llama_output)
+            .unwrap();
 
         for row in 0..4 {
             let tolerance = 3.0e-2 * (1.0 + expected[row].abs());
