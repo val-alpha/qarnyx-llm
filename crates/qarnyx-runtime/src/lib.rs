@@ -206,13 +206,8 @@ pub struct GenerationResult {
 /// replacement text is emitted as a TextDelta event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationEvent {
-    Token {
-        token_id: usize,
-        text_delta: String,
-    },
-    TextDelta {
-        text: String,
-    },
+    Token { token_id: usize, text_delta: String },
+    TextDelta { text: String },
 }
 
 /// Sampling state for one generation stream.
@@ -1212,14 +1207,7 @@ impl Qwen35Generator {
     ) -> Result<GenerationResult, GenerationError> {
         cancellation.check()?;
         let ids = tokenizer.encode(prompt)?;
-        self.generate_ids_with_cancellation(
-            model,
-            tokenizer,
-            backend,
-            &ids,
-            config,
-            cancellation,
-        )
+        self.generate_ids_with_cancellation(model, tokenizer, backend, &ids, config, cancellation)
     }
 
     /// Tokenizes a prompt and emits generated-token events as they become available.

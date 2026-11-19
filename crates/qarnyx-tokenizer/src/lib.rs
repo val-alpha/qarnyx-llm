@@ -335,8 +335,7 @@ impl GgufTokenizer {
 
     /// Creates a decoder that yields text deltas as generated tokens arrive.
     pub fn stream_decoder(&self) -> TokenizerStreamDecoder<'_> {
-        let is_qwen35_byte_level =
-            self.model == "gpt2" && self.pre.as_deref() == Some("qwen35");
+        let is_qwen35_byte_level = self.model == "gpt2" && self.pre.as_deref() == Some("qwen35");
         TokenizerStreamDecoder {
             tokenizer: self,
             pending_utf8: Vec::new(),
@@ -380,15 +379,10 @@ impl<'a> TokenizerStreamDecoder<'a> {
         let mut output = String::new();
 
         loop {
-            let (valid_up_to, error_len, is_valid) =
-                match std::str::from_utf8(&self.pending_utf8) {
-                    Ok(_) => (self.pending_utf8.len(), None, true),
-                    Err(error) => (
-                        error.valid_up_to(),
-                        error.error_len(),
-                        false,
-                    ),
-                };
+            let (valid_up_to, error_len, is_valid) = match std::str::from_utf8(&self.pending_utf8) {
+                Ok(_) => (self.pending_utf8.len(), None, true),
+                Err(error) => (error.valid_up_to(), error.error_len(), false),
+            };
 
             if is_valid {
                 let bytes = std::mem::take(&mut self.pending_utf8);
@@ -416,7 +410,6 @@ impl<'a> TokenizerStreamDecoder<'a> {
     }
 }
 
-
 fn is_special_token_spelling(token: &str) -> bool {
     (token.starts_with("<|") && token.ends_with("|>"))
         || matches!(
@@ -433,10 +426,7 @@ fn byte_to_unicode(text: &str) -> String {
         .collect()
 }
 
-fn unicode_to_bytes_with_map(
-    token: &str,
-    reverse: &std::collections::HashMap<u32, u8>,
-) -> Vec<u8> {
+fn unicode_to_bytes_with_map(token: &str, reverse: &std::collections::HashMap<u32, u8>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(token.len());
     for ch in token.chars() {
         if let Some(&byte) = reverse.get(&(ch as u32)) {
