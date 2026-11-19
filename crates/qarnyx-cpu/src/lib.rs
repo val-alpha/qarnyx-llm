@@ -715,7 +715,8 @@ unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f3
                     _mm256_madd_epi16(low_products, _mm256_set1_epi16(scales[low_group]));
                 let high_scaled =
                     _mm256_madd_epi16(high_products, _mm256_set1_epi16(scales[high_group]));
-                scaled_dot = _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
+                scaled_dot =
+                    _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
             }
 
             accumulator = _mm256_fmadd_ps(
