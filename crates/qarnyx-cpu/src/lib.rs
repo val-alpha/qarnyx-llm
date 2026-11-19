@@ -1742,6 +1742,7 @@ mod tests {
         let fused = CpuBackend::new_fused_qk(1).unwrap();
         // Four output rows and two workers exercise the parallel fused-row path.
         let parallel_fused = CpuBackend::new_fused_qk(2).unwrap();
+        let experimental_fused = CpuBackend::new_fused_kq_fma(2).unwrap();
 
         let mut q5_k = vec![0_u8; 176 * 8];
         let half_scales = [0x3c00_u16, 0x3800, 0x4000, 0x3a00];
@@ -1780,6 +1781,7 @@ mod tests {
             let mut dequant_output = [0.0_f32; 4];
             let mut fused_output = [0.0_f32; 4];
             let mut parallel_output = [0.0_f32; 4];
+            let mut experimental_output = [0.0_f32; 4];
 
             scalar.matvec(weights, &input, &mut expected).unwrap();
             simd_dequant
@@ -1788,6 +1790,9 @@ mod tests {
             fused.matvec(weights, &input, &mut fused_output).unwrap();
             parallel_fused
                 .matvec(weights, &input, &mut parallel_output)
+                .unwrap();
+            experimental_fused
+                .matvec(weights, &input, &mut experimental_output)
                 .unwrap();
 
             for row in 0..4 {
@@ -1812,6 +1817,13 @@ mod tests {
                     dtype,
                     expected[row],
                     parallel_output[row]
+                );
+                assert!(
+                    (experimental_output[row] - expected[row]).abs() <= tolerance,
+                    "experimental AVX2/FMA {:?} mismatch at row {row}: expected={}, actual={}",
+                    dtype,
+                    expected[row],
+                    experimental_output[row]
                 );
             }
         }
