@@ -14,14 +14,6 @@ use std::arch::x86_64::*;
 /// Elements per K-quant super-block.
 pub(crate) const QK_K: usize = 256;
 const Q4K_BYTES: usize = 144;
-const Q5K_BYTES: usize = 176;
-const Q6K_BYTES: usize = 210;
-
-/// Returns whether the host can run these kernels.
-#[inline]
-pub(crate) fn available() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
-}
 
 /// Sums every 32-element group of `input` into `out` (`out.len() == input.len() / 32`).
 ///
@@ -107,18 +99,6 @@ macro_rules! u8_lanes_to_f32 {
     }};
 }
 
-macro_rules! i8_lanes_to_f32 {
-    ($halves:expr, $chunk:expr) => {{
-        let source = $halves[$chunk / 2];
-        let shifted = if $chunk % 2 == 0 {
-            source
-        } else {
-            _mm_srli_si128::<8>(source)
-        };
-        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(shifted))
-    }};
-}
-
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn halves(v: __m256i) -> [__m128i; 2] {
@@ -133,7 +113,7 @@ pub(crate) fn dot_q4_k(encoded: &[u8], input: &[f32], sums: &[f32]) -> f32 {
     assert_eq!(encoded.len(), blocks * Q4K_BYTES, "partial Q4_K block");
     assert_eq!(input.len(), blocks * QK_K, "input length must match blocks");
     assert_eq!(sums.len(), blocks * 8, "one group sum per 32 inputs");
-    // SAFETY: lengths validated above; callers verified `available()`.
+    // SAFETY: lengths validated above; callers verified AVX2+FMA support.
     unsafe { dot_q4_k_impl(encoded, input, sums) }
 }
 
