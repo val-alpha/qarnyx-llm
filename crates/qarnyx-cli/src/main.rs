@@ -91,7 +91,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Status) | None => {
             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
-            println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
+            println!(
+                "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
+            );
             println!("Use --cpu-kernel auto|fused-q4k|fused-qk|scalar to select CPU kernels.");
         }
         Some(Command::Inspect {
@@ -157,7 +159,12 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
         for tensor in &gguf.tensors {
             println!(
                 "  {:<36} shape={:?} ggml_type={} bytes={} offset={} file_offset={}",
-                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.byte_len, tensor.offset, tensor.file_offset
+                tensor.name,
+                tensor.dimensions,
+                tensor.ggml_type,
+                tensor.byte_len,
+                tensor.offset,
+                tensor.file_offset
             );
         }
     } else if !gguf.tensors.is_empty() {
@@ -178,10 +185,7 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn model_file_budget_bytes(
-    max_memory_mib: usize,
-    max_cache_mib: usize,
-) -> anyhow::Result<usize> {
+fn model_file_budget_bytes(max_memory_mib: usize, max_cache_mib: usize) -> anyhow::Result<usize> {
     const MIB: usize = 1024 * 1024;
 
     if max_memory_mib == 0 || max_cache_mib == 0 {
@@ -306,23 +310,19 @@ fn generate_model(
             }
             let model = LlamaModel::from_gguf(&gguf, &data)?;
             let mut generator = LlamaGenerator::new(seed);
-            run_streaming_generation(
-                &cancellation,
-                None,
-                |cancellation, on_event| {
-                    generator
-                        .generate_with_events(
-                            &model,
-                            &tokenizer,
-                            &backend,
-                            prompt,
-                            config,
-                            cancellation,
-                            on_event,
-                        )
-                        .map(|_| ())
-                },
-            )?;
+            run_streaming_generation(&cancellation, None, |cancellation, on_event| {
+                generator
+                    .generate_with_events(
+                        &model,
+                        &tokenizer,
+                        &backend,
+                        prompt,
+                        config,
+                        cancellation,
+                        on_event,
+                    )
+                    .map(|_| ())
+            })?;
         }
         Some(other) => anyhow::bail!("unsupported model architecture: {other}"),
         None => anyhow::bail!("GGUF is missing general.architecture metadata"),
@@ -330,7 +330,6 @@ fn generate_model(
 
     Ok(())
 }
-
 
 /// Runs generation while writing each incremental text event to stdout.
 ///
@@ -342,10 +341,7 @@ fn run_streaming_generation<F>(
     run: F,
 ) -> anyhow::Result<()>
 where
-    F: FnOnce(
-        &CancellationToken,
-        &mut dyn FnMut(GenerationEvent),
-    ) -> Result<(), GenerationError>,
+    F: FnOnce(&CancellationToken, &mut dyn FnMut(GenerationEvent)) -> Result<(), GenerationError>,
 {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -396,10 +392,7 @@ where
 }
 
 /// Writes one runtime event and flushes it so terminal output is incremental.
-fn write_generation_event<W: Write>(
-    writer: &mut W,
-    event: GenerationEvent,
-) -> io::Result<()> {
+fn write_generation_event<W: Write>(writer: &mut W, event: GenerationEvent) -> io::Result<()> {
     match event {
         GenerationEvent::Token { text_delta, .. } => {
             writer.write_all(text_delta.as_bytes())?;
@@ -436,7 +429,6 @@ mod memory_budget_tests {
         assert!(model_file_budget_bytes(usize::MAX, 1).is_err());
     }
 }
-
 
 #[cfg(test)]
 mod cli_tests {
@@ -475,26 +467,19 @@ mod cli_tests {
 
     #[test]
     fn thinking_is_disabled_by_default_and_can_be_enabled() {
-        let default_cli = Cli::try_parse_from([
-            "qarnyx",
-            "generate",
-            "model.gguf",
-            "hello",
-        ])
-        .unwrap();
+        let default_cli =
+            Cli::try_parse_from(["qarnyx", "generate", "model.gguf", "hello"]).unwrap();
         assert!(matches!(
             default_cli.command,
-            Some(Command::Generate { thinking: false, .. })
+            Some(Command::Generate {
+                thinking: false,
+                ..
+            })
         ));
 
-        let thinking_cli = Cli::try_parse_from([
-            "qarnyx",
-            "generate",
-            "model.gguf",
-            "hello",
-            "--thinking",
-        ])
-        .unwrap();
+        let thinking_cli =
+            Cli::try_parse_from(["qarnyx", "generate", "model.gguf", "hello", "--thinking"])
+                .unwrap();
         assert!(matches!(
             thinking_cli.command,
             Some(Command::Generate { thinking: true, .. })
