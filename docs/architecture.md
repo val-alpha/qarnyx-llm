@@ -420,14 +420,16 @@ Native Qarnyx ─┘                         │
                                 └── streaming events
 ```
 
-Planned work:
-- M8-A Streaming (implementation in progress): the runtime now has a
-  protocol-neutral GenerationEvent callback path for both LLaMA and Qwen3.5.
-  Token events expose generated token IDs and incremental text deltas; a
-  tokenizer-owned stream decoder buffers split UTF-8 sequences. Existing
-  blocking generation methods remain compatible wrappers. Callback delivery
-  is synchronous on the generation thread, and consumers can request
-  cooperative cancellation through the shared CancellationToken.
+Milestones:
+- M8-A Streaming (complete): the runtime exposes protocol-neutral
+  `generate_with_events` and `generate_ids_with_events` APIs for both LLaMA
+  and Qwen3.5. Each generated token emits its ID and an incremental text
+  delta; a tokenizer-owned stream decoder buffers split UTF-8 sequences.
+  Prompt tokens and end-of-turn markers are not emitted as completion events.
+  Blocking generation remains backward compatible and bypasses stream decoder
+  and callback work. Event callbacks run synchronously on the generation
+  thread and can request cooperative cancellation through
+  `CancellationToken`.
 - M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
   the common generation request and map results/events back to the expected
   response or stream format.
