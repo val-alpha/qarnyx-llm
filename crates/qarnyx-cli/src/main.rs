@@ -68,7 +68,7 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
-        /// CPU kernel implementation: automatic SIMD, fused Q4_K, experimental fused Q4_K FMA, fused K-quants, or scalar reference.
+        /// CPU kernel implementation: automatic SIMD, fused Q4_K, experimental fused K-quant AVX2/FMA, fused K-quants, or scalar reference.
         #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.
@@ -81,7 +81,7 @@ enum Command {
 enum CpuKernelMode {
     Auto,
     FusedQ4k,
-    FusedQ4kFma,
+    FusedKqFma,
     FusedQk,
     Scalar,
 }
@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
                 "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
             );
             println!(
-                "Use --cpu-kernel auto|fused-q4k|fused-q4k-fma|fused-qk|scalar to select CPU kernels."
+                "Use --cpu-kernel auto|fused-q4k|fused-kq-fma|fused-qk|scalar to select CPU kernels."
             );
         }
         Some(Command::Inspect {
@@ -270,7 +270,7 @@ fn generate_model(
     let backend = match cpu_kernel {
         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
         CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
-        CpuKernelMode::FusedQ4kFma => qarnyx_cpu::CpuBackend::new_fused_q4k_fma(workers)?,
+        CpuKernelMode::FusedQ4kFma => qarnyx_cpu::CpuBackend::new_fused_kq_fma(workers)?,
         CpuKernelMode::FusedQk => qarnyx_cpu::CpuBackend::new_fused_qk(workers)?,
         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
     };
