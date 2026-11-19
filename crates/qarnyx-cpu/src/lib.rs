@@ -502,8 +502,8 @@ fn dot_q4_k_q8_k_scalar(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
     total
 }
 
-/// AVX2 Q4_K x Q8_K dot product. Nibbles are unpacked in SIMD registers and
-/// accumulated as integer products, avoiding per-element scalar expansion.
+/// AVX2 Q4_K x Q8_K dot product. Each packed Q4_K byte is loaded once and
+/// contributes both its low- and high-nibble activation groups.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
@@ -523,30 +523,43 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
             let mut scaled_dot = _mm256_setzero_si256();
             let mut scaled_min_sum = 0_i64;
 
-            // Keep the eight partial dot-product lanes in the integer domain.
-            // This mirrors the main AVX2 Q4_K x Q8_K strategy used by ggml:
-            // apply each Q4_K sub-block scale before the final float conversion.
-            for group in 0..8 {
-                let pair = group / 2;
-                let high_nibble = group % 2 != 0;
-                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+            // A 32-byte Q4_K quant group stores 32 low nibbles and 32 high
+            // nibbles. Process both halves together instead of reloading the
+            // same packed weight bytes in two separate group iterations.
+            for pair in 0..4 {
+                let low_group = pair * 2;
+                let high_group = low_group + 1;
+                let (low_scale, low_min) = q4k_scale_min(low_group, packed_scales);
+                let (high_scale, high_min) = q4k_scale_min(high_group, packed_scales);
+
                 let packed =
                     _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
-                let unpacked = if high_nibble {
-                    _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask)
-                } else {
-                    _mm256_and_si256(packed, nibble_mask)
-                };
-                let activation_bytes =
-                    _mm256_loadu_si256(activations.qs.as_ptr().add(group * 32).cast::<__m256i>());
+                let low_quants = _mm256_and_si256(packed, nibble_mask);
+                let high_quants =
+                    _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
 
-                let pair_products = _mm256_maddubs_epi16(unpacked, activation_bytes);
-                let scale_lanes = _mm256_set1_epi16(i16::from(local_scale));
-                let scaled_group = _mm256_madd_epi16(pair_products, scale_lanes);
-                scaled_dot = _mm256_add_epi32(scaled_dot, scaled_group);
+                let low_activations = _mm256_loadu_si256(
+                    activations.qs.as_ptr().add(low_group * 32).cast::<__m256i>(),
+                );
+                let high_activations = _mm256_loadu_si256(
+                    activations.qs.as_ptr().add(high_group * 32).cast::<__m256i>(),
+                );
 
-                scaled_min_sum +=
-                    i64::from(local_min) * i64::from(activations.sums32[group]);
+                let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
+                let high_products = _mm256_maddubs_epi16(high_quants, high_activations);
+                let low_scale_lanes = _mm256_set1_epi16(i16::from(low_scale));
+                let high_scale_lanes = _mm256_set1_epi16(i16::from(high_scale));
+                let low_scaled = _mm256_madd_epi16(low_products, low_scale_lanes);
+                let high_scaled = _mm256_madd_epi16(high_products, high_scale_lanes);
+                scaled_dot = _mm256_add_epi32(
+                    scaled_dot,
+                    _mm256_add_epi32(low_scaled, high_scaled),
+                );
+
+                scaled_min_sum += i64::from(low_min)
+                    * i64::from(activations.sums32[low_group]);
+                scaled_min_sum += i64::from(high_min)
+                    * i64::from(activations.sums32[high_group]);
             }
 
             let integer_lanes = _mm256_cvtepi32_ps(scaled_dot);
