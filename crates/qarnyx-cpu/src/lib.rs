@@ -1164,8 +1164,7 @@ impl Backend for CpuBackend {
 
         let workers = self.worker_count.min(out_features);
         let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
-        let fused_q4k_fma =
-            self.fused_q4k_fma_matvec && weights.dtype == DType::Q4K;
+        let fused_q4k_fma = self.fused_q4k_fma_matvec && weights.dtype == DType::Q4K;
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
         // Q8_K activation quantization pays off for the wide hidden dimensions
         // used by Qwen3.5 and is performed once per matvec, not once per row.
