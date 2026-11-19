@@ -53,6 +53,7 @@ pub struct GgufTokenizer {
 pub struct TokenizerStreamDecoder<'a> {
     tokenizer: &'a GgufTokenizer,
     pending_utf8: Vec<u8>,
+    reverse_map: Option<std::collections::HashMap<u32, u8>>,
 }
 
 impl GgufTokenizer {
@@ -320,22 +321,26 @@ impl GgufTokenizer {
             return Ok(output);
         }
 
+        let reverse_map = gpt2_reverse_map();
         let mut bytes = Vec::new();
         for &token_id in token_ids {
             let token = self
                 .tokens
                 .get(token_id)
                 .ok_or(TokenizerError::TokenIdOutOfRange(token_id))?;
-            bytes.extend_from_slice(&unicode_to_bytes(token));
+            bytes.extend_from_slice(&unicode_to_bytes_with_map(token, &reverse_map));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Creates a decoder that yields text deltas as generated tokens arrive.
     pub fn stream_decoder(&self) -> TokenizerStreamDecoder<'_> {
+        let is_qwen35_byte_level =
+            self.model == "gpt2" && self.pre.as_deref() == Some("qwen35");
         TokenizerStreamDecoder {
             tokenizer: self,
             pending_utf8: Vec::new(),
+            reverse_map: is_qwen35_byte_level.then(gpt2_reverse_map),
         }
     }
 }
@@ -357,7 +362,12 @@ impl<'a> TokenizerStreamDecoder<'a> {
             return Ok(token.clone());
         }
 
-        self.pending_utf8.extend_from_slice(&unicode_to_bytes(token));
+        let reverse_map = self
+            .reverse_map
+            .as_ref()
+            .expect("Qwen3.5 byte-level decoder must have a reverse map");
+        self.pending_utf8
+            .extend_from_slice(&unicode_to_bytes_with_map(token, reverse_map));
         Ok(self.drain_valid_utf8())
     }
 
@@ -423,14 +433,17 @@ fn byte_to_unicode(text: &str) -> String {
         .collect()
 }
 
-fn unicode_to_bytes(token: &str) -> Vec<u8> {
-    let reverse = gpt2_reverse_map();
+fn unicode_to_bytes_with_map(
+    token: &str,
+    reverse: &std::collections::HashMap<u32, u8>,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(token.len());
     for ch in token.chars() {
         if let Some(&byte) = reverse.get(&(ch as u32)) {
             bytes.push(byte);
         } else {
-            bytes.extend_from_slice(ch.to_string().as_bytes());
+            let mut encoded = [0_u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
         }
     }
     bytes

@@ -750,14 +750,14 @@ impl LlamaGenerator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
-        self.generate_ids_with_events(
+        self.generate_ids_internal(
             model,
             tokenizer,
             backend,
             prompt,
             config,
             cancellation,
-            |_| {},
+            None::<fn(GenerationEvent)>,
         )
     }
 
@@ -775,7 +775,32 @@ impl LlamaGenerator {
         prompt: &[usize],
         config: GenerationConfig,
         cancellation: &CancellationToken,
-        mut on_event: F,
+        on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
+        self.generate_ids_internal(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            Some(on_event),
+        )
+    }
+
+    fn generate_ids_internal<B, F>(
+        &mut self,
+        model: &LlamaModel<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        mut on_event: Option<F>,
     ) -> Result<GenerationResult, GenerationError>
     where
         B: Backend,
@@ -796,7 +821,7 @@ impl LlamaGenerator {
             LlamaKvCache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
-        let mut decoder = tokenizer.stream_decoder();
+        let mut decoder = on_event.as_ref().map(|_| tokenizer.stream_decoder());
 
         for (position, &token_id) in prompt.iter().enumerate() {
             cancellation.check()?;
@@ -812,20 +837,30 @@ impl LlamaGenerator {
             }
 
             generated.push(next);
-            let text_delta = decoder.push(next)?;
-            on_event(GenerationEvent::Token {
-                token_id: next,
-                text_delta,
-            });
-            cancellation.check()?;
+            if let Some(callback) = on_event.as_mut() {
+                let text_delta = decoder
+                    .as_mut()
+                    .expect("event callback requires a stream decoder")
+                    .push(next)?;
+                callback(GenerationEvent::Token {
+                    token_id: next,
+                    text_delta,
+                });
+                cancellation.check()?;
+            }
 
             let position = cache.sequence_len();
             logits = model.forward_logits(backend, next, position, &mut cache)?;
         }
 
-        let final_delta = decoder.finish();
-        if !final_delta.is_empty() {
-            on_event(GenerationEvent::TextDelta { text: final_delta });
+        if let Some(callback) = on_event.as_mut() {
+            let final_delta = decoder
+                .as_mut()
+                .expect("event callback requires a stream decoder")
+                .finish();
+            if !final_delta.is_empty() {
+                callback(GenerationEvent::TextDelta { text: final_delta });
+            }
         }
         cancellation.check()?;
 
@@ -859,14 +894,15 @@ impl LlamaGenerator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
-        self.generate_with_events(
+        cancellation.check()?;
+        let prompt_tokens = tokenizer.encode(prompt)?;
+        self.generate_ids_with_cancellation(
             model,
             tokenizer,
             backend,
-            prompt,
+            &prompt_tokens,
             config,
             cancellation,
-            |_| {},
         )
     }
 
@@ -1011,14 +1047,14 @@ impl Qwen35Generator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
-        self.generate_ids_with_events(
+        self.generate_ids_internal(
             model,
             tokenizer,
             backend,
             prompt,
             config,
             cancellation,
-            |_| {},
+            None::<fn(GenerationEvent)>,
         )
     }
 
@@ -1036,7 +1072,32 @@ impl Qwen35Generator {
         prompt: &[usize],
         config: GenerationConfig,
         cancellation: &CancellationToken,
-        mut on_event: F,
+        on_event: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        B: Backend,
+        F: FnMut(GenerationEvent),
+    {
+        self.generate_ids_internal(
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            cancellation,
+            Some(on_event),
+        )
+    }
+
+    fn generate_ids_internal<B, F>(
+        &mut self,
+        model: &Qwen35Model<'_>,
+        tokenizer: &GgufTokenizer,
+        backend: &B,
+        prompt: &[usize],
+        config: GenerationConfig,
+        cancellation: &CancellationToken,
+        mut on_event: Option<F>,
     ) -> Result<GenerationResult, GenerationError>
     where
         B: Backend,
@@ -1061,7 +1122,7 @@ impl Qwen35Generator {
             Qwen35Cache::with_context_capacity(&model.config, config.max_context_tokens)?;
         let mut generated = prompt.to_vec();
         let mut logits = Vec::new();
-        let mut decoder = tokenizer.stream_decoder();
+        let mut decoder = on_event.as_ref().map(|_| tokenizer.stream_decoder());
         let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
         let mut profile = Qwen35Profile::default();
 
@@ -1085,12 +1146,17 @@ impl Qwen35Generator {
             }
 
             generated.push(next);
-            let text_delta = decoder.push(next)?;
-            on_event(GenerationEvent::Token {
-                token_id: next,
-                text_delta,
-            });
-            cancellation.check()?;
+            if let Some(callback) = on_event.as_mut() {
+                let text_delta = decoder
+                    .as_mut()
+                    .expect("event callback requires a stream decoder")
+                    .push(next)?;
+                callback(GenerationEvent::Token {
+                    token_id: next,
+                    text_delta,
+                });
+                cancellation.check()?;
+            }
 
             let position = cache.sequence_len;
             if profiling {
@@ -1102,9 +1168,14 @@ impl Qwen35Generator {
             }
         }
 
-        let final_delta = decoder.finish();
-        if !final_delta.is_empty() {
-            on_event(GenerationEvent::TextDelta { text: final_delta });
+        if let Some(callback) = on_event.as_mut() {
+            let final_delta = decoder
+                .as_mut()
+                .expect("event callback requires a stream decoder")
+                .finish();
+            if !final_delta.is_empty() {
+                callback(GenerationEvent::TextDelta { text: final_delta });
+            }
         }
         cancellation.check()?;
         if profiling {
@@ -1139,14 +1210,15 @@ impl Qwen35Generator {
         config: GenerationConfig,
         cancellation: &CancellationToken,
     ) -> Result<GenerationResult, GenerationError> {
-        self.generate_with_events(
+        cancellation.check()?;
+        let ids = tokenizer.encode(prompt)?;
+        self.generate_ids_with_cancellation(
             model,
             tokenizer,
             backend,
-            prompt,
+            &ids,
             config,
             cancellation,
-            |_| {},
         )
     }
 
