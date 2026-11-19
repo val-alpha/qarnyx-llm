@@ -532,17 +532,23 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 let (low_scale, low_min) = q4k_scale_min(low_group, packed_scales);
                 let (high_scale, high_min) = q4k_scale_min(high_group, packed_scales);
 
-                let packed =
-                    _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
                 let low_quants = _mm256_and_si256(packed, nibble_mask);
-                let high_quants =
-                    _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
+                let high_quants = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
 
                 let low_activations = _mm256_loadu_si256(
-                    activations.qs.as_ptr().add(low_group * 32).cast::<__m256i>(),
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(low_group * 32)
+                        .cast::<__m256i>(),
                 );
                 let high_activations = _mm256_loadu_si256(
-                    activations.qs.as_ptr().add(high_group * 32).cast::<__m256i>(),
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(high_group * 32)
+                        .cast::<__m256i>(),
                 );
 
                 let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
@@ -551,23 +557,16 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
                 let high_scale_lanes = _mm256_set1_epi16(i16::from(high_scale));
                 let low_scaled = _mm256_madd_epi16(low_products, low_scale_lanes);
                 let high_scaled = _mm256_madd_epi16(high_products, high_scale_lanes);
-                scaled_dot = _mm256_add_epi32(
-                    scaled_dot,
-                    _mm256_add_epi32(low_scaled, high_scaled),
-                );
+                scaled_dot =
+                    _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
 
-                scaled_min_sum += i64::from(low_min)
-                    * i64::from(activations.sums32[low_group]);
-                scaled_min_sum += i64::from(high_min)
-                    * i64::from(activations.sums32[high_group]);
+                scaled_min_sum += i64::from(low_min) * i64::from(activations.sums32[low_group]);
+                scaled_min_sum += i64::from(high_min) * i64::from(activations.sums32[high_group]);
             }
 
             let integer_lanes = _mm256_cvtepi32_ps(scaled_dot);
             let block_scale = _mm256_set1_ps(d);
-            accumulator = _mm256_add_ps(
-                accumulator,
-                _mm256_mul_ps(integer_lanes, block_scale),
-            );
+            accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(integer_lanes, block_scale));
             min_total += min_d * scaled_min_sum as f32;
         }
 
