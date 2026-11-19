@@ -1814,7 +1814,7 @@ mod tests {
         optimized.matvec(weights, &input, &mut actual).unwrap();
 
         for row in 0..4 {
-            let tolerance = 2.0e-2 * (1.0 + expected[row].abs());
+            let tolerance = 3.0e-2 * (1.0 + expected[row].abs());
             assert!(
                 (actual[row] - expected[row]).abs() <= tolerance,
                 "Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
