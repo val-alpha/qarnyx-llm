@@ -95,7 +95,9 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
             );
-            println!("Use --cpu-kernel auto|fused-q4k|fused-q4k-fma|fused-qk|scalar to select CPU kernels.");
+            println!(
+                "Use --cpu-kernel auto|fused-q4k|fused-q4k-fma|fused-qk|scalar to select CPU kernels."
+            );
         }
         Some(Command::Inspect {
             model,
