@@ -244,3 +244,64 @@ text after generation. It does not expose token streaming, time-to-first-token,
 or independent prefill/decode timers. End-to-end CLI timing therefore remains
 the reliable metric available from this command-line path until a dedicated
 benchmark harness is added.
+
+
+## User-reported VPS Q4_K fused-q4k worker scaling (2026-11-19)
+
+A clean 18-run worker sweep was reported from the Ubuntu VPS. The script
+validated exactly 18 data rows, six worker groups, runs 1-3 in each group,
+and one output hash shared by all runs. Trials were executed round-robin by
+worker count to reduce systematic time-of-run bias.
+
+Workload:
+
+- Model: `Huihui-Qwen3.5-2B-abliterated.Q4_K_M.gguf`
+- Prompt: `model apa kamu`
+- Generated tokens: 32, greedy sampling (`temperature=0`, `top-k=0`,
+  `top-p=1`)
+- Kernel: `fused-q4k`
+- Worker counts: 1, 2, 4, 6, 8, and 10
+- Limits: `max-context-tokens=4096`, `max-cache-mib=512`,
+  `max-memory-mib=8192`
+- Trials: three per worker count; no separate warm-up trial reported
+- Measurement: GNU `/usr/bin/time` elapsed wall time (`%e`) and peak RSS
+  (`%M`)
+
+| Workers | Run 1 (s) | Run 2 (s) | Run 3 (s) | Mean (s) | Median (s) | Range (s) | Speedup vs 1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 90.25 | 84.46 | 80.36 | 85.02 | 84.46 | 80.36-90.25 | 1.00x |
+| 2 | 58.59 | 49.82 | 46.72 | 51.71 | 49.82 | 46.72-58.59 | 1.64x |
+| 4 | 36.67 | 35.25 | 31.53 | 34.48 | 35.25 | 31.53-36.67 | 2.47x |
+| 6 | 29.18 | 28.10 | 27.70 | 28.33 | 28.10 | 27.70-29.18 | 3.00x |
+| 8 | 27.07 | 24.54 | 25.58 | 25.73 | 25.58 | 24.54-27.07 | 3.30x |
+| 10 | 23.73 | 23.02 | 23.45 | 23.40 | 23.45 | 23.02-23.73 | 3.63x |
+
+All 18 runs produced the same output SHA-256:
+
+```text
+c5413d2a495ace3cbb7d89f3729c1a408cd77316add0fb50fa986736a559cb11
+```
+
+The highest observed peak RSS was 1,363,784 KiB (about 1.30 GiB); RSS
+remained in a narrow range across worker counts.
+
+**Interpretation:** the mean whole-process time decreased at every tested
+worker-count increase. Moving from 1 to 10 workers improved the measured
+time by 3.63x (72.5% less elapsed time). Moving from 8 to 10 workers still
+reduced the mean by about 9.1%, so this sweep does not show a clear plateau.
+Ten workers is the fastest configuration tested, not a proven global optimum;
+counts above 10 were not tested. The result is specific to this host, model,
+prompt, and kernel mode.
+
+These are whole-process timings, not decode-only throughput. They include
+model reading, GGUF/tokenizer setup, backend initialization, and generation.
+No separate warm-up was reported. The script saved host/compiler details and
+the source revision to
+`benchmark-results/m7-q4k-workers-sweep.env` on the VPS; that environment
+file should be retained alongside the CSV for reproducibility. The CPU model,
+available vCPUs, Rust/Cargo versions, and exact revision are not reproduced
+in the terminal output captured here.
+
+This single-request worker sweep does not establish the best configuration
+under concurrent serving load. M8 serving benchmarks must measure both
+per-request latency and aggregate throughput under controlled concurrency.
