@@ -1785,6 +1785,39 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_q4k_q8k_dot_matches_scalar_q8k_reference() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let mut encoded = vec![0_u8; 144 * 8];
+        for (block_index, block) in encoded.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 17 + block_index * 23) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 31) as u8;
+            }
+        }
+
+        let input = (0..2048)
+            .map(|index| ((index * 7 % 113) as f32 - 56.0) / 57.0)
+            .collect::<Vec<_>>();
+        let quantized = quantize_q8_k(&input).unwrap();
+        let expected = dot_q4_k_q8_k_scalar(&encoded, &quantized);
+        let actual = unsafe { dot_q4_k_q8_k_avx2(&encoded, &quantized) };
+
+        let tolerance = 1.0e-4 * (1.0 + expected.abs());
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "AVX2 Q4_K x Q8_K mismatch: expected={expected}, actual={actual}"
+        );
+    }
+
     #[test]
     fn q4k_q8k_matvec_matches_f32_reference_with_bounded_error() {
         let shape = [4, 2048];
