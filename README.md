@@ -77,15 +77,19 @@ sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
 The CPU backend executes matrix-vector and matrix-matrix operations with all
-currently registered storage types. The default `auto` backend dequantizes
-Q4_K rows into reusable F32 scratch before the AVX2/FMA dot product.
-The opt-in `fused-q4k` mode evaluates Q4_K directly from packed blocks using
-runtime AVX2/FMA on supported x86_64 CPUs. The opt-in `fused-qk` mode extends
-direct-block matvec to Q4_K, Q5_K, and Q6_K, using AVX2 for Q5_K/Q6_K on
-supported x86_64 CPUs and scalar direct-block fallbacks elsewhere. These
-experimental paths do not materialize an F32 weight row. Other quantized
-formats still decode one active row at a time, and the full weight matrix is
-never expanded.
+currently registered storage types. The default `auto` backend currently
+dequantizes Q4_K rows into reusable F32 scratch before the AVX2/FMA dot product.
+The opt-in `fused-q4k` mode uses a Q8_K-quantized activation vector and an
+integer AVX2 Q4_K dot for wide inputs. The opt-in `llama-q4k` mode implements
+the x86 AVX2/FMA Q4_K x Q8_K per-row dot strategy used by
+`ggml_vec_dot_q4_K_q8_K` in llama.cpp, including its SIMD minimum correction.
+It does not call llama.cpp or use its repacked/interleaved matrix format.
+The opt-in `fused-kq-fma` mode evaluates Q4_K, Q5_K, and Q6_K directly from
+packed blocks using the original F32 activation vector and AVX2/FMA on supported
+x86_64 CPUs. The opt-in `fused-qk` mode extends the existing direct-block
+integer/AVX2 kernels to Q4_K, Q5_K, and Q6_K. These experimental paths do not
+materialize an F32 weight row. Unsupported CPU features use the corresponding
+portable fallback.
 
 Large matvec/matmul output rows and independent Qwen3.5 projection batches use
 the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
@@ -107,17 +111,19 @@ kernel mode explicitly:
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-q4k
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel llama-q4k
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-kq-fma
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-qk
 ```
 
 For Qwen3.5, add `--thinking` to enable model reasoning output; without the
 flag the CLI uses the non-thinking prefix.
 
-The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
-`fused-q4k` enables the experimental direct-block Q4_K matvec;
-`fused-qk` enables direct-block Q4_K/Q5_K/Q6_K matvecs. Both modes remain
-opt-in pending broader validation. `scalar` remains the non-SIMD correctness
-reference.
+The `auto` mode remains the dequantize-plus-AVX2/FMA baseline.
+`fused-q4k`, `llama-q4k`, `fused-kq-fma`, and `fused-qk` are explicit
+experimental modes for same-machine comparison; none replaces `auto` until
+broader benchmark and correctness results justify a default change.
+`scalar` remains the non-SIMD correctness reference.
 
 Generation is capped at 4096 combined prompt and requested output tokens by
 default. Use `--max-context-tokens N` to set a different per-request limit.
