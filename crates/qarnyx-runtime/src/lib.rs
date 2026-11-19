@@ -1242,11 +1242,17 @@ impl Qwen35Generator {
         if logits.is_empty() || logits.iter().any(|v| !v.is_finite()) {
             return Err(GenerationError::NonFiniteLogits);
         }
-        let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
         if config.temperature == 0.0 {
-            return candidates.into_iter().max_by(|a,b| a.1.total_cmp(&b.1))
-                .map(|(id,_)| id).ok_or(GenerationError::NonFiniteLogits);
+            return logits
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| id)
+                .ok_or(GenerationError::NonFiniteLogits);
         }
+
+        let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
         candidates.sort_by(|a,b| b.1.total_cmp(&a.1));
         if config.top_k > 0 && config.top_k < candidates.len() {
             candidates.truncate(config.top_k);

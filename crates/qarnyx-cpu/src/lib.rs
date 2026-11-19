@@ -184,6 +184,17 @@ impl CpuBackend {
         dot_q4_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
     }
 
+    fn fused_q4k_q8k_dot(&self, encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+        if self.simd_enabled && self.features.avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                return dot_q4_k_q8_k_avx2(encoded, input);
+            }
+        }
+
+        dot_q4_k_q8_k_scalar(encoded, input)
+    }
+
     fn fused_q5k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
         if self.simd_enabled && self.features.avx2 {
             #[cfg(target_arch = "x86_64")]
@@ -352,7 +363,6 @@ unsafe fn dot_avx2_fma(lhs: &[f32], rhs: &[f32]) -> f32 {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn q4k_read_half(bytes: &[u8]) -> f32 {
     let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
     let sign = u32::from(bits & 0x8000) << 16;
@@ -376,7 +386,6 @@ fn q4k_read_half(bytes: &[u8]) -> f32 {
     f32::from_bits(output)
 }
 
-#[cfg(target_arch = "x86_64")]
 fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
     if index < 4 {
         (packed[index] & 0x3f, packed[index + 4] & 0x3f)
@@ -385,6 +394,163 @@ fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
             (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
             (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
         )
+    }
+}
+
+/// One GGML Q8_K activation block, quantized once and reused for every output row.
+#[derive(Clone)]
+struct Q8KBlock {
+    d: f32,
+    qs: [i8; 256],
+    bsums: [i16; 16],
+}
+
+fn quantize_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>, BackendError> {
+    if input.is_empty() || input.len() % 256 != 0 {
+        return Err(shape_mismatch(
+            "matvec",
+            format!(
+                "Q8_K input length {} must be a non-zero multiple of 256",
+                input.len()
+            ),
+        ));
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_parameter(
+            "matvec",
+            "Q8_K input values must all be finite",
+        ));
+    }
+
+    let block_count = input.len() / 256;
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(block_count)
+        .map_err(|_| BackendError::AllocationFailed {
+            operation: "matvec_q8k",
+            elements: block_count,
+        })?;
+
+    for values in input.chunks_exact(256) {
+        let max_abs = values
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        let d = max_abs / 127.0;
+        let mut block = Q8KBlock {
+            d,
+            qs: [0; 256],
+            bsums: [0; 16],
+        };
+
+        if d > 0.0 {
+            for (quantized, value) in block.qs.iter_mut().zip(values) {
+                *quantized = (value / d).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+
+        for group in 0..16 {
+            let start = group * 16;
+            block.bsums[group] = block.qs[start..start + 16]
+                .iter()
+                .map(|value| i16::from(*value))
+                .sum();
+        }
+
+        blocks.push(block);
+    }
+
+    Ok(blocks)
+}
+
+fn dot_q4_k_q8_k_scalar(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    let mut total = 0.0_f32;
+
+    for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+        let activations = &input[block_index];
+        let d = q4k_read_half(&weights[..2]);
+        let min_d = q4k_read_half(&weights[2..4]);
+        let packed_scales = &weights[4..16];
+        let quants = &weights[16..144];
+        let scaled_d = d * activations.d;
+        let scaled_min_d = min_d * activations.d;
+
+        for group in 0..8 {
+            let pair = group / 2;
+            let high_nibble = group % 2 != 0;
+            let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+            let quant_bytes = &quants[pair * 32..pair * 32 + 32];
+            let input_offset = group * 32;
+            let mut dot = 0_i32;
+
+            for index in 0..32 {
+                let packed = quant_bytes[index];
+                let quant = if high_nibble {
+                    packed >> 4
+                } else {
+                    packed & 0x0f
+                };
+                dot += i32::from(quant) * i32::from(activations.qs[input_offset + index]);
+            }
+
+            let input_sum = i32::from(activations.bsums[group * 2])
+                + i32::from(activations.bsums[group * 2 + 1]);
+            total += scaled_d * f32::from(local_scale) * dot as f32
+                - scaled_min_d * f32::from(local_min) * input_sum as f32;
+        }
+    }
+
+    total
+}
+
+/// AVX2 Q4_K x Q8_K dot product. Nibbles are unpacked in SIMD registers and
+/// accumulated as integer products, avoiding per-element scalar expansion.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let ones = _mm256_set1_epi16(1);
+        let mut total = 0.0_f32;
+
+        for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+            let activations = &input[block_index];
+            let d = q4k_read_half(&weights[..2]) * activations.d;
+            let min_d = q4k_read_half(&weights[2..4]) * activations.d;
+            let packed_scales = &weights[4..16];
+            let quants = &weights[16..144];
+
+            for group in 0..8 {
+                let pair = group / 2;
+                let high_nibble = group % 2 != 0;
+                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+                let packed = _mm256_loadu_si256(
+                    quants.as_ptr().add(pair * 32).cast::<__m256i>(),
+                );
+                let unpacked = if high_nibble {
+                    _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask)
+                } else {
+                    _mm256_and_si256(packed, nibble_mask)
+                };
+                let activation_bytes = _mm256_loadu_si256(
+                    activations.qs.as_ptr().add(group * 32).cast::<__m256i>(),
+                );
+                let products = _mm256_maddubs_epi16(unpacked, activation_bytes);
+                let pair_sums = _mm256_madd_epi16(products, ones);
+                let mut lanes = [0_i32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), pair_sums);
+                let dot = lanes.iter().map(|value| i64::from(*value)).sum::<i64>() as f32;
+                let input_sum = i32::from(activations.bsums[group * 2])
+                    + i32::from(activations.bsums[group * 2 + 1]);
+
+                total += d * f32::from(local_scale) * dot
+                    - min_d * f32::from(local_min) * input_sum as f32;
+            }
+        }
+
+        total
     }
 }
 
@@ -949,6 +1115,13 @@ impl Backend for CpuBackend {
         let workers = self.worker_count.min(out_features);
         let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
+        // Q8_K activation quantization pays off for the wide hidden dimensions
+        // used by Qwen3.5 and is performed once per matvec, not once per row.
+        let q8k_input = if fused_q4k && in_features >= 2048 && self.uses_avx2() {
+            Some(quantize_q8_k(input)?)
+        } else {
+            None
+        };
         let fused_q5k_q6k =
             self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
         let fused = fused_q4k || fused_q5k_q6k;
@@ -981,8 +1154,12 @@ impl Backend for CpuBackend {
                                             "encoded weight row is outside the tensor byte range",
                                         )
                                     })?;
-                                *output_value =
-                                    self.fused_k_dot(weights.dtype, encoded_row, input)?;
+                                *output_value = match q8k_input.as_deref() {
+                                    Some(quantized_input) => {
+                                        self.fused_q4k_q8k_dot(encoded_row, quantized_input)
+                                    }
+                                    None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
+                                };
                             }
                             Ok(())
                         },
@@ -1003,7 +1180,10 @@ impl Backend for CpuBackend {
                         "encoded weight row is outside the tensor byte range",
                     )
                 })?;
-                *output_value = self.fused_k_dot(weights.dtype, encoded_row, input)?;
+                *output_value = match q8k_input.as_deref() {
+                    Some(quantized_input) => self.fused_q4k_q8k_dot(encoded_row, quantized_input),
+                    None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
+                };
             }
             return Ok(());
         }
@@ -1601,6 +1781,45 @@ mod tests {
                 "parallel fused Q4_K mismatch at row {row}: expected={}, actual={}",
                 expected[row],
                 parallel_output[row]
+            );
+        }
+    }
+
+    #[test]
+    fn q4k_q8k_matvec_matches_f32_reference_with_bounded_error() {
+        let shape = [4, 2048];
+        let mut bytes = vec![0_u8; 144 * 8 * shape[0]];
+
+        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 19 + block_index * 7) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 11) as u8;
+            }
+        }
+
+        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
+        let input = (0..2048)
+            .map(|index| ((index * 13 % 97) as f32 - 48.0) / 49.0)
+            .collect::<Vec<_>>();
+        let reference = CpuBackend::new_scalar(1).unwrap();
+        let optimized = CpuBackend::new_fused_q4k(4).unwrap();
+        let mut expected = [0.0_f32; 4];
+        let mut actual = [0.0_f32; 4];
+
+        reference.matvec(weights, &input, &mut expected).unwrap();
+        optimized.matvec(weights, &input, &mut actual).unwrap();
+
+        for row in 0..4 {
+            let tolerance = 2.0e-2 * (1.0 + expected[row].abs());
+            assert!(
+                (actual[row] - expected[row]).abs() <= tolerance,
+                "Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                actual[row]
             );
         }
     }
