@@ -86,6 +86,7 @@ pub struct CpuBackend {
     fused_q4k_matvec: bool,
     fused_q5k_q6k_matvec: bool,
     fused_kq_fma_matvec: bool,
+    llama_q4k_matvec: bool,
 }
 
 impl CpuBackend {
@@ -93,12 +94,12 @@ impl CpuBackend {
     ///
     /// Quantized rows use the reference dequantization path before the F32 dot.
     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, false, false, false)
+        Self::with_options(worker_count, true, false, false, false, false)
     }
 
     /// Creates a scalar-only backend for reference testing and benchmarks.
     pub fn new_scalar(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, false, false, false, false)
+        Self::with_options(worker_count, false, false, false, false, false)
     }
 
     /// Creates a runtime-SIMD backend with the experimental fused Q4_K matvec.
@@ -106,7 +107,7 @@ impl CpuBackend {
     /// Q4_K rows are dotted directly from packed blocks using AVX2/FMA where
     /// available, with a scalar packed-block fallback.
     pub fn new_fused_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, true, false, false)
+        Self::with_options(worker_count, true, true, false, false, false)
     }
 
     /// Creates a runtime-SIMD backend with direct-block Q4_K, Q5_K, and Q6_K matvecs.
@@ -114,7 +115,7 @@ impl CpuBackend {
     /// Q4_K uses AVX2/FMA where available. Q5_K and Q6_K use AVX2 direct-block
     /// kernels on supported x86_64 hosts and scalar direct-block references otherwise.
     pub fn new_fused_qk(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, true, true, false)
+        Self::with_options(worker_count, true, true, true, false, false)
     }
 
     /// Creates experimental AVX2/FMA direct-block kernels for Q4_K, Q5_K, and Q6_K.
@@ -122,7 +123,16 @@ impl CpuBackend {
     /// These consume the original F32 activation vector and are an A/B alternative
     /// to the existing direct-block kernels. They are not selected by default.
     pub fn new_fused_kq_fma(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, false, false, true)
+        Self::with_options(worker_count, true, false, false, true, false)
+    }
+
+    /// Creates a Q4_K x Q8_K AVX2/FMA kernel following llama.cpp's x86 dot path.
+    ///
+    /// This ports the core per-row algorithm from ggml_vec_dot_q4_K_q8_K:
+    /// quantized Q8_K activations, integer dot products, and SIMD/FMA minimum
+    /// correction. It does not use llama.cpp's C++ runtime or model repacking.
+    pub fn new_llama_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, false, false, false, true)
     }
 
     fn with_options(
@@ -131,6 +141,7 @@ impl CpuBackend {
         fused_q4k_matvec: bool,
         fused_q5k_q6k_matvec: bool,
         fused_kq_fma_matvec: bool,
+        llama_q4k_matvec: bool,
     ) -> Result<Self, CpuBackendError> {
         if worker_count == 0 {
             return Err(CpuBackendError::ZeroWorkers);
@@ -150,6 +161,7 @@ impl CpuBackend {
             fused_q4k_matvec,
             fused_q5k_q6k_matvec,
             fused_kq_fma_matvec,
+            llama_q4k_matvec,
         })
     }
 
@@ -207,6 +219,16 @@ impl CpuBackend {
         }
 
         dot_q4_k_q8_k_scalar(encoded, input)
+    }
+
+    fn llama_q4k_q8k_dot(&self, encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if self.simd_enabled && self.features.avx2 && self.features.fma {
+            // SAFETY: runtime feature detection above covers the target features.
+            return unsafe { dot_q4_k_q8_k_llama_avx2_fma(encoded, input) };
+        }
+
+        self.fused_q4k_q8k_dot(encoded, input)
     }
 
     fn fused_kq_fma_dot(
@@ -610,6 +632,104 @@ unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
         let mut lanes = [0.0_f32; 8];
         _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
         lanes.iter().sum::<f32>() - min_total
+    }
+}
+
+/// Q4_K x Q8_K AVX2/FMA dot following llama.cpp's x86 ggml_vec_dot_q4_K_q8_K
+/// structure: pairwise integer products, per-group scale application, and a
+/// vectorized Q8_K sum correction.
+///
+/// Unlike the llama.cpp engine, this operates on Qarnyx's row-major Q4_K weights
+/// and the equivalent Q8_K activation blocks; no repacked/interleaved matrix is
+/// required for this per-row x86 dot kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let mut accumulator = _mm256_setzero_ps();
+        let mut min_accumulator = _mm_setzero_ps();
+
+        for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+            let activations = &input[block_index];
+            let scale = q4k_read_half(&weights[..2]) * activations.d;
+            let min_scale = -q4k_read_half(&weights[2..4]) * activations.d;
+            let packed_scales = &weights[4..16];
+            let quants = &weights[16..144];
+
+            let mut mins = [0_i16; 8];
+            let mut scales = [0_i16; 8];
+            for group in 0..8 {
+                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+                scales[group] = i16::from(local_scale);
+                mins[group] = i16::from(local_min);
+            }
+
+            // Same pairwise min correction used by the llama.cpp x86 kernel:
+            // min[group] * sum(q8[group]) for all eight 32-element groups.
+            let min_lanes = _mm_setr_epi16(
+                mins[0], mins[1], mins[2], mins[3],
+                mins[4], mins[5], mins[6], mins[7],
+            );
+            let sum_lanes = _mm_setr_epi16(
+                activations.sums32[0], activations.sums32[1],
+                activations.sums32[2], activations.sums32[3],
+                activations.sums32[4], activations.sums32[5],
+                activations.sums32[6], activations.sums32[7],
+            );
+            let min_products = _mm_madd_epi16(min_lanes, sum_lanes);
+            let min_values = _mm_cvtepi32_ps(min_products);
+            min_accumulator =
+                _mm_fmadd_ps(_mm_set1_ps(min_scale), min_values, min_accumulator);
+
+            let mut scaled_dot = _mm256_setzero_si256();
+            for pair in 0..4 {
+                let low_group = pair * 2;
+                let high_group = low_group + 1;
+
+                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let low_quants = _mm256_and_si256(packed, nibble_mask);
+                let high_quants = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
+                let low_activations = _mm256_loadu_si256(
+                    activations.qs.as_ptr().add(low_group * 32).cast::<__m256i>(),
+                );
+                let high_activations = _mm256_loadu_si256(
+                    activations.qs.as_ptr().add(high_group * 32).cast::<__m256i>(),
+                );
+
+                let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
+                let high_products = _mm256_maddubs_epi16(high_quants, high_activations);
+                let low_scaled = _mm256_madd_epi16(
+                    low_products,
+                    _mm256_set1_epi16(scales[low_group]),
+                );
+                let high_scaled = _mm256_madd_epi16(
+                    high_products,
+                    _mm256_set1_epi16(scales[high_group]),
+                );
+                scaled_dot = _mm256_add_epi32(
+                    scaled_dot,
+                    _mm256_add_epi32(low_scaled, high_scaled),
+                );
+            }
+
+            accumulator = _mm256_fmadd_ps(
+                _mm256_set1_ps(scale),
+                _mm256_cvtepi32_ps(scaled_dot),
+                accumulator,
+            );
+        }
+
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        let main_sum = lanes.iter().sum::<f32>();
+        let min_sum = _mm_cvtss_f32(_mm_add_ss(
+            _mm_add_ps(min_accumulator, _mm_movehl_ps(min_accumulator, min_accumulator)),
+            _mm_shuffle_ps::<1>(min_accumulator, min_accumulator),
+        ));
+        main_sum + min_sum
     }
 }
 
@@ -1176,9 +1296,12 @@ impl Backend for CpuBackend {
         let fused_kq_fma = self.fused_kq_fma_matvec
             && matches!(weights.dtype, DType::Q4K | DType::Q5K | DType::Q6K);
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
-        // Q8_K activation quantization pays off for the wide hidden dimensions
-        // used by Qwen3.5 and is performed once per matvec, not once per row.
-        let q8k_input = if fused_q4k && !fused_kq_fma && in_features >= 2048 && self.uses_avx2() {
+        let llama_q4k = self.llama_q4k_matvec && weights.dtype == DType::Q4K;
+        // Quantize once per matvec. The llama-q4k mode uses Q8_K for any valid
+        // K-block-aligned input; fused-q4k keeps its current wide-vector threshold.
+        let q8k_input = if (llama_q4k && in_features >= 256 && in_features % 256 == 0)
+            || (fused_q4k && !fused_kq_fma && in_features >= 2048 && self.uses_avx2())
+        {
             Some(quantize_q8_k(input)?)
         } else {
             None
@@ -1213,7 +1336,7 @@ impl Backend for CpuBackend {
 
         let fused_q5k_q6k =
             self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
-        let fused = fused_q4k || fused_kq_fma || fused_q5k_q6k;
+        let fused = fused_q4k || llama_q4k || fused_kq_fma || fused_q5k_q6k;
 
         if fused {
             if parallel {
@@ -1244,6 +1367,9 @@ impl Backend for CpuBackend {
                                         )
                                     })?;
                                 *output_value = match q8k_input.as_deref() {
+                                    Some(quantized_input) if llama_q4k => {
+                                        self.llama_q4k_q8k_dot(encoded_row, quantized_input)
+                                    }
                                     Some(quantized_input) => {
                                         self.fused_q4k_q8k_dot(encoded_row, quantized_input)
                                     }
@@ -1276,6 +1402,9 @@ impl Backend for CpuBackend {
                     )
                 })?;
                 *output_value = match q8k_input.as_deref() {
+                    Some(quantized_input) if llama_q4k => {
+                        self.llama_q4k_q8k_dot(encoded_row, quantized_input)
+                    }
                     Some(quantized_input) => self.fused_q4k_q8k_dot(encoded_row, quantized_input),
                     None if fused_kq_fma => {
                         self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
@@ -1969,6 +2098,39 @@ mod tests {
                 actual[row]
             );
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn llama_q4k_avx2_fma_matches_q8k_scalar_reference() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let mut encoded = vec![0_u8; 144 * 8];
+        for (block_index, block) in encoded.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 17 + block_index * 23) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 31) as u8;
+            }
+        }
+
+        let input = (0..2048)
+            .map(|index| ((index * 7 % 113) as f32 - 56.0) / 57.0)
+            .collect::<Vec<_>>();
+        let quantized = quantize_q8_k(&input).unwrap();
+        let expected = dot_q4_k_q8_k_scalar(&encoded, &quantized);
+        let actual = unsafe { dot_q4_k_q8_k_llama_avx2_fma(&encoded, &quantized) };
+
+        let tolerance = 1.0e-4 * (1.0 + expected.abs());
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "llama-style AVX2/FMA Q4_K x Q8_K mismatch: expected={expected}, actual={actual}"
+        );
     }
 
     #[test]
