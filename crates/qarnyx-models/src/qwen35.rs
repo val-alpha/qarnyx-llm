@@ -651,23 +651,24 @@ fn recurrent_heads<B: Backend>(
         let decay = decay_factors[head];
         let beta_value = sigmoid(beta[head]);
 
-        for column in 0..LD {
-            for row in 0..LD {
-                head_state[row * LD + column] *= decay;
-            }
-        }
-
+        // Traverse the row-major state contiguously. Decay and memory
+        // accumulation share one pass while preserving each memory element's
+        // accumulation order over key rows.
         let mut memory = [0.0_f32; LD];
-        for column in 0..LD {
-            for row in 0..LD {
-                memory[column] += head_state[row * LD + column] * key_head[row];
+        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
+            for (cell, slot) in state_row.iter_mut().zip(memory.iter_mut()) {
+                *cell *= decay;
+                *slot += *cell * *key;
             }
         }
 
-        for row in 0..LD {
-            let delta = (value_head[row] - memory[row]) * beta_value;
-            for column in 0..LD {
-                head_state[column * LD + row] += key_head[column] * delta;
+        let mut delta = [0.0_f32; LD];
+        for ((slot, value), mem) in delta.iter_mut().zip(value_head).zip(&memory) {
+            *slot = (*value - *mem) * beta_value;
+        }
+        for (state_row, key) in head_state.chunks_exact_mut(LD).zip(key_head) {
+            for (cell, change) in state_row.iter_mut().zip(&delta) {
+                *cell += *key * *change;
             }
         }
     })?;
@@ -680,9 +681,11 @@ fn recurrent_heads<B: Backend>(
         let query_head = &q[head * LD..(head + 1) * LD];
         let gate_head = &z[head * LD..(head + 1) * LD];
 
-        for column in 0..LD {
-            for row in 0..LD {
-                head_core[column] += head_state[row * LD + column] * query_head[row];
+        // Keep each output accumulator's reduction order while traversing
+        // the row-major state contiguously.
+        for (state_row, query) in head_state.chunks_exact(LD).zip(query_head) {
+            for (out, cell) in head_core.iter_mut().zip(state_row) {
+                *out += *cell * *query;
             }
         }
 
