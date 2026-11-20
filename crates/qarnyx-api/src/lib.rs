@@ -876,6 +876,7 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content: content.into(),
+            unsupported: HashMap::new(),
         }
     }
 
