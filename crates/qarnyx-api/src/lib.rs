@@ -1063,6 +1063,59 @@ mod tests {
     }
 
     #[test]
+    fn tool_history_is_preserved_in_model_neutral_prompt() {
+        let call = OpenAiToolCall {
+            id: "call_qarnyx_1".into(),
+            kind: "function".into(),
+            function: tool_call::OpenAiFunctionCall {
+                name: "get_weather".into(),
+                arguments: r#"{"city":"Jakarta"}"#.into(),
+            },
+        };
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(vec![call]),
+                tool_call_id: None,
+                name: None,
+                unsupported: HashMap::new(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Sunny, 31 C".into()),
+                tool_calls: None,
+                tool_call_id: Some("call_qarnyx_1".into()),
+                name: Some("get_weather".into()),
+                unsupported: HashMap::new(),
+            },
+        ];
+        let prompt = format_chat_prompt("llama", &messages, &[], &ToolChoice::Auto).unwrap();
+        assert!(prompt.contains(r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#));
+        assert!(prompt.contains("TOOL:\nSunny, 31 C [tool_call_id=call_qarnyx_1]"));
+    }
+
+    #[test]
+    fn openai_tools_request_deserializes() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "qarnyx",
+            "messages": [{"role":"user","content":"Weather in Jakarta?"}],
+            "tools": [{
+                "type":"function",
+                "function":{
+                    "name":"get_weather",
+                    "description":"Get weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
+                }
+            }],
+            "tool_choice":"auto"
+        })).unwrap();
+        let tools = request.tools.unwrap();
+        validate_tools(&tools).unwrap();
+        assert_eq!(parse_tool_choice(request.tool_choice.as_ref()).unwrap(), ToolChoice::Auto);
+    }
+
+    #[test]
     fn stream_chunks_use_openai_chunk_shape() {
         let chunk = stream_chunk(
             "chatcmpl-test",
