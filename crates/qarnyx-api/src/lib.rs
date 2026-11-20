@@ -294,6 +294,35 @@ struct StreamOptions {
     unsupported: HashMap<String, Value>,
 }
 
+
+fn validate_generation_request(
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+    max_context_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+) -> Result<(), ApiError> {
+    if max_new_tokens == 0 {
+        return Err(ApiError::bad_request("max_tokens must be non-zero"));
+    }
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(ApiError::bad_request(
+            "temperature must be finite and greater than or equal to zero",
+        ));
+    }
+    if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+        return Err(ApiError::bad_request("top_p must be finite and in (0, 1]"));
+    }
+    if prompt_tokens > max_context_tokens
+        || max_new_tokens > max_context_tokens.saturating_sub(prompt_tokens)
+    {
+        return Err(ApiError::bad_request(format!(
+            "requested prompt ({prompt_tokens}) plus completion ({max_new_tokens}) exceeds context limit {max_context_tokens}"
+        )));
+    }
+    Ok(())
+}
+
 struct PreparedRequest {
     prompt_ids: Vec<usize>,
     config: GenerationConfig,
@@ -421,14 +450,23 @@ impl ApiState {
             .tokenizer
             .encode(&prompt)
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let temperature = request.temperature.unwrap_or(0.8);
+        let top_p = request.top_p.unwrap_or(0.95);
+        validate_generation_request(
+            prompt_ids.len(),
+            max_new_tokens,
+            max_context_tokens,
+            temperature,
+            top_p,
+        )?;
         let seed = request.seed.unwrap_or(DEFAULT_SEED);
         let config = GenerationConfig {
             max_new_tokens,
             max_context_tokens,
             max_cache_mib,
-            temperature: request.temperature.unwrap_or(0.8),
+            temperature,
             top_k: GenerationConfig::default().top_k,
-            top_p: request.top_p.unwrap_or(0.95),
+            top_p,
             seed,
         };
         Ok(PreparedRequest {
@@ -934,6 +972,17 @@ mod tests {
         let first = next_completion_identity().0;
         let second = next_completion_identity().0;
         assert_ne!(first, second);
+    }
+
+
+    #[test]
+    fn invalid_generation_limits_are_rejected_before_stream_start() {
+        assert!(validate_generation_request(4, 0, 16, 0.8, 0.95).is_err());
+        assert!(validate_generation_request(4, 8, 16, f32::NAN, 0.95).is_err());
+        assert!(validate_generation_request(4, 8, 16, 0.8, 0.0).is_err());
+        assert!(validate_generation_request(12, 8, 16, 0.8, 0.95).is_err());
+        assert!(validate_generation_request(4, 13, 16, 0.8, 0.95).is_err());
+        assert!(validate_generation_request(4, 8, 16, 0.8, 0.95).is_ok());
     }
 
     #[test]
