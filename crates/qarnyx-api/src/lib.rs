@@ -546,9 +546,11 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage]) -> Result<St
     Ok(prompt)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum RunError {
-    Generation(GenerationError),
+    #[error("generation failed: {0}")]
+    Generation(#[from] GenerationError),
+    #[error("model error: {0}")]
     Model(String),
 }
 
