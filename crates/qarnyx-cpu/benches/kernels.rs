@@ -153,6 +153,7 @@ fn benchmark_matmul(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let scalar_backend = CpuBackend::new_scalar(1)?;
+    let dequant_backend = CpuBackend::new_dequant(1)?;
     let auto_backend = CpuBackend::new(1)?;
     let fused_q4k_backend = CpuBackend::new_fused_q4k(1)?;
     let features = auto_backend.features();
@@ -222,40 +223,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("Q6_K", DType::Q6K, 14),
     ];
 
-    println!("\nMatvec storage-format comparison (scalar vs runtime dispatch):");
+    println!("\nMatvec storage-format comparison (scalar vs automatic dispatch):");
     for (label, dtype, raw_type) in formats {
         benchmark_matvec(&scalar_backend, "scalar", label, dtype, raw_type)?;
         benchmark_matvec(&auto_backend, "auto", label, dtype, raw_type)?;
     }
 
-    println!("\nQ4_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
-    benchmark_matvec(
-        &auto_backend,
-        "auto-dequant",
-        "Q4_K",
-        DType::Q4K,
-        12,
-    )?;
-    benchmark_matvec(
-        &fused_q4k_backend,
-        "fused-q4k",
-        "Q4_K",
-        DType::Q4K,
-        12,
-    )?;
+    println!("\nQ4_K matvec A/B (dequant baseline vs automatic fused K-quant):");
+    benchmark_matvec(&dequant_backend, "dequant", "Q4_K", DType::Q4K, 12)?;
+    benchmark_matvec(&auto_backend, "auto-fused-kq-fma", "Q4_K", DType::Q4K, 12)?;
+    benchmark_matvec(&fused_q4k_backend, "fused-q4k", "Q4_K", DType::Q4K, 12)?;
 
-    println!("\nQ5_K / Q6_K matvec A/B (AVX2 + dequant vs fused packed-block dot):");
+    println!("\nQ5_K / Q6_K matvec A/B (dequant baseline vs automatic fused K-quant):");
     for workers in [1, 10] {
-        let auto_qk_backend = if workers == 1 {
-            CpuBackend::new(1)?
-        } else {
-            CpuBackend::new(workers)?
-        };
+        let dequant_qk_backend = CpuBackend::new_dequant(workers)?;
+        let auto_qk_backend = CpuBackend::new(workers)?;
         let fused_qk_backend = CpuBackend::new_fused_qk(workers)?;
         for (label, dtype, raw_type) in [("Q5_K", DType::Q5K, 13), ("Q6_K", DType::Q6K, 14)] {
             benchmark_matvec(
+                &dequant_qk_backend,
+                &format!("workers={workers} dequant"),
+                label,
+                dtype,
+                raw_type,
+            )?;
+            benchmark_matvec(
                 &auto_qk_backend,
-                &format!("workers={workers} auto-dequant"),
+                &format!("workers={workers} auto-fused-kq-fma"),
                 label,
                 dtype,
                 raw_type,

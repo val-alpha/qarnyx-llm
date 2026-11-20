@@ -1147,12 +1147,7 @@ unsafe fn dot_q6_k_avx2_fma(encoded: &[u8], input: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn matmul_row_avx2(
-    row: &[f32],
-    input: &[f32],
-    output: &mut [f32],
-    columns: usize,
-) {
+unsafe fn matmul_row_avx2(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -1178,12 +1173,7 @@ unsafe fn matmul_row_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_row_avx2_fma(
-    row: &[f32],
-    input: &[f32],
-    output: &mut [f32],
-    columns: usize,
-) {
+unsafe fn matmul_row_avx2_fma(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -1467,12 +1457,9 @@ impl Backend for CpuBackend {
                         Some(quantized_input) => {
                             self.fused_q4k_q8k_dot(encoded_row, quantized_input)
                         }
-                        None if fused_kq_fma => self.fused_kq_fma_dot(
-                            weights.dtype,
-                            encoded_row,
-                            input,
-                            q4k_sums,
-                        )?,
+                        None if fused_kq_fma => {
+                            self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
+                        }
                         None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
                     };
                 }
@@ -1848,9 +1835,7 @@ mod tests {
             })
             .unwrap();
 
-        let expected = (0..32)
-            .map(|index| (index / 8) as f32)
-            .collect::<Vec<_>>();
+        let expected = (0..32).map(|index| (index / 8) as f32).collect::<Vec<_>>();
         assert_eq!(values, expected);
     }
 
@@ -2295,10 +2280,7 @@ mod tests {
             .matvec(weights, &vector, &mut automatic_vector_output)
             .unwrap();
 
-        for (expected, actual) in scalar_vector_output
-            .iter()
-            .zip(&automatic_vector_output)
-        {
+        for (expected, actual) in scalar_vector_output.iter().zip(&automatic_vector_output) {
             assert!(
                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
                 "matvec mismatch: scalar={expected}, automatic={actual}"
@@ -2314,10 +2296,7 @@ mod tests {
             .matmul(weights, &matrix, &mut automatic_matrix_output, m, n, k)
             .unwrap();
 
-        for (expected, actual) in scalar_matrix_output
-            .iter()
-            .zip(&automatic_matrix_output)
-        {
+        for (expected, actual) in scalar_matrix_output.iter().zip(&automatic_matrix_output) {
             assert!(
                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
                 "matmul mismatch: scalar={expected}, automatic={actual}"
@@ -2339,7 +2318,9 @@ mod tests {
         let mut second = [0.0_f32; 3];
         let mut outputs: [&mut [f32]; 2] = [&mut first, &mut second];
 
-        backend.matvec_batch(&weights, &input, &mut outputs).unwrap();
+        backend
+            .matvec_batch(&weights, &input, &mut outputs)
+            .unwrap();
 
         assert_eq!(first, [4.5, 9.0]);
         assert_eq!(second, [-1.0, 4.5, 6.0]);
@@ -2380,14 +2361,8 @@ mod tests {
 
     #[test]
     fn row_scratch_is_reused_between_calls() {
-        let first = with_row_scratch("test", 128, |scratch| {
-            Ok(scratch.as_ptr() as usize)
-        })
-        .unwrap();
-        let second = with_row_scratch("test", 64, |scratch| {
-            Ok(scratch.as_ptr() as usize)
-        })
-        .unwrap();
+        let first = with_row_scratch("test", 128, |scratch| Ok(scratch.as_ptr() as usize)).unwrap();
+        let second = with_row_scratch("test", 64, |scratch| Ok(scratch.as_ptr() as usize)).unwrap();
         assert_eq!(first, second);
     }
 

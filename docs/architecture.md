@@ -119,23 +119,31 @@ Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
-storage lengths and do not materialize a full F32 matrix. The automatic Q4_K
-matvec path decodes the active row into reusable F32 scratch for the AVX2/FMA
-dot. Other quantized matvec/matmul paths also decode only the active weight row
-into reusable F32 scratch. RMSNorm requires a positive finite epsilon. RoPE
-pairs the first and second halves of one head vector, matching the split-half
-convention used by LLaMA-style rotary embeddings. Softmax rejects empty or
-non-finite inputs.
+storage lengths and do not materialize a full F32 matrix. On x86_64 with AVX2
+and FMA, the automatic Q4_K/Q5_K/Q6_K matvec path computes directly from packed
+K-quant blocks using F32-input AVX2/FMA kernels; CPUs without both features keep
+the runtime-SIMD dequantize-plus-dot fallback. The previous dequantized mode is
+retained as an explicit Rust API baseline through `CpuBackend::new_dequant()`.
 
-The opt-in `fused-q4k` mode computes directly from packed Q4_K blocks without
+General matvec and matmul fallbacks reuse a per-thread F32 scratch allocation.
+Large operations are partitioned by encoded weight bytes into several tasks
+per worker, while small operations avoid Rayon scheduling overhead. F32-input
+matmul decodes up to four weight rows together and uses an AVX2/FMA register
+tile to reuse each input vector across those rows when the tile and shape fit.
+This is a F32 GEMM micro-kernel after row decoding, not a packed Q4_Kx8 GEMM.
+RMSNorm requires a positive finite epsilon. RoPE pairs the first and second
+halves of one head vector, matching the split-half convention used by
+LLaMA-style rotary embeddings. Softmax rejects empty or non-finite inputs.
+
+The explicit `fused-q4k` mode computes directly from packed Q4_K blocks without
 materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
-falls back to the scalar direct-block dot elsewhere. The opt-in `fused-qk`
+falls back to the scalar direct-block dot elsewhere. The explicit `fused-qk`
 mode extends direct-block matvec to Q5_K and Q6_K, using AVX2 on supported
 x86_64 CPUs and scalar direct-block references elsewhere; it also enables the
-fused Q4_K path. Keep `auto` as the dequantize-plus-AVX2/FMA baseline. Fused
-paths are hardware- and workload-dependent and must remain opt-in until
-representative target-machine measurements are repeatable. RMSNorm, RoPE,
-softmax, and residual addition currently use scalar implementations.
+fused Q4_K path. The automatic mode selects the F32-input direct-block K-quant
+kernels when AVX2+FMA are available. The explicit `llama-q4k` and
+`fused-q4k` modes remain available for controlled A/B comparisons. RMSNorm,
+RoPE, softmax, and residual addition currently use scalar implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
@@ -157,11 +165,11 @@ correctness tests before dispatch is enabled.
 
 Keep the scalar backend as the correctness reference and dispatch by runtime
 feature detection:
-- x86_64: AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
-  available when those features are absent;
-- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 and selects FMA
-  accumulation when supported, with AVX2-only and scalar fallbacks;
+- x86_64: AVX2/FMA matvec and four-row F32 GEMM micro-kernels are implemented;
+- x86_64: automatic direct-block Q4_K/Q5_K/Q6_K matvec uses AVX2+FMA when
+  supported, with dequantized SIMD and scalar fallback paths;
+- x86_64: explicit Q8_K-based Q4_K and integer K-quant alternatives remain
+  selectable for A/B comparisons;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 

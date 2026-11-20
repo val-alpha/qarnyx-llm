@@ -64,13 +64,7 @@ unsafe fn tile_4_impl(a: &[f32], k: usize, b: &[f32], n: usize, c: &mut [f32]) {
 /// A must point to 4*k floats, B to k rows with at least 8*NV values at stride
 /// n, and C to four output rows of length n.
 #[target_feature(enable = "avx2,fma")]
-unsafe fn kernel<const NV: usize>(
-    a: *const f32,
-    k: usize,
-    b: *const f32,
-    n: usize,
-    c: *mut f32,
-) {
+unsafe fn kernel<const NV: usize>(a: *const f32, k: usize, b: *const f32, n: usize, c: *mut f32) {
     unsafe {
         let mut accumulators = [[_mm256_setzero_ps(); NV]; TILE_ROWS];
         for inner in 0..k {
