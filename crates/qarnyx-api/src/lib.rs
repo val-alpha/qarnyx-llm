@@ -15,7 +15,7 @@ use axum::{
 use bytes::Bytes;
 use qarnyx_cpu::{CpuBackend, CpuBackendError};
 use qarnyx_gguf::{GgufError, GgufFile};
-use qarnyx_models::{LlamaModel, Qwen35Model, TensorLoadError};
+use qarnyx_models::{LlamaModel, Qwen35Model};
 use qarnyx_runtime::{
     CancellationToken, GenerationConfig, GenerationError, GenerationEvent, GenerationResult,
     LlamaGenerator, Qwen35Generator,
@@ -28,7 +28,7 @@ use std::{
     convert::Infallible,
     fs::File,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -97,7 +97,12 @@ impl ApiState {
                 "max_context_tokens and max_concurrent_requests must be non-zero".into(),
             ));
         }
-        let model_data = read_model_with_budget(path.as_ref(), max_memory_mib, max_cache_mib)?;
+        let model_data = read_model_with_budget(
+            path.as_ref(),
+            max_memory_mib,
+            max_cache_mib,
+            max_concurrent_requests,
+        )?;
         let gguf = GgufFile::parse(&model_data)?;
         let architecture = gguf
             .metadata_string("general.architecture")
@@ -158,6 +163,7 @@ fn read_model_with_budget(
     path: &Path,
     max_memory_mib: usize,
     max_cache_mib: usize,
+    max_concurrent_requests: usize,
 ) -> Result<Vec<u8>, ApiLoadError> {
     const MIB: usize = 1024 * 1024;
     if max_memory_mib == 0 || max_cache_mib == 0 {
@@ -169,11 +175,16 @@ fn read_model_with_budget(
         .checked_mul(MIB)
         .ok_or_else(|| ApiLoadError::MemoryBudget("max_memory_mib overflows bytes".into()))?;
     let cache = max_cache_mib
-        .checked_mul(MIB)
-        .ok_or_else(|| ApiLoadError::MemoryBudget("max_cache_mib overflows bytes".into()))?;
+        .checked_mul(max_concurrent_requests)
+        .and_then(|value| value.checked_mul(MIB))
+        .ok_or_else(|| {
+            ApiLoadError::MemoryBudget(
+                "max_cache_mib multiplied by max_concurrent_requests overflows bytes".into(),
+            )
+        })?;
     let model_limit = total.checked_sub(cache).filter(|value| *value > 0).ok_or_else(|| {
         ApiLoadError::MemoryBudget(
-            "max_memory_mib must exceed max_cache_mib, leaving space for model weights".into(),
+            "max_memory_mib must exceed the aggregate cache reservation, leaving space for model weights".into(),
         )
     })?;
 
@@ -365,6 +376,18 @@ impl ApiState {
             return Err(ApiError::bad_request(
                 "max_context_tokens and max_cache_mib must be non-zero",
             ));
+        }
+        if max_context_tokens > self.assets.max_context_tokens {
+            return Err(ApiError::bad_request(format!(
+                "max_context_tokens exceeds the server limit of {}",
+                self.assets.max_context_tokens
+            )));
+        }
+        if max_cache_mib > self.assets.max_cache_mib {
+            return Err(ApiError::bad_request(format!(
+                "max_cache_mib exceeds the server limit of {}",
+                self.assets.max_cache_mib
+            )));
         }
 
         let prompt = format_chat_prompt(&self.assets.architecture, &request.messages)?;
