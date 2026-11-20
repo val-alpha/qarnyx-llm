@@ -153,6 +153,9 @@ pub fn parse_model_output(output: &str, tools: &[OpenAiTool], choice: &ToolChoic
         }
         return Ok(ParsedAssistant { content: Some(output.to_owned()), tool_calls: Vec::new() });
     };
+    if matches!(choice, ToolChoice::None) {
+        return Err("model emitted a tool call while tool_choice='none'".into());
+    }
     if object.len() != 1 { return Err("tool-call envelope must contain only tool_calls".into()); }
     let raw_calls = raw_calls.as_array().filter(|a| !a.is_empty())
         .ok_or_else(|| "tool_calls must be a non-empty array".to_owned())?;
