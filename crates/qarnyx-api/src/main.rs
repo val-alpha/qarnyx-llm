@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::Parser;
-use qarnyx_api::{router, ApiState};
+use qarnyx_api::{ApiState, router};
 use tokio::net::TcpListener;
 
 #[derive(Debug, Parser)]
