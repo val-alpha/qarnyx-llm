@@ -36,7 +36,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 const DEFAULT_SEED: u64 = 0x51_4e_52_59_58;
@@ -79,6 +79,7 @@ struct ModelAssets {
     model_id: String,
     max_context_tokens: usize,
     max_cache_mib: usize,
+    request_slots: Arc<Semaphore>,
 }
 
 impl ApiState {
@@ -89,10 +90,11 @@ impl ApiState {
         max_memory_mib: usize,
         max_context_tokens: usize,
         max_cache_mib: usize,
+        max_concurrent_requests: usize,
     ) -> Result<Self, ApiLoadError> {
-        if max_context_tokens == 0 {
+        if max_context_tokens == 0 || max_concurrent_requests == 0 {
             return Err(ApiLoadError::MemoryBudget(
-                "max_context_tokens must be non-zero".into(),
+                "max_context_tokens and max_concurrent_requests must be non-zero".into(),
             ));
         }
         let model_data = read_model_with_budget(path.as_ref(), max_memory_mib, max_cache_mib)?;
@@ -138,6 +140,7 @@ impl ApiState {
                 model_id,
                 max_context_tokens,
                 max_cache_mib,
+                request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
             }),
         })
     }
@@ -581,17 +584,27 @@ async fn create_chat_completion(
     let max_new_tokens = prepared.config.max_new_tokens;
 
     if stream {
-        return Ok(stream_chat_completion(
+        return stream_chat_completion(
             state,
             prepared,
             prompt_tokens,
             max_new_tokens,
-        ));
+        )
+        .await
+        .map(|response| response);
     }
 
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut content = String::new();
         let result = state_for_task.generate(&prepared, &cancellation, |event| match event {
             GenerationEvent::Token { text_delta, .. } => content.push_str(&text_delta),
@@ -634,12 +647,19 @@ async fn create_chat_completion(
     .into_response())
 }
 
-fn stream_chat_completion(
+async fn stream_chat_completion(
     state: ApiState,
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_new_tokens: usize,
-) -> Response {
+) -> Result<Response, ApiError> {
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let include_usage = prepared.include_usage;
     let (id, created) = next_completion_identity();
     let model_id = state.assets.model_id.clone();
@@ -648,6 +668,7 @@ fn stream_chat_completion(
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut send = |value: Value| -> bool {
             let bytes = Bytes::from(format!("data: {}\n\n", value));
             if sender.blocking_send(bytes).is_err() {
@@ -759,7 +780,7 @@ fn stream_chat_completion(
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .header(header::CONNECTION, HeaderValue::from_static("keep-alive"))
         .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))
 }
 
 fn stream_chunk(
