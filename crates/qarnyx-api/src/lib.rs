@@ -5,12 +5,12 @@
 //! own generator and request-local cache.
 
 use axum::{
+    Json, Router,
     body::Body,
-    extract::{rejection::JsonRejection, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{State, rejection::JsonRejection},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use bytes::Bytes;
 use qarnyx_cpu::{CpuBackend, CpuBackendError};
@@ -22,7 +22,7 @@ use qarnyx_runtime::{
 };
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -30,14 +30,14 @@ use std::{
     io::{self, Read},
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, Semaphore};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio::sync::{Semaphore, mpsc};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 const DEFAULT_SEED: u64 = 0x51_4e_52_59_58;
 static NEXT_COMPLETION_ID: AtomicU64 = AtomicU64::new(1);
@@ -59,7 +59,6 @@ pub enum ApiLoadError {
     #[error("invalid memory budget: {0}")]
     MemoryBudget(String),
 }
-
 /// Shared immutable model assets and backend configuration.
 ///
 /// Tensor payloads stay in one shared byte buffer. A lightweight model view is
@@ -294,7 +293,6 @@ struct StreamOptions {
     unsupported: HashMap<String, Value>,
 }
 
-
 fn validate_generation_request(
     prompt_tokens: usize,
     max_new_tokens: usize,
@@ -339,7 +337,9 @@ impl ApiState {
             )));
         }
         if request.messages.is_empty() {
-            return Err(ApiError::bad_request("messages must contain at least one message"));
+            return Err(ApiError::bad_request(
+                "messages must contain at least one message",
+            ));
         }
         for message in &request.messages {
             if !message.unsupported.is_empty() {
@@ -369,7 +369,11 @@ impl ApiState {
         if request.logprobs.unwrap_or(false) || request.top_logprobs.unwrap_or(0) > 0 {
             return Err(ApiError::bad_request("logprobs are not supported"));
         }
-        if request.logit_bias.as_ref().is_some_and(|value| !value.is_empty()) {
+        if request
+            .logit_bias
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        {
             return Err(ApiError::bad_request("logit_bias is not supported"));
         }
         if request.tools.is_some()
@@ -377,7 +381,9 @@ impl ApiState {
             || request.functions.is_some()
             || request.function_call.is_some()
         {
-            return Err(ApiError::bad_request("tool and function calling are not supported"));
+            return Err(ApiError::bad_request(
+                "tool and function calling are not supported",
+            ));
         }
         if let Some(format) = request.response_format {
             if format.kind != "text" {
@@ -434,9 +440,7 @@ impl ApiState {
 
         let stream_options = request.stream_options.unwrap_or_default();
         if stream_options.include_obfuscation.unwrap_or(false) {
-            return Err(ApiError::bad_request(
-                "stream obfuscation is not supported",
-            ));
+            return Err(ApiError::bad_request("stream obfuscation is not supported"));
         }
         if !stream_options.unsupported.is_empty() {
             return Err(ApiError::bad_request(
@@ -488,11 +492,9 @@ impl ApiState {
     {
         match self.assets.architecture.as_str() {
             "llama" => {
-                let model = LlamaModel::from_gguf(
-                    &self.assets.gguf,
-                    self.assets.model_data.as_ref(),
-                )
-                .map_err(|error| RunError::Model(error.to_string()))?;
+                let model =
+                    LlamaModel::from_gguf(&self.assets.gguf, self.assets.model_data.as_ref())
+                        .map_err(|error| RunError::Model(error.to_string()))?;
                 let mut generator = LlamaGenerator::new(prepared.seed);
                 generator
                     .generate_ids_with_events(
@@ -507,11 +509,9 @@ impl ApiState {
                     .map_err(RunError::Generation)
             }
             "qwen35" => {
-                let model = Qwen35Model::from_gguf(
-                    &self.assets.gguf,
-                    self.assets.model_data.as_ref(),
-                )
-                .map_err(|error| RunError::Model(error.to_string()))?;
+                let model =
+                    Qwen35Model::from_gguf(&self.assets.gguf, self.assets.model_data.as_ref())
+                        .map_err(|error| RunError::Model(error.to_string()))?;
                 let mut generator = Qwen35Generator::new(prepared.seed);
                 generator
                     .generate_ids_with_events(
@@ -672,14 +672,9 @@ async fn create_chat_completion(
     let max_new_tokens = prepared.config.max_new_tokens;
 
     if stream {
-        return stream_chat_completion(
-            state,
-            prepared,
-            prompt_tokens,
-            max_new_tokens,
-        )
-        .await
-        .map(|response| response);
+        return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens)
+            .await
+            .map(|response| response);
     }
 
     let permit = state
@@ -704,11 +699,7 @@ async fn create_chat_completion(
     .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
     .map_err(ApiError::from)?;
 
-    let completion_tokens = completion
-        .1
-        .token_ids
-        .len()
-        .saturating_sub(prompt_tokens);
+    let completion_tokens = completion.1.token_ids.len().saturating_sub(prompt_tokens);
     let finish_reason = if completion_tokens >= max_new_tokens {
         "length"
     } else {
@@ -782,7 +773,10 @@ async fn stream_chat_completion(
         let mut disconnected = false;
         let result = state.generate(&prepared, &task_cancellation, |event| {
             let delta = match event {
-                GenerationEvent::Token { token_id: _, text_delta } => {
+                GenerationEvent::Token {
+                    token_id: _,
+                    text_delta,
+                } => {
                     completion_tokens += 1;
                     text_delta
                 }
@@ -864,10 +858,15 @@ async fn stream_chat_completion(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .header(header::CONNECTION, HeaderValue::from_static("keep-alive"))
-        .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
+        .body(Body::from_stream(
+            ReceiverStream::new(receiver).map(Ok::<_, Infallible>),
+        ))
         .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))
 }
 
@@ -922,10 +921,7 @@ mod tests {
     fn qwen35_chat_prompt_preserves_roles_and_non_thinking_prefix() {
         let prompt = format_chat_prompt(
             "qwen35",
-            &[
-                message("system", "Be concise."),
-                message("user", "Hello"),
-            ],
+            &[message("system", "Be concise."), message("user", "Hello")],
         )
         .unwrap();
 
@@ -973,7 +969,6 @@ mod tests {
         let second = next_completion_identity().0;
         assert_ne!(first, second);
     }
-
 
     #[test]
     fn invalid_generation_limits_are_rejected_before_stream_start() {
