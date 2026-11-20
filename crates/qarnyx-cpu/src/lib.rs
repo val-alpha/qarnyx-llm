@@ -36,7 +36,7 @@ thread_local! {
     static ROW_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Errors raised while constructing the CPU backend./// Errors raised while constructing the CPU backend.
+/// Errors raised while constructing the CPU backend.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CpuBackendError {
     /// Worker count must be non-zero.
@@ -2540,7 +2540,8 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let weights = TensorView::new(&bytes, &[m, k], DType::F32);
+        let shape = [m, k];
+        let weights = TensorView::new(&bytes, &shape, DType::F32);
         let input = (0..k * n)
             .map(|index| ((index * 11 % 43) as f32 - 21.0) / 23.0)
             .collect::<Vec<_>>();
