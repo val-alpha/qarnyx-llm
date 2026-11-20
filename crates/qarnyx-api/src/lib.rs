@@ -859,10 +859,10 @@ async fn stream_chat_completion(
         }
 
         let mut completion_tokens = 0usize;
-        let mut disconnected = false;
         let mut raw_output = String::new();
-        // Buffer until the adapter knows whether this is text or a tool call.
-        // This avoids leaking a partial JSON tool envelope as assistant content.
+        let should_buffer = !prepared.tools.is_empty();
+        // Preserve token streaming for ordinary chat. Tool-enabled output is
+        // buffered so a partial JSON envelope is never misreported as content.
         let result = state.generate(&prepared, &task_cancellation, |event| {
             let delta = match event {
                 GenerationEvent::Token { text_delta, .. } => {
@@ -871,10 +871,16 @@ async fn stream_chat_completion(
                 }
                 GenerationEvent::TextDelta { text } => text,
             };
-            raw_output.push_str(&delta);
+            if should_buffer {
+                raw_output.push_str(&delta);
+            } else if !delta.is_empty() && !send(stream_chunk(
+                &id, created, &model_id, json!({"content": delta}), Value::Null, include_usage,
+            )) {
+                task_cancellation.cancel();
+            }
         });
 
-        if disconnected || task_cancellation.is_cancelled() {
+        if task_cancellation.is_cancelled() {
             return;
         }
 
@@ -893,10 +899,12 @@ async fn stream_chat_completion(
                         return;
                     }
                 };
-                if let Some(content) = parsed.content {
-                    if !content.is_empty() && !send(stream_chunk(
-                        &id, created, &model_id, json!({"content": content}), Value::Null, include_usage,
-                    )) { return; }
+                if should_buffer {
+                    if let Some(content) = parsed.content {
+                        if !content.is_empty() && !send(stream_chunk(
+                            &id, created, &model_id, json!({"content": content}), Value::Null, include_usage,
+                        )) { return; }
+                    }
                 }
                 let tool_calls = parsed.tool_calls.iter().map(|call| call.to_openai()).collect::<Vec<_>>();
                 for (index, call) in tool_calls.iter().enumerate() {
