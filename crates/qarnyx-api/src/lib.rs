@@ -274,9 +274,12 @@ struct ChatCompletionRequest {
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(flatten)]
+    unsupported: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResponseFormat {
     #[serde(rename = "type")]
     kind: String,
@@ -286,6 +289,9 @@ struct ResponseFormat {
 struct StreamOptions {
     #[serde(default)]
     include_usage: bool,
+    include_obfuscation: Option<bool>,
+    #[serde(flatten)]
+    unsupported: HashMap<String, Value>,
 }
 
 struct PreparedRequest {
@@ -305,6 +311,13 @@ impl ApiState {
         }
         if request.messages.is_empty() {
             return Err(ApiError::bad_request("messages must contain at least one message"));
+        }
+        for message in &request.messages {
+            if !message.unsupported.is_empty() {
+                return Err(ApiError::bad_request(
+                    "message fields other than role and text content are not supported",
+                ));
+            }
         }
         if request.n.unwrap_or(1) != 1 {
             return Err(ApiError::bad_request("only n=1 is supported"));
@@ -390,6 +403,18 @@ impl ApiState {
             )));
         }
 
+        let stream_options = request.stream_options.unwrap_or_default();
+        if stream_options.include_obfuscation.unwrap_or(false) {
+            return Err(ApiError::bad_request(
+                "stream obfuscation is not supported",
+            ));
+        }
+        if !stream_options.unsupported.is_empty() {
+            return Err(ApiError::bad_request(
+                "unsupported stream_options fields were provided",
+            ));
+        }
+
         let prompt = format_chat_prompt(&self.assets.architecture, &request.messages)?;
         let prompt_ids = self
             .assets
@@ -410,7 +435,7 @@ impl ApiState {
             prompt_ids,
             config,
             seed,
-            include_usage: request.stream_options.unwrap_or_default().include_usage,
+            include_usage: stream_options.include_usage,
         })
     }
 
@@ -692,7 +717,7 @@ async fn stream_chat_completion(
 
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut send = |value: Value| -> bool {
+        let send = |value: Value| -> bool {
             let bytes = Bytes::from(format!("data: {}\n\n", value));
             if sender.blocking_send(bytes).is_err() {
                 task_cancellation.cancel();
