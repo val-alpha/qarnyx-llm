@@ -21,7 +21,7 @@ use qarnyx_runtime::{
     LlamaGenerator, Qwen35Generator,
 };
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -37,7 +37,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 const DEFAULT_SEED: u64 = 0x51_4e_52_59_58;
 static NEXT_COMPLETION_ID: AtomicU64 = AtomicU64::new(1);
@@ -246,7 +246,8 @@ struct ChatCompletionRequest {
     function_call: Option<Value>,
     response_format: Option<ResponseFormat>,
     stream_options: Option<StreamOptions>,
-    user: Option<String>,
+    #[serde(rename = "user")]
+    _user: Option<String>,
     store: Option<bool>,
     #[serde(default)]
     max_context_tokens: Option<usize>,
@@ -304,7 +305,7 @@ impl ApiState {
                 )));
             }
         }
-        if request.stop.is_some() {
+        if request.stop.as_ref().is_some_and(|value| !value.is_null()) {
             return Err(ApiError::bad_request(
                 "stop sequences are not supported by this runtime adapter yet",
             ));
@@ -671,12 +672,12 @@ fn stream_chat_completion(
         let mut completion_tokens = 0usize;
         let mut disconnected = false;
         let result = state.generate(&prepared, &task_cancellation, |event| {
-            let (delta, token) = match event {
+            let delta = match event {
                 GenerationEvent::Token { token_id: _, text_delta } => {
                     completion_tokens += 1;
-                    (text_delta, true)
+                    text_delta
                 }
-                GenerationEvent::TextDelta { text } => (text, false),
+                GenerationEvent::TextDelta { text } => text,
             };
             if delta.is_empty() {
                 return;
@@ -692,7 +693,6 @@ fn stream_chat_completion(
                 disconnected = true;
                 task_cancellation.cancel();
             }
-            let _ = token;
         });
 
         if disconnected || task_cancellation.is_cancelled() {
@@ -758,7 +758,7 @@ fn stream_chat_completion(
         .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .header(header::CONNECTION, HeaderValue::from_static("keep-alive"))
-        .body(Body::from_stream(ReceiverStream::new(receiver)))
+        .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
