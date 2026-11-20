@@ -707,6 +707,8 @@ async fn create_chat_completion(
         .await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
+    let tools = prepared.tools.clone();
+    let tool_choice = prepared.tool_choice.clone();
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -722,12 +724,22 @@ async fn create_chat_completion(
     .map_err(ApiError::from)?;
 
     let completion_tokens = completion.1.token_ids.len().saturating_sub(prompt_tokens);
-    let finish_reason = if completion_tokens >= max_new_tokens {
+    let parsed = parse_model_output(&completion.0, &tools, &tool_choice)
+        .map_err(ApiError::bad_request)?;
+    let finish_reason = if !parsed.tool_calls.is_empty() {
+        "tool_calls"
+    } else if completion_tokens >= max_new_tokens {
         "length"
     } else {
         "stop"
     };
+    let tool_calls = parsed.tool_calls.iter().map(|call| call.to_openai()).collect::<Vec<_>>();
     let (id, created) = next_completion_identity();
+    let mut message = json!({ "role": "assistant", "content": parsed.content });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::to_value(tool_calls)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
     Ok(Json(json!({
         "id": id,
         "object": "chat.completion",
@@ -735,7 +747,7 @@ async fn create_chat_completion(
         "model": state.assets.model_id,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": completion.0 },
+            "message": message,
             "logprobs": null,
             "finish_reason": finish_reason
         }],
