@@ -23,7 +23,7 @@ use qarnyx_runtime::{
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use serde::Deserialize;
 mod tool_call;
-use tool_call::{OpenAiTool, ToolChoice, parse_model_output, parse_tool_choice, tool_protocol_instruction, validate_choice, validate_tools};
+use tool_call::{OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice, tool_protocol_instruction, validate_choice, validate_tools};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -274,7 +274,11 @@ struct ChatCompletionRequest {
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+    tool_call_id: Option<String>,
+    name: Option<String>,
     #[serde(flatten)]
     unsupported: HashMap<String, Value>,
 }
@@ -347,9 +351,34 @@ impl ApiState {
         }
         for message in &request.messages {
             if !message.unsupported.is_empty() {
-                return Err(ApiError::bad_request(
-                    "message fields other than role and text content are not supported",
-                ));
+                return Err(ApiError::bad_request("unsupported message fields were provided"));
+            }
+            match message.role.as_str() {
+                "system" | "developer" | "user" => {
+                    if message.tool_calls.is_some() || message.tool_call_id.is_some() || message.name.is_some() {
+                        return Err(ApiError::bad_request("tool-call metadata is only valid on assistant/tool messages"));
+                    }
+                    if message.content.is_none() {
+                        return Err(ApiError::bad_request("message content must be a string"));
+                    }
+                }
+                "assistant" => {
+                    if message.tool_call_id.is_some() {
+                        return Err(ApiError::bad_request("assistant messages cannot contain tool_call_id"));
+                    }
+                    if message.content.is_none() && message.tool_calls.as_ref().is_none_or(Vec::is_empty) {
+                        return Err(ApiError::bad_request("assistant message needs content or tool_calls"));
+                    }
+                }
+                "tool" => {
+                    if message.tool_call_id.as_deref().is_none_or(str::is_empty) || message.content.is_none() {
+                        return Err(ApiError::bad_request("tool messages require tool_call_id and string content"));
+                    }
+                    if message.tool_calls.is_some() {
+                        return Err(ApiError::bad_request("tool messages cannot contain tool_calls"));
+                    }
+                }
+                other => return Err(ApiError::bad_request(format!("unsupported message role '{other}'"))),
             }
         }
         if request.n.unwrap_or(1) != 1 {
@@ -553,6 +582,7 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[Ope
                     "system" | "developer" => "system",
                     "user" => "user",
                     "assistant" => "assistant",
+                    "tool" => "tool",
                     other => {
                         return Err(ApiError::bad_request(format!(
                             "unsupported message role '{other}'"
@@ -562,7 +592,19 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[Ope
                 prompt.push_str("<|im_start|>");
                 prompt.push_str(role);
                 prompt.push('\n');
-                prompt.push_str(&message.content);
+                if let Some(content) = &message.content { prompt.push_str(content); }
+                if let Some(calls) = &message.tool_calls {
+                    let neutral = calls.iter().map(|call| {
+                        let arguments = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
+                        json!({"name":call.function.name,"arguments":arguments})
+                    }).collect::<Vec<_>>();
+                    prompt.push_str(&json!({"tool_calls":neutral}).to_string());
+                }
+                if message.role == "tool" {
+                    prompt.push_str(" [tool_call_id=");
+                    prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
+                    prompt.push(']');
+                }
                 prompt.push_str("<|im_end|>\n");
             }
             if !tools.is_empty() {
@@ -579,6 +621,7 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[Ope
                     "system" | "developer" => "SYSTEM",
                     "user" => "USER",
                     "assistant" => "ASSISTANT",
+                    "tool" => "TOOL",
                     other => {
                         return Err(ApiError::bad_request(format!(
                             "unsupported message role '{other}'"
@@ -587,7 +630,19 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[Ope
                 };
                 prompt.push_str(role);
                 prompt.push_str(":\n");
-                prompt.push_str(&message.content);
+                if let Some(content) = &message.content { prompt.push_str(content); }
+                if let Some(calls) = &message.tool_calls {
+                    let neutral = calls.iter().map(|call| {
+                        let arguments = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
+                        json!({"name":call.function.name,"arguments":arguments})
+                    }).collect::<Vec<_>>();
+                    prompt.push_str(&json!({"tool_calls":neutral}).to_string());
+                }
+                if message.role == "tool" {
+                    prompt.push_str(" [tool_call_id=");
+                    prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
+                    prompt.push(']');
+                }
                 prompt.push_str("\n\n");
             }
             if !tools.is_empty() {
@@ -956,7 +1011,10 @@ mod tests {
     fn message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.into(),
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
             unsupported: HashMap::new(),
         }
     }
