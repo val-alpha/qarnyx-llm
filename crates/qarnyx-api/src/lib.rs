@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn unsupported_chat_roles_are_rejected() {
-        assert!(format_chat_prompt("qwen35", &[message("tool", "result")], &[], &ToolChoice::Auto).is_err());
+        assert!(format_chat_prompt("qwen35", &[message("function", "result")], &[], &ToolChoice::Auto).is_err());
     }
 
     #[test]
