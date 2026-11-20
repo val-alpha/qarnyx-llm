@@ -889,7 +889,7 @@ async fn stream_chat_completion(
                     Ok(parsed) => parsed,
                     Err(error) => {
                         let _ = send(json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}));
-                        let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\\n\\n"));
+                        let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
                         return;
                     }
                 };
