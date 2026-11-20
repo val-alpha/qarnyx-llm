@@ -992,4 +992,3 @@ mod tests {
         assert_eq!(request.max_tokens, None);
     }
 }
-
