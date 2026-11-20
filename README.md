@@ -47,6 +47,7 @@ measure performance on the same hardware as its benchmarks.
 | qarnyx-models | Model definitions, including the experimental Qwen3.5 path |
 | qarnyx-runtime | Prefill, decode, KV cache, sampling, generation |
 | qarnyx-cli | Command-line interface |
+| qarnyx-api | OpenAI-compatible HTTP serving adapter |
 
 See [docs/architecture.md](docs/architecture.md) for the architecture,
 backend contract, memory strategy, and implementation roadmap.
@@ -154,6 +155,60 @@ and omits the end-of-turn control token.
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its
 request-local cache is released. The CLI does not print partial generated text.
+
+
+## OpenAI-compatible HTTP API (experimental)
+
+Build and start the server with one local GGUF model:
+
+```bash
+cargo run --release -p qarnyx-api --bin qarnyx-server -- \
+  --model /path/to/model.gguf --workers 10
+```
+
+The server binds to `127.0.0.1:8000` by default. It exposes
+`GET /health`, `GET /v1/models`, and
+`POST /v1/chat/completions`. The chat endpoint supports ordinary JSON
+responses and Server-Sent Events when `stream=true`:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_completion_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+For streaming output, add `-N` to curl and set `"stream": true`:
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 64,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+```
+
+This first adapter is intentionally text-only: it supports system, developer,
+user, and assistant messages; one completion choice; temperature, top-p, seed,
+and output/context/cache limits. Unsupported sampling controls, stop
+sequences, tools/functions, logprobs, and non-text response formats are
+rejected instead of silently ignored. Qwen3.5 messages use the existing ChatML
+format; LLaMA currently uses a generic role-labelled prompt because this
+runtime does not yet implement model-specific LLaMA chat templates.
+
+The server has no built-in authentication and defaults to loopback binding.
+Do not expose it to an untrusted network without placing it behind an
+authenticated gateway. Concurrent inference is limited to one request by
+default so each request's cache budget remains bounded; raise
+`--max-concurrent-requests` only after measuring available memory.
 
 ## Development
 
