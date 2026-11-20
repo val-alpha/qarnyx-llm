@@ -805,31 +805,18 @@ async fn stream_chat_completion(
 
         let mut completion_tokens = 0usize;
         let mut disconnected = false;
+        let mut raw_output = String::new();
+        // Buffer until the adapter knows whether this is text or a tool call.
+        // This avoids leaking a partial JSON tool envelope as assistant content.
         let result = state.generate(&prepared, &task_cancellation, |event| {
             let delta = match event {
-                GenerationEvent::Token {
-                    token_id: _,
-                    text_delta,
-                } => {
+                GenerationEvent::Token { text_delta, .. } => {
                     completion_tokens += 1;
                     text_delta
                 }
                 GenerationEvent::TextDelta { text } => text,
             };
-            if delta.is_empty() {
-                return;
-            }
-            if !send(stream_chunk(
-                &id,
-                created,
-                &model_id,
-                json!({"content": delta}),
-                Value::Null,
-                include_usage,
-            )) {
-                disconnected = true;
-                task_cancellation.cancel();
-            }
+            raw_output.push_str(&delta);
         });
 
         if disconnected || task_cancellation.is_cancelled() {
@@ -843,7 +830,30 @@ async fn stream_chat_completion(
                     .len()
                     .saturating_sub(prompt_tokens)
                     .max(completion_tokens);
-                let finish_reason = if completion_tokens >= max_new_tokens {
+                let parsed = match parse_model_output(&raw_output, &prepared.tools, &prepared.tool_choice) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = send(json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}));
+                        let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\\n\\n"));
+                        return;
+                    }
+                };
+                if let Some(content) = parsed.content {
+                    if !content.is_empty() && !send(stream_chunk(
+                        &id, created, &model_id, json!({"content": content}), Value::Null, include_usage,
+                    )) { return; }
+                }
+                let tool_calls = parsed.tool_calls.iter().map(|call| call.to_openai()).collect::<Vec<_>>();
+                for (index, call) in tool_calls.iter().enumerate() {
+                    if !send(stream_chunk(
+                        &id, created, &model_id,
+                        json!({"tool_calls":[{"index":index,"id":call.id,"type":"function","function":{"name":call.function.name,"arguments":call.function.arguments}}]}),
+                        Value::Null, include_usage,
+                    )) { return; }
+                }
+                let finish_reason = if !tool_calls.is_empty() {
+                    "tool_calls"
+                } else if completion_tokens >= max_new_tokens {
                     "length"
                 } else {
                     "stop"
