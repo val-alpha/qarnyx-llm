@@ -616,7 +616,7 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[Ope
                 if let Some(calls) = &message.tool_calls {
                     let neutral = calls.iter().map(|call| {
                         let arguments = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
-                        json!({"name":call.function.name,"arguments":arguments})
+                        json!({"id":call.id,"name":call.function.name,"arguments":arguments})
                     }).collect::<Vec<_>>();
                     prompt.push_str(&json!({"tool_calls":neutral}).to_string());
                 }
