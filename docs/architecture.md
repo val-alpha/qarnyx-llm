@@ -408,7 +408,7 @@ Remaining target validation:
 - Add process-wide admission/concurrency controls only when the serving layer
   is designed; do not start HTTP serving inside M7.
 
-## M8 - API and serving layer (planned)
+## M8 - API and serving layer (in progress)
 
 M8 starts only after the runtime generation contract is stable. It is an API
 adapter/serving layer, not another model or inference layer.
@@ -438,9 +438,18 @@ Milestones:
   and callback work. Event callbacks run synchronously on the generation
   thread and can request cooperative cancellation through
   `CancellationToken`.
-- M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
-  the common generation request and map results/events back to the expected
-  response or stream format.
+- M8-B OpenAI-compatible API (initial text-only adapter implemented):
+  `qarnyx-api` exposes `GET /v1/models` and
+  `POST /v1/chat/completions`, with JSON completion responses and OpenAI-style
+  SSE chunks plus `data: [DONE]`. It maps supported chat roles and sampling
+  controls onto the existing runtime configuration, includes token usage, and
+  rejects unsupported tools, stop sequences, logprobs, and non-text request
+  shapes. LLaMA currently uses a generic role-labelled prompt; Qwen3.5 uses its
+  existing ChatML control-token format. Shared GGUF/model assets are read-only,
+  while generator/cache state is request-local. The server uses a bounded
+  inference semaphore (default one concurrent request) and binds to loopback
+  by default. Authentication, multimodal content, model-specific LLaMA chat
+  templates, and broader OpenAI parameter parity remain outstanding.
 - M8-C Anthropic Messages-compatible API: provide the corresponding adapter
   using the same runtime request/event contract.
 - M8-D Native Qarnyx API: expose the runtime's native request/configuration
