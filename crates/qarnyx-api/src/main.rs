@@ -41,6 +41,10 @@ struct Args {
     /// Per-request KV/recurrent cache budget, in MiB.
     #[arg(long, default_value_t = 512)]
     max_cache_mib: usize,
+
+    /// Maximum simultaneous inference requests. Defaults to one to bound cache memory.
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_requests: usize,
 }
 
 #[tokio::main]
@@ -52,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         args.max_memory_mib,
         args.max_context_tokens,
         args.max_cache_mib,
+        args.max_concurrent_requests,
     )?;
 
     let address = SocketAddr::from((args.host, args.port));
