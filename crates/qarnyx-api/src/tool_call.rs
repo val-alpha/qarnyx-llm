@@ -2,7 +2,7 @@
 //! OpenAI is the HTTP boundary; model adapters translate to/from this neutral IR.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -38,12 +38,6 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
-}
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolResult {
-    pub tool_call_id: String,
-    pub name: Option<String>,
-    pub content: String,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolChoice {
@@ -183,14 +177,6 @@ pub fn parse_model_output(output: &str, tools: &[OpenAiTool], choice: &ToolChoic
         });
     }
     Ok(ParsedAssistant { content: None, tool_calls: parsed })
-}
-
-pub fn format_tool_result(result: &ToolResult) -> Value {
-    let mut value = Map::new();
-    value.insert("tool_call_id".into(), Value::String(result.tool_call_id.clone()));
-    if let Some(name) = &result.name { value.insert("name".into(), Value::String(name.clone())); }
-    value.insert("content".into(), Value::String(result.content.clone()));
-    Value::Object(value)
 }
 
 #[cfg(test)]
