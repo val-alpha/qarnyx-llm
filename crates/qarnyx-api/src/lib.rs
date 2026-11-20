@@ -22,6 +22,8 @@ use qarnyx_runtime::{
 };
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use serde::Deserialize;
+mod tool_call;
+use tool_call::{OpenAiTool, ToolChoice, parse_model_output, parse_tool_choice, tool_protocol_instruction, validate_choice, validate_tools};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -253,7 +255,7 @@ struct ChatCompletionRequest {
     logprobs: Option<bool>,
     top_logprobs: Option<usize>,
     logit_bias: Option<HashMap<String, Value>>,
-    tools: Option<Value>,
+    tools: Option<Vec<OpenAiTool>>,
     tool_choice: Option<Value>,
     functions: Option<Value>,
     function_call: Option<Value>,
@@ -326,6 +328,8 @@ struct PreparedRequest {
     config: GenerationConfig,
     seed: u64,
     include_usage: bool,
+    tools: Vec<OpenAiTool>,
+    tool_choice: ToolChoice,
 }
 
 impl ApiState {
@@ -376,15 +380,21 @@ impl ApiState {
         {
             return Err(ApiError::bad_request("logit_bias is not supported"));
         }
-        if request.tools.is_some()
-            || request.tool_choice.is_some()
-            || request.functions.is_some()
-            || request.function_call.is_some()
-        {
+        if request.functions.is_some() || request.function_call.is_some() {
             return Err(ApiError::bad_request(
-                "tool and function calling are not supported",
+                "legacy functions/function_call are not supported; use tools/tool_choice",
             ));
         }
+        let tools = request.tools.unwrap_or_default();
+        if !tools.is_empty() {
+            validate_tools(&tools).map_err(ApiError::bad_request)?;
+        }
+        let tool_choice = parse_tool_choice(request.tool_choice.as_ref())
+            .map_err(ApiError::bad_request)?;
+        if tools.is_empty() && !matches!(tool_choice, ToolChoice::Auto | ToolChoice::None) {
+            return Err(ApiError::bad_request("tool_choice requires a non-empty tools array"));
+        }
+        validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
         if let Some(format) = request.response_format {
             if format.kind != "text" {
                 return Err(ApiError::bad_request(
@@ -448,7 +458,7 @@ impl ApiState {
             ));
         }
 
-        let prompt = format_chat_prompt(&self.assets.architecture, &request.messages)?;
+        let prompt = format_chat_prompt(&self.assets.architecture, &request.messages, &tools, &tool_choice)?;
         let prompt_ids = self
             .assets
             .tokenizer
@@ -478,6 +488,8 @@ impl ApiState {
             config,
             seed,
             include_usage: stream_options.include_usage,
+            tools,
+            tool_choice,
         })
     }
 
@@ -532,7 +544,7 @@ impl ApiState {
     }
 }
 
-fn format_chat_prompt(architecture: &str, messages: &[ChatMessage]) -> Result<String, ApiError> {
+fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[OpenAiTool], choice: &ToolChoice) -> Result<String, ApiError> {
     let mut prompt = String::new();
     match architecture {
         "qwen35" => {
@@ -553,6 +565,11 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage]) -> Result<St
                 prompt.push_str(&message.content);
                 prompt.push_str("<|im_end|>\n");
             }
+            if !tools.is_empty() {
+                prompt.push_str("<|im_start|>system\n");
+                prompt.push_str(&tool_protocol_instruction(tools, choice));
+                prompt.push_str("<|im_end|>\n");
+            }
             // Match the runtime's default non-thinking Qwen3.5 chat prefix.
             prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         }
@@ -571,6 +588,11 @@ fn format_chat_prompt(architecture: &str, messages: &[ChatMessage]) -> Result<St
                 prompt.push_str(role);
                 prompt.push_str(":\n");
                 prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            if !tools.is_empty() {
+                prompt.push_str("SYSTEM:\n");
+                prompt.push_str(&tool_protocol_instruction(tools, choice));
                 prompt.push_str("\n\n");
             }
             prompt.push_str("ASSISTANT:\n");
@@ -922,6 +944,8 @@ mod tests {
         let prompt = format_chat_prompt(
             "qwen35",
             &[message("system", "Be concise."), message("user", "Hello")],
+            &[],
+            &ToolChoice::Auto,
         )
         .unwrap();
 
@@ -938,6 +962,8 @@ mod tests {
         let prompt = format_chat_prompt(
             "llama",
             &[message("user", "Hello"), message("assistant", "Hi")],
+            &[],
+            &ToolChoice::Auto,
         )
         .unwrap();
         assert_eq!(prompt, "USER:\nHello\n\nASSISTANT:\nHi\n\nASSISTANT:\n");
@@ -945,7 +971,7 @@ mod tests {
 
     #[test]
     fn unsupported_chat_roles_are_rejected() {
-        assert!(format_chat_prompt("qwen35", &[message("tool", "result")]).is_err());
+        assert!(format_chat_prompt("qwen35", &[message("tool", "result")], &[], &ToolChoice::Auto).is_err());
     }
 
     #[test]
