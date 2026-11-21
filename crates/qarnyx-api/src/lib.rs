@@ -334,6 +334,65 @@ fn validate_generation_request(
     Ok(())
 }
 
+fn validate_chat_messages(messages: &[ChatMessage]) -> Result<(), ApiError> {
+    if messages.is_empty() {
+        return Err(ApiError::bad_request("messages must contain at least one message"));
+    }
+    let mut pending_tool_call_ids = std::collections::HashSet::new();
+    for message in messages {
+        if !message.unsupported.is_empty() {
+            return Err(ApiError::bad_request("unsupported message fields were provided"));
+        }
+        match message.role.as_str() {
+            "system" | "developer" | "user" => {
+                if message.tool_calls.is_some() || message.tool_call_id.is_some() || message.name.is_some() {
+                    return Err(ApiError::bad_request("tool-call metadata is only valid on assistant/tool messages"));
+                }
+                if message.content.is_none() {
+                    return Err(ApiError::bad_request("message content must be a string"));
+                }
+            }
+            "assistant" => {
+                if message.tool_call_id.is_some() {
+                    return Err(ApiError::bad_request("assistant messages cannot contain tool_call_id"));
+                }
+                if message.content.is_none() && message.tool_calls.as_ref().map_or(true, Vec::is_empty) {
+                    return Err(ApiError::bad_request("assistant message needs content or tool_calls"));
+                }
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        if call.kind != "function" || call.id.trim().is_empty() || call.function.name.trim().is_empty() {
+                            return Err(ApiError::bad_request("assistant tool_calls require id, type='function', and function.name"));
+                        }
+                        let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                            .map_err(|_| ApiError::bad_request("tool call arguments must be a valid JSON string"))?;
+                        if !arguments.is_object() {
+                            return Err(ApiError::bad_request("tool call arguments must encode a JSON object"));
+                        }
+                        if !pending_tool_call_ids.insert(call.id.clone()) {
+                            return Err(ApiError::bad_request(format!("duplicate tool_call_id '{}'", call.id)));
+                        }
+                    }
+                }
+            }
+            "tool" => {
+                if message.tool_call_id.as_deref().map_or(true, str::is_empty) || message.content.is_none() {
+                    return Err(ApiError::bad_request("tool messages require tool_call_id and string content"));
+                }
+                if message.tool_calls.is_some() {
+                    return Err(ApiError::bad_request("tool messages cannot contain tool_calls"));
+                }
+                let call_id = message.tool_call_id.as_deref().unwrap_or_default();
+                if !pending_tool_call_ids.remove(call_id) {
+                    return Err(ApiError::bad_request(format!("tool result references unknown tool_call_id '{call_id}'")));
+                }
+            }
+            other => return Err(ApiError::bad_request(format!("unsupported message role '{other}'"))),
+        }
+    }
+    Ok(())
+}
+
 struct PreparedRequest {
     prompt_ids: Vec<usize>,
     config: GenerationConfig,
@@ -351,63 +410,7 @@ impl ApiState {
                 request.model, self.assets.model_id
             )));
         }
-        if request.messages.is_empty() {
-            return Err(ApiError::bad_request(
-                "messages must contain at least one message",
-            ));
-        }
-        let mut pending_tool_call_ids = std::collections::HashSet::new();
-        for message in &request.messages {
-            if !message.unsupported.is_empty() {
-                return Err(ApiError::bad_request("unsupported message fields were provided"));
-            }
-            match message.role.as_str() {
-                "system" | "developer" | "user" => {
-                    if message.tool_calls.is_some() || message.tool_call_id.is_some() || message.name.is_some() {
-                        return Err(ApiError::bad_request("tool-call metadata is only valid on assistant/tool messages"));
-                    }
-                    if message.content.is_none() {
-                        return Err(ApiError::bad_request("message content must be a string"));
-                    }
-                }
-                "assistant" => {
-                    if message.tool_call_id.is_some() {
-                        return Err(ApiError::bad_request("assistant messages cannot contain tool_call_id"));
-                    }
-                    if message.content.is_none() && message.tool_calls.as_ref().map_or(true, Vec::is_empty) {
-                        return Err(ApiError::bad_request("assistant message needs content or tool_calls"));
-                    }
-                    if let Some(calls) = &message.tool_calls {
-                        for call in calls {
-                            if call.kind != "function" || call.id.trim().is_empty() || call.function.name.trim().is_empty() {
-                                return Err(ApiError::bad_request("assistant tool_calls require id, type='function', and function.name"));
-                            }
-                            let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-                                .map_err(|_| ApiError::bad_request("tool call arguments must be a valid JSON string"))?;
-                            if !arguments.is_object() {
-                                return Err(ApiError::bad_request("tool call arguments must encode a JSON object"));
-                            }
-                            if !pending_tool_call_ids.insert(call.id.clone()) {
-                                return Err(ApiError::bad_request(format!("duplicate tool_call_id '{}'", call.id)));
-                            }
-                        }
-                    }
-                }
-                "tool" => {
-                    if message.tool_call_id.as_deref().map_or(true, str::is_empty) || message.content.is_none() {
-                        return Err(ApiError::bad_request("tool messages require tool_call_id and string content"));
-                    }
-                    if message.tool_calls.is_some() {
-                        return Err(ApiError::bad_request("tool messages cannot contain tool_calls"));
-                    }
-                    let call_id = message.tool_call_id.as_deref().unwrap_or_default();
-                    if !pending_tool_call_ids.remove(call_id) {
-                        return Err(ApiError::bad_request(format!("tool result references unknown tool_call_id '{call_id}'")));
-                    }
-                }
-                other => return Err(ApiError::bad_request(format!("unsupported message role '{other}'"))),
-            }
-        }
+        validate_chat_messages(&request.messages)?;
         if request.n.unwrap_or(1) != 1 {
             return Err(ApiError::bad_request("only n=1 is supported"));
         }
