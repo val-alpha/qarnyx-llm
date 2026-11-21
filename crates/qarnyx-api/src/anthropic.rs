@@ -324,6 +324,10 @@ fn stop_reason(parsed: &tool_call::ParsedAssistant, completion_tokens: usize, ma
     else { "end_turn" }
 }
 
+fn anthropic_tool_id(id: &str) -> String {
+    format!("toolu_{}", id.strip_prefix("call_qarnyx_").unwrap_or(id))
+}
+
 fn content_blocks(parsed: &tool_call::ParsedAssistant) -> Vec<Value> {
     let mut blocks = Vec::new();
     if let Some(text) = &parsed.content {
@@ -334,7 +338,7 @@ fn content_blocks(parsed: &tool_call::ParsedAssistant) -> Vec<Value> {
     for call in &parsed.tool_calls {
         blocks.push(json!({
             "type":"tool_use",
-            "id":call.id,
+            "id":anthropic_tool_id(&call.id),
             "name":call.name,
             "input":call.arguments
         }));
@@ -487,7 +491,7 @@ async fn stream_messages(
                 for call in &parsed.tool_calls {
                     let _ = send("content_block_start", json!({
                         "type":"content_block_start","index":index,
-                        "content_block":{"type":"tool_use","id":call.id,"name":call.name,"input":{}}
+                        "content_block":{"type":"tool_use","id":anthropic_tool_id(&call.id),"name":call.name,"input":{}}
                     }));
                     let _ = send("content_block_delta", json!({
                         "type":"content_block_delta","index":index,
@@ -563,6 +567,7 @@ mod tests {
             }
         ]).unwrap();
         assert_eq!(messages[0].tool_calls.as_ref().unwrap()[0].id, "toolu_1");
+        assert_eq!(anthropic_tool_id("call_qarnyx_7"), "toolu_7");
         assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
         assert_eq!(messages[1].content.as_deref(), Some("Sunny"));
     }
