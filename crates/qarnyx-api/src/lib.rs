@@ -22,6 +22,10 @@ use qarnyx_runtime::{
 };
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use serde::Deserialize;
+mod anthropic;
+mod common;
+mod native;
+pub use common::{GenerationOutput, GenerationRequest};
 mod tool_call;
 use tool_call::{OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice, tool_protocol_instruction, validate_choice, validate_tools};
 use serde_json::{Value, json};
@@ -218,6 +222,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/messages", post(anthropic::create_messages))
+        .route("/v1/generate", post(native::generate))
         .with_state(state)
 }
 
@@ -247,6 +253,7 @@ struct ChatCompletionRequest {
     max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<usize>,
     seed: Option<u64>,
     n: Option<usize>,
     frequency_penalty: Option<f32>,
@@ -508,35 +515,65 @@ impl ApiState {
         }
 
         let prompt = format_chat_prompt(&self.assets.architecture, &request.messages, &tools, &tool_choice)?;
-        let prompt_ids = self
-            .assets
-            .tokenizer
-            .encode(&prompt)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         let temperature = request.temperature.unwrap_or(0.8);
         let top_p = request.top_p.unwrap_or(0.95);
-        validate_generation_request(
-            prompt_ids.len(),
-            max_new_tokens,
-            max_context_tokens,
-            temperature,
-            top_p,
-        )?;
         let seed = request.seed.unwrap_or(DEFAULT_SEED);
         let config = GenerationConfig {
             max_new_tokens,
             max_context_tokens,
             max_cache_mib,
             temperature,
-            top_k: GenerationConfig::default().top_k,
+            top_k: request.top_k.unwrap_or(GenerationConfig::default().top_k),
             top_p,
             seed,
         };
+        self.prepare_generation(
+            GenerationRequest { prompt, config },
+            stream_options.include_usage,
+            tools,
+            tool_choice,
+        )
+    }
+
+    fn prepare_generation(
+        &self,
+        request: GenerationRequest,
+        include_usage: bool,
+        tools: Vec<OpenAiTool>,
+        tool_choice: ToolChoice,
+    ) -> Result<PreparedRequest, ApiError> {
+        let config = request.config;
+        if config.max_context_tokens == 0 || config.max_cache_mib == 0 {
+            return Err(ApiError::bad_request(
+                "max_context_tokens and max_cache_mib must be non-zero",
+            ));
+        }
+        if config.max_context_tokens > self.assets.max_context_tokens {
+            return Err(ApiError::bad_request(format!(
+                "max_context_tokens exceeds the server limit of {}",
+                self.assets.max_context_tokens
+            )));
+        }
+        if config.max_cache_mib > self.assets.max_cache_mib {
+            return Err(ApiError::bad_request(format!(
+                "max_cache_mib exceeds the server limit of {}",
+                self.assets.max_cache_mib
+            )));
+        }
+        let prompt_ids = self.assets.tokenizer.encode(&request.prompt)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        validate_generation_request(
+            prompt_ids.len(),
+            config.max_new_tokens,
+            config.max_context_tokens,
+            config.temperature,
+            config.top_p,
+        )?;
         Ok(PreparedRequest {
             prompt_ids,
             config,
-            seed,
-            include_usage: stream_options.include_usage,
+            seed: config.seed,
+            include_usage,
             tools,
             tool_choice,
         })
