@@ -816,7 +816,7 @@ mod tests {
         let prompt = tokenizer.format_chat_prompt("qwen35", &messages, Some("Call tools only when needed.")).unwrap();
         assert!(prompt.starts_with("<|im_start|>system\nBe concise.<|im_end|>"));
         assert!(prompt.contains(r#"{"tool_calls":[{"id":"toolu_1"}]}"#));
-        assert!(prompt.contains("TOOL").not());
+        assert!(!prompt.contains("TOOL"));
         assert!(prompt.contains(" [tool_call_id=toolu_1]"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
