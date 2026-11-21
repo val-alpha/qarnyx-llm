@@ -24,6 +24,30 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
+static NEXT_ERROR_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct AnthropicApiError(ApiError);
+
+impl From<ApiError> for AnthropicApiError {
+    fn from(error: ApiError) -> Self { Self(error) }
+}
+
+impl IntoResponse for AnthropicApiError {
+    fn into_response(self) -> Response {
+        let error_type = if self.0.kind == "server_error" { "api_error" } else { self.0.kind };
+        let request_id = format!("req_qarnyx_{}", NEXT_ERROR_ID.fetch_add(1, Ordering::Relaxed));
+        (
+            self.0.status,
+            Json(json!({
+                "type":"error",
+                "error":{"type":error_type,"message":self.0.message},
+                "request_id":request_id
+            })),
+        ).into_response()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct MessagesRequest {
     model: String,
@@ -349,7 +373,7 @@ fn content_blocks(parsed: &tool_call::ParsedAssistant) -> Vec<Value> {
 pub(super) async fn create_messages(
     State(state): State<ApiState>,
     payload: Result<Json<MessagesRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AnthropicApiError> {
     let Json(request) = payload.map_err(|error| {
         ApiError::bad_request(format!("invalid JSON request: {error}"))
     })?;
@@ -401,7 +425,7 @@ async fn stream_messages(
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_tokens: usize,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AnthropicApiError> {
     let permit = state.assets.request_slots.clone().acquire_owned().await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let model = state.assets.model_id.clone();
