@@ -287,6 +287,12 @@ portable binaries without an appropriate dispatch/build strategy.
    session-cache reservation) are implemented. Session isolation, stress tests,
    and reproducible benchmarks remain planned.
 
+9. **M8 - API and serving layer:** runtime token streaming, OpenAI Chat
+   Completions, Anthropic Messages, and native Qarnyx generation endpoints are
+   implemented over a shared protocol-neutral GenerationRequest/GenerationOutput
+   contract. Broader vendor parameter parity, multimodal inputs, and built-in
+   authentication remain outstanding.
+
 ## Non-goals for the first milestone
 
 - GPU execution
