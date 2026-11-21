@@ -119,23 +119,31 @@ Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
-storage lengths and do not materialize a full F32 matrix. The automatic Q4_K
-matvec path decodes the active row into reusable F32 scratch for the AVX2/FMA
-dot. Other quantized matvec/matmul paths also decode only the active weight row
-into reusable F32 scratch. RMSNorm requires a positive finite epsilon. RoPE
-pairs the first and second halves of one head vector, matching the split-half
-convention used by LLaMA-style rotary embeddings. Softmax rejects empty or
-non-finite inputs.
+storage lengths and do not materialize a full F32 matrix. On x86_64 with AVX2
+and FMA, the automatic Q4_K/Q5_K/Q6_K matvec path computes directly from packed
+K-quant blocks using F32-input AVX2/FMA kernels; CPUs without both features keep
+the runtime-SIMD dequantize-plus-dot fallback. The previous dequantized mode is
+retained as an explicit Rust API baseline through `CpuBackend::new_dequant()`.
 
-The opt-in `fused-q4k` mode computes directly from packed Q4_K blocks without
+General matvec and matmul fallbacks reuse a per-thread F32 scratch allocation.
+Large operations are partitioned by encoded weight bytes into several tasks
+per worker, while small operations avoid Rayon scheduling overhead. F32-input
+matmul decodes up to four weight rows together and uses an AVX2/FMA register
+tile to reuse each input vector across those rows when the tile and shape fit.
+This is a F32 GEMM micro-kernel after row decoding, not a packed Q4_Kx8 GEMM.
+RMSNorm requires a positive finite epsilon. RoPE pairs the first and second
+halves of one head vector, matching the split-half convention used by
+LLaMA-style rotary embeddings. Softmax rejects empty or non-finite inputs.
+
+The explicit `fused-q4k` mode computes directly from packed Q4_K blocks without
 materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
-falls back to the scalar direct-block dot elsewhere. The opt-in `fused-qk`
+falls back to the scalar direct-block dot elsewhere. The explicit `fused-qk`
 mode extends direct-block matvec to Q5_K and Q6_K, using AVX2 on supported
 x86_64 CPUs and scalar direct-block references elsewhere; it also enables the
-fused Q4_K path. Keep `auto` as the dequantize-plus-AVX2/FMA baseline. Fused
-paths are hardware- and workload-dependent and must remain opt-in until
-representative target-machine measurements are repeatable. RMSNorm, RoPE,
-softmax, and residual addition currently use scalar implementations.
+fused Q4_K path. The automatic mode selects the F32-input direct-block K-quant
+kernels when AVX2+FMA are available. The explicit `llama-q4k` and
+`fused-q4k` modes remain available for controlled A/B comparisons. RMSNorm,
+RoPE, softmax, and residual addition currently use scalar implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
@@ -157,11 +165,11 @@ correctness tests before dispatch is enabled.
 
 Keep the scalar backend as the correctness reference and dispatch by runtime
 feature detection:
-- x86_64: AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
-  available when those features are absent;
-- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 and selects FMA
-  accumulation when supported, with AVX2-only and scalar fallbacks;
+- x86_64: AVX2/FMA matvec and four-row F32 GEMM micro-kernels are implemented;
+- x86_64: automatic direct-block Q4_K/Q5_K/Q6_K matvec uses AVX2+FMA when
+  supported, with dequantized SIMD and scalar fallback paths;
+- x86_64: explicit Q8_K-based Q4_K and integer K-quant alternatives remain
+  selectable for A/B comparisons;
 - aarch64: NEON kernels remain planned;
 - all other configurations: scalar fallback.
 
@@ -400,24 +408,25 @@ Remaining target validation:
 - Add process-wide admission/concurrency controls only when the serving layer
   is designed; do not start HTTP serving inside M7.
 
-## M8 - API and serving layer (planned)
+## M8 - API and serving layer (implemented; protocol parity remains scoped)
 
-M8 starts only after the runtime generation contract is stable. It is an API
-adapter/serving layer, not another model or inference layer.
+M8 is an API adapter/serving layer, not another model or inference layer. OpenAI,
+Anthropic, and native Qarnyx requests are translated to one protocol-neutral
+request contract before reaching the runtime.
 
-Architecture target:
+Architecture:
 
 ```text
 OpenAI request ─┐
-Anthropic       ├──> API adapter ──> common GenerationRequest
-Native Qarnyx ─┘                         │
-                                         ▼
-                                  Qarnyx Runtime
-                                         │
-                                         ▼
-                              common GenerationResult
-                                ├── normal response
-                                └── streaming events
+Anthropic       ├──> protocol adapters ──> GenerationRequest
+Native Qarnyx ─┘                              │
+                                              ▼
+                                       Qarnyx Runtime
+                                              │
+                                              ▼
+                                       GenerationOutput
+                                         ├── JSON response
+                                         └── streaming events
 ```
 
 Milestones:
@@ -428,26 +437,59 @@ Milestones:
   Prompt tokens and end-of-turn markers are not emitted as completion events.
   Blocking generation remains backward compatible and bypasses stream decoder
   and callback work. Event callbacks run synchronously on the generation
-  thread and can request cooperative cancellation through
-  `CancellationToken`.
-- M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
-  the common generation request and map results/events back to the expected
-  response or stream format.
-- M8-C Anthropic Messages-compatible API: provide the corresponding adapter
-  using the same runtime request/event contract.
-- M8-D Native Qarnyx API: expose the runtime's native request/configuration
-  surface without forcing vendor-specific semantics.
-- M8-E Common API abstraction: keep authentication, HTTP routing, JSON parsing,
-  SSE/stream transport, and protocol-specific validation in the serving/API
-  layer rather than in qarnyx-runtime.
+  thread and can request cooperative cancellation through `CancellationToken`.
+- M8-B OpenAI-compatible API (implemented): `qarnyx-api` exposes
+  `GET /v1/models` and `POST /v1/chat/completions`, including JSON completion
+  responses, OpenAI-style SSE chunks, `data: [DONE]`, token usage, supported
+  chat roles, sampling controls, and client-executed function tool calls.
+  Tool-call requests and tool-result history are normalized before prompt
+  formatting; the server never executes client functions.
+- M8-C Anthropic Messages-compatible API (implemented): `POST /v1/messages`
+  accepts system instructions, user/assistant text, text content blocks,
+  function tools, `auto`/`any`/named-tool choices, assistant `tool_use`
+  history, and user `tool_result` blocks. JSON responses use Anthropic message
+  and content-block shapes. Streaming uses message/content-block lifecycle
+  events and text/input-JSON deltas. Tool execution remains the client's
+  responsibility.
+- M8-D Native Qarnyx API (implemented): `POST /v1/generate` accepts a raw
+  prompt plus a native `config` containing `max_new_tokens`,
+  `max_context_tokens`, `max_cache_mib`, `temperature`, `top_k`,
+  `top_p`, and `seed`. Raw prompts are not wrapped in vendor chat syntax.
+  JSON responses expose generated token IDs and usage. Streaming emits native
+  token, text-delta, completion, and done events.
+- M8-E Common API abstraction (implemented): all adapters normalize prompt
+  text and `GenerationConfig` into the public, protocol-neutral
+  `GenerationRequest` contract in `qarnyx-api::common`. The shared
+  `ApiState::prepare_generation` validates limits, tokenizes the prompt, and
+  produces the same prepared request consumed by the single runtime dispatch
+  path. `GenerationOutput` presents generated-only token IDs and shared usage
+  counts to protocol response serializers. HTTP routing, JSON decoding,
+  protocol validation, SSE transport, and authentication boundaries remain in
+  `qarnyx-api`; vendor-specific protocol code is not added to
+  `qarnyx-runtime`.
 
-Streaming should be implemented first because OpenAI, Anthropic, and native
-protocols can then share the same runtime event source. The API layer must not
-duplicate generation loops or model-specific logic.
+Implementation limits (not a claim of full vendor API parity):
+- The API currently serves one loaded GGUF model per server process and
+  supports the LLaMA and Qwen3.5 runtime architectures.
+- Multimodal content, stop sequences, OpenAI logprobs, broad vendor-specific
+  parameter parity, model-specific LLaMA chat templates, and built-in
+  authentication remain outstanding.
+- Anthropic system and message content is text-only. Unsupported content block
+  types and unsupported request fields are rejected rather than silently
+  ignored.
+- The native endpoint is a deliberately small, explicit runtime surface. It
+  exposes the currently supported generation configuration, not internal
+  model/cache implementation details.
+- Tool execution is always performed by the client. Qarnyx formats and returns
+  tool calls and accepts the corresponding tool-result history; it does not
+  invoke external functions.
 
-Model-specific chat formatting remains below M8: Qwen3.5 ChatML templates,
-thinking-mode control tokens, and end-of-turn handling belong to the tokenizer
-and model/runtime integration rather than the HTTP protocol adapters.
+All three adapters share the runtime event source and the same request
+admission semaphore. They must not duplicate model forward passes, decode
+loops, or model-specific prompt-formatting logic. Model-specific chat
+formatting remains below M8: Qwen3.5 ChatML templates, thinking-mode control
+tokens, and end-of-turn handling belong to tokenizer/model integration rather
+than HTTP protocol adapters.
 
 ## Benchmark methodology
 

@@ -13,8 +13,28 @@ use qarnyx_quant::{
 };
 use rayon::ThreadPool;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::sync::Arc;
 use thiserror::Error;
+
+#[cfg(target_arch = "x86_64")]
+mod gemm;
+#[cfg(target_arch = "x86_64")]
+mod kq;
+
+/// Do not parallelize matrix work smaller than this many encoded weight bytes.
+const PARALLEL_MIN_BYTES: usize = 128 * 1024;
+/// Target at least this many encoded weight bytes per task.
+const CHUNK_MIN_BYTES: usize = 32 * 1024;
+/// Keep several tasks per worker to improve work stealing and load balance.
+const CHUNKS_PER_WORKER: usize = 4;
+/// Number of decoded rows held in the F32 GEMM micro-kernel tile.
+const MATMUL_ROW_TILE: usize = 4;
+
+thread_local! {
+    /// A decoded-row scratch allocation retained independently by each worker.
+    static ROW_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Errors raised while constructing the CPU backend.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -82,19 +102,27 @@ pub struct CpuBackend {
     simd_enabled: bool,
     fused_q4k_matvec: bool,
     fused_q5k_q6k_matvec: bool,
+    fused_kq_fma_matvec: bool,
+    llama_q4k_matvec: bool,
 }
 
 impl CpuBackend {
-    /// Creates the default backend with runtime SIMD dispatch.
+    /// Creates the automatic backend.
     ///
-    /// Quantized rows use the reference dequantization path before the F32 dot.
+    /// AVX2+FMA hosts use the direct-block Q4_K/Q5_K/Q6_K kernels; other hosts
+    /// retain the runtime-SIMD dequantization path.
     pub fn new(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, false, false)
+        Self::with_options(worker_count, true, false, false, true, false)
+    }
+
+    /// Creates the previous SIMD dequantize-then-dot path for A/B benchmarks.
+    pub fn new_dequant(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, false, false, false, false)
     }
 
     /// Creates a scalar-only backend for reference testing and benchmarks.
     pub fn new_scalar(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, false, false, false)
+        Self::with_options(worker_count, false, false, false, false, false)
     }
 
     /// Creates a runtime-SIMD backend with the experimental fused Q4_K matvec.
@@ -102,7 +130,7 @@ impl CpuBackend {
     /// Q4_K rows are dotted directly from packed blocks using AVX2/FMA where
     /// available, with a scalar packed-block fallback.
     pub fn new_fused_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, true, false)
+        Self::with_options(worker_count, true, true, false, false, false)
     }
 
     /// Creates a runtime-SIMD backend with direct-block Q4_K, Q5_K, and Q6_K matvecs.
@@ -110,7 +138,24 @@ impl CpuBackend {
     /// Q4_K uses AVX2/FMA where available. Q5_K and Q6_K use AVX2 direct-block
     /// kernels on supported x86_64 hosts and scalar direct-block references otherwise.
     pub fn new_fused_qk(worker_count: usize) -> Result<Self, CpuBackendError> {
-        Self::with_options(worker_count, true, true, true)
+        Self::with_options(worker_count, true, true, true, false, false)
+    }
+
+    /// Creates experimental AVX2/FMA direct-block kernels for Q4_K, Q5_K, and Q6_K.
+    ///
+    /// These consume the original F32 activation vector and are an A/B alternative
+    /// to the existing direct-block kernels. They are not selected by default.
+    pub fn new_fused_kq_fma(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, false, false, true, false)
+    }
+
+    /// Creates a Q4_K x Q8_K AVX2/FMA kernel following llama.cpp's x86 dot path.
+    ///
+    /// This ports the core per-row algorithm from ggml_vec_dot_q4_K_q8_K:
+    /// quantized Q8_K activations, integer dot products, and SIMD/FMA minimum
+    /// correction. It does not use llama.cpp's C++ runtime or model repacking.
+    pub fn new_llama_q4k(worker_count: usize) -> Result<Self, CpuBackendError> {
+        Self::with_options(worker_count, true, false, false, false, true)
     }
 
     fn with_options(
@@ -118,6 +163,8 @@ impl CpuBackend {
         simd_enabled: bool,
         fused_q4k_matvec: bool,
         fused_q5k_q6k_matvec: bool,
+        fused_kq_fma_matvec: bool,
+        llama_q4k_matvec: bool,
     ) -> Result<Self, CpuBackendError> {
         if worker_count == 0 {
             return Err(CpuBackendError::ZeroWorkers);
@@ -129,13 +176,21 @@ impl CpuBackend {
             .build()
             .map_err(|error| CpuBackendError::WorkerPoolBuild(error.to_string()))?;
 
+        let features = CpuFeatures::detect();
+        // FusedK is enabled by the automatic mode only when its required ISA
+        // is available. Explicit alternatives keep their separate dispatch.
+        let fused_kq_fma_matvec =
+            fused_kq_fma_matvec && simd_enabled && features.avx2 && features.fma;
+
         Ok(Self {
             worker_count,
             pool: Arc::new(pool),
-            features: CpuFeatures::detect(),
+            features,
             simd_enabled,
             fused_q4k_matvec,
             fused_q5k_q6k_matvec,
+            fused_kq_fma_matvec,
+            llama_q4k_matvec,
         })
     }
 
@@ -155,6 +210,46 @@ impl CpuBackend {
     /// Returns whether runtime SIMD dispatch was requested and AVX2 is usable.
     pub const fn uses_avx2(&self) -> bool {
         cfg!(target_arch = "x86_64") && self.simd_enabled && self.features.avx2
+    }
+
+    /// Rows per parallel task, sized by bytes and split into several tasks
+    /// per worker so Rayon can balance uneven or noisy work.
+    fn rows_per_task(&self, rows: usize, row_bytes: usize, multiple_of: usize) -> Option<usize> {
+        let total_bytes = rows.checked_mul(row_bytes)?;
+        if self.worker_count <= 1 || total_bytes < PARALLEL_MIN_BYTES {
+            return None;
+        }
+
+        let task_count = self.worker_count.saturating_mul(CHUNKS_PER_WORKER).max(1);
+        let by_balance = rows.div_ceil(task_count);
+        let by_size = (CHUNK_MIN_BYTES / row_bytes.max(1)).max(1);
+        let alignment = multiple_of.max(1);
+        let unaligned = by_balance.max(by_size);
+        let chunk_rows = unaligned.div_ceil(alignment).saturating_mul(alignment);
+        (chunk_rows < rows).then_some(chunk_rows)
+    }
+
+    /// Multiplies up to four decoded weight rows by a row-major input matrix.
+    fn matmul_tile(&self, a: &[f32], tile: usize, k: usize, b: &[f32], c: &mut [f32], n: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if tile == gemm::TILE_ROWS
+            && self.simd_enabled
+            && self.features.avx2
+            && self.features.fma
+            && n >= 8
+        {
+            gemm::tile_4(a, k, b, n, c);
+            return;
+        }
+
+        for row in 0..tile {
+            self.matmul_row(
+                &a[row * k..(row + 1) * k],
+                b,
+                &mut c[row * n..(row + 1) * n],
+                n,
+            );
+        }
     }
 
     fn dot_product(&self, lhs: &[f32], rhs: &[f32]) -> f32 {
@@ -182,6 +277,50 @@ impl CpuBackend {
         }
 
         dot_q4_k_scalar(encoded, input).map_err(|error| shape_mismatch("matvec", error.to_string()))
+    }
+
+    fn fused_q4k_q8k_dot(&self, encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+        if self.simd_enabled && self.features.avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                return dot_q4_k_q8_k_avx2(encoded, input);
+            }
+        }
+
+        dot_q4_k_q8_k_scalar(encoded, input)
+    }
+
+    fn llama_q4k_q8k_dot(&self, encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if self.simd_enabled && self.features.avx2 && self.features.fma {
+            // SAFETY: runtime feature detection above covers the target features.
+            return unsafe { dot_q4_k_q8_k_llama_avx2_fma(encoded, input) };
+        }
+
+        self.fused_q4k_q8k_dot(encoded, input)
+    }
+
+    fn fused_kq_fma_dot(
+        &self,
+        dtype: DType,
+        encoded: &[u8],
+        input: &[f32],
+        group_sums: &[f32],
+    ) -> Result<f32, BackendError> {
+        #[cfg(target_arch = "x86_64")]
+        if self.simd_enabled && self.features.avx2 && self.features.fma {
+            return match dtype {
+                DType::Q4K => Ok(kq::dot_q4_k(encoded, input, group_sums)),
+                DType::Q5K => Ok(kq::dot_q5_k(encoded, input, group_sums)),
+                DType::Q6K => Ok(kq::dot_q6_k(encoded, input)),
+                _ => Err(invalid_parameter(
+                    "matvec",
+                    "experimental fused K-quantized dot received a non K-quantized tensor",
+                )),
+            };
+        }
+
+        self.fused_k_dot(dtype, encoded, input)
     }
 
     fn fused_q5k_dot(&self, encoded: &[u8], input: &[f32]) -> Result<f32, BackendError> {
@@ -352,7 +491,6 @@ unsafe fn dot_avx2_fma(lhs: &[f32], rhs: &[f32]) -> f32 {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn q4k_read_half(bytes: &[u8]) -> f32 {
     let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
     let sign = u32::from(bits & 0x8000) << 16;
@@ -376,7 +514,6 @@ fn q4k_read_half(bytes: &[u8]) -> f32 {
     f32::from_bits(output)
 }
 
-#[cfg(target_arch = "x86_64")]
 fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
     if index < 4 {
         (packed[index] & 0x3f, packed[index + 4] & 0x3f)
@@ -385,6 +522,291 @@ fn q4k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
             (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
             (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
         )
+    }
+}
+
+/// One GGML Q8_K activation block, quantized once and reused for every output row.
+#[derive(Clone)]
+struct Q8KBlock {
+    d: f32,
+    qs: [i8; 256],
+    sums32: [i16; 8],
+}
+
+fn quantize_q8_k(input: &[f32]) -> Result<Vec<Q8KBlock>, BackendError> {
+    if input.is_empty() || input.len() % 256 != 0 {
+        return Err(shape_mismatch(
+            "matvec",
+            format!(
+                "Q8_K input length {} must be a non-zero multiple of 256",
+                input.len()
+            ),
+        ));
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_parameter(
+            "matvec",
+            "Q8_K input values must all be finite",
+        ));
+    }
+
+    let block_count = input.len() / 256;
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(block_count)
+        .map_err(|_| BackendError::AllocationFailed {
+            operation: "matvec_q8k",
+            elements: block_count,
+        })?;
+
+    for values in input.chunks_exact(256) {
+        let max_abs = values
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        let d = max_abs / 127.0;
+        let mut block = Q8KBlock {
+            d,
+            qs: [0; 256],
+            sums32: [0; 8],
+        };
+
+        if d > 0.0 {
+            for (quantized, value) in block.qs.iter_mut().zip(values) {
+                *quantized = (value / d).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+
+        for group in 0..8 {
+            let start = group * 32;
+            block.sums32[group] = block.qs[start..start + 32]
+                .iter()
+                .map(|value| i16::from(*value))
+                .sum();
+        }
+
+        blocks.push(block);
+    }
+
+    Ok(blocks)
+}
+
+fn dot_q4_k_q8_k_scalar(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    let mut total = 0.0_f32;
+
+    for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+        let activations = &input[block_index];
+        let d = q4k_read_half(&weights[..2]);
+        let min_d = q4k_read_half(&weights[2..4]);
+        let packed_scales = &weights[4..16];
+        let quants = &weights[16..144];
+        let scaled_d = d * activations.d;
+        let scaled_min_d = min_d * activations.d;
+
+        for group in 0..8 {
+            let pair = group / 2;
+            let high_nibble = group % 2 != 0;
+            let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+            let quant_bytes = &quants[pair * 32..pair * 32 + 32];
+            let input_offset = group * 32;
+            let mut dot = 0_i32;
+
+            for index in 0..32 {
+                let packed = quant_bytes[index];
+                let quant = if high_nibble {
+                    packed >> 4
+                } else {
+                    packed & 0x0f
+                };
+                dot += i32::from(quant) * i32::from(activations.qs[input_offset + index]);
+            }
+
+            let input_sum = i32::from(activations.sums32[group]);
+            total += scaled_d * f32::from(local_scale) * dot as f32
+                - scaled_min_d * f32::from(local_min) * input_sum as f32;
+        }
+    }
+
+    total
+}
+
+/// AVX2 Q4_K x Q8_K dot product. Each packed Q4_K byte is loaded once and
+/// contributes both its low- and high-nibble activation groups.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_k_q8_k_avx2(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let mut accumulator = _mm256_setzero_ps();
+        let mut min_total = 0.0_f32;
+
+        for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+            let activations = &input[block_index];
+            let d = q4k_read_half(&weights[..2]) * activations.d;
+            let min_d = q4k_read_half(&weights[2..4]) * activations.d;
+            let packed_scales = &weights[4..16];
+            let quants = &weights[16..144];
+            let mut scaled_dot = _mm256_setzero_si256();
+            let mut scaled_min_sum = 0_i64;
+
+            // A 32-byte Q4_K quant group stores 32 low nibbles and 32 high
+            // nibbles. Process both halves together instead of reloading the
+            // same packed weight bytes in two separate group iterations.
+            for pair in 0..4 {
+                let low_group = pair * 2;
+                let high_group = low_group + 1;
+                let (low_scale, low_min) = q4k_scale_min(low_group, packed_scales);
+                let (high_scale, high_min) = q4k_scale_min(high_group, packed_scales);
+
+                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let low_quants = _mm256_and_si256(packed, nibble_mask);
+                let high_quants = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
+
+                let low_activations = _mm256_loadu_si256(
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(low_group * 32)
+                        .cast::<__m256i>(),
+                );
+                let high_activations = _mm256_loadu_si256(
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(high_group * 32)
+                        .cast::<__m256i>(),
+                );
+
+                let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
+                let high_products = _mm256_maddubs_epi16(high_quants, high_activations);
+                let low_scale_lanes = _mm256_set1_epi16(i16::from(low_scale));
+                let high_scale_lanes = _mm256_set1_epi16(i16::from(high_scale));
+                let low_scaled = _mm256_madd_epi16(low_products, low_scale_lanes);
+                let high_scaled = _mm256_madd_epi16(high_products, high_scale_lanes);
+                scaled_dot =
+                    _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
+
+                scaled_min_sum += i64::from(low_min) * i64::from(activations.sums32[low_group]);
+                scaled_min_sum += i64::from(high_min) * i64::from(activations.sums32[high_group]);
+            }
+
+            let integer_lanes = _mm256_cvtepi32_ps(scaled_dot);
+            let block_scale = _mm256_set1_ps(d);
+            accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(integer_lanes, block_scale));
+            min_total += min_d * scaled_min_sum as f32;
+        }
+
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        lanes.iter().sum::<f32>() - min_total
+    }
+}
+
+/// Q4_K x Q8_K AVX2/FMA dot following llama.cpp's x86 ggml_vec_dot_q4_K_q8_K
+/// structure: pairwise integer products, per-group scale application, and a
+/// vectorized Q8_K sum correction.
+///
+/// Unlike the llama.cpp engine, this operates on Qarnyx's row-major Q4_K weights
+/// and the equivalent Q8_K activation blocks; no repacked/interleaved matrix is
+/// required for this per-row x86 dot kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q4_k_q8_k_llama_avx2_fma(encoded: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let mut accumulator = _mm256_setzero_ps();
+        let mut min_accumulator = _mm_setzero_ps();
+
+        for (block_index, weights) in encoded.chunks_exact(144).enumerate() {
+            let activations = &input[block_index];
+            let scale = q4k_read_half(&weights[..2]) * activations.d;
+            let min_scale = -q4k_read_half(&weights[2..4]) * activations.d;
+            let packed_scales = &weights[4..16];
+            let quants = &weights[16..144];
+
+            let mut mins = [0_i16; 8];
+            let mut scales = [0_i16; 8];
+            for group in 0..8 {
+                let (local_scale, local_min) = q4k_scale_min(group, packed_scales);
+                scales[group] = i16::from(local_scale);
+                mins[group] = i16::from(local_min);
+            }
+
+            // Same pairwise min correction used by the llama.cpp x86 kernel:
+            // min[group] * sum(q8[group]) for all eight 32-element groups.
+            let min_lanes = _mm_setr_epi16(
+                mins[0], mins[1], mins[2], mins[3], mins[4], mins[5], mins[6], mins[7],
+            );
+            let sum_lanes = _mm_setr_epi16(
+                activations.sums32[0],
+                activations.sums32[1],
+                activations.sums32[2],
+                activations.sums32[3],
+                activations.sums32[4],
+                activations.sums32[5],
+                activations.sums32[6],
+                activations.sums32[7],
+            );
+            let min_products = _mm_madd_epi16(min_lanes, sum_lanes);
+            let min_values = _mm_cvtepi32_ps(min_products);
+            min_accumulator = _mm_fmadd_ps(_mm_set1_ps(min_scale), min_values, min_accumulator);
+
+            let mut scaled_dot = _mm256_setzero_si256();
+            for pair in 0..4 {
+                let low_group = pair * 2;
+                let high_group = low_group + 1;
+
+                let packed = _mm256_loadu_si256(quants.as_ptr().add(pair * 32).cast::<__m256i>());
+                let low_quants = _mm256_and_si256(packed, nibble_mask);
+                let high_quants = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble_mask);
+                let low_activations = _mm256_loadu_si256(
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(low_group * 32)
+                        .cast::<__m256i>(),
+                );
+                let high_activations = _mm256_loadu_si256(
+                    activations
+                        .qs
+                        .as_ptr()
+                        .add(high_group * 32)
+                        .cast::<__m256i>(),
+                );
+
+                let low_products = _mm256_maddubs_epi16(low_quants, low_activations);
+                let high_products = _mm256_maddubs_epi16(high_quants, high_activations);
+                let low_scaled =
+                    _mm256_madd_epi16(low_products, _mm256_set1_epi16(scales[low_group]));
+                let high_scaled =
+                    _mm256_madd_epi16(high_products, _mm256_set1_epi16(scales[high_group]));
+                scaled_dot =
+                    _mm256_add_epi32(scaled_dot, _mm256_add_epi32(low_scaled, high_scaled));
+            }
+
+            accumulator = _mm256_fmadd_ps(
+                _mm256_set1_ps(scale),
+                _mm256_cvtepi32_ps(scaled_dot),
+                accumulator,
+            );
+        }
+
+        let mut lanes = [0.0_f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+        let main_sum = lanes.iter().sum::<f32>();
+        let min_pair_sums = _mm_add_ps(
+            min_accumulator,
+            _mm_movehl_ps(min_accumulator, min_accumulator),
+        );
+        let min_sum = _mm_cvtss_f32(_mm_add_ss(
+            min_pair_sums,
+            _mm_shuffle_ps::<1>(min_pair_sums, min_pair_sums),
+        ));
+        main_sum + min_sum
     }
 }
 
@@ -725,12 +1147,7 @@ unsafe fn dot_q6_k_avx2_fma(encoded: &[u8], input: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn matmul_row_avx2(
-    row: &[f32],
-    input: &[f32],
-    output: &mut [f32],
-    columns: usize,
-) {
+unsafe fn matmul_row_avx2(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -756,12 +1173,7 @@ unsafe fn matmul_row_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_row_avx2_fma(
-    row: &[f32],
-    input: &[f32],
-    output: &mut [f32],
-    columns: usize,
-) {
+unsafe fn matmul_row_avx2_fma(row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
     use std::arch::x86_64::*;
 
     unsafe {
@@ -882,6 +1294,37 @@ fn allocate_row_scratch(
     Ok(scratch)
 }
 
+/// Runs a closure with a retained per-thread F32 scratch buffer.
+///
+/// Rayon workers are persistent, so the decoded-row allocation is reused on
+/// subsequent matvec/matmul calls. Re-entrant borrowing falls back to a
+/// temporary allocation rather than panicking.
+fn with_row_scratch<R>(
+    operation: &'static str,
+    elements: usize,
+    body: impl FnOnce(&mut [f32]) -> Result<R, BackendError>,
+) -> Result<R, BackendError> {
+    ROW_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            if buffer.len() < elements {
+                let missing = elements - buffer.len();
+                buffer
+                    .try_reserve_exact(missing)
+                    .map_err(|_| BackendError::AllocationFailed {
+                        operation,
+                        elements,
+                    })?;
+                buffer.resize(elements, 0.0);
+            }
+            body(&mut buffer[..elements])
+        }
+        Err(_) => {
+            let mut temporary = allocate_row_scratch(operation, elements)?;
+            body(&mut temporary)
+        }
+    })
+}
+
 fn decode_weight_row(
     operation: &'static str,
     raw_type: u32,
@@ -946,119 +1389,109 @@ impl Backend for CpuBackend {
         let (raw_type, columns, row_bytes) =
             matrix_row_layout(&weights, out_features, in_features, "matvec")?;
 
-        let workers = self.worker_count.min(out_features);
-        let parallel = workers > 1 && out_features >= workers.saturating_mul(2);
+        let fused_kq_fma = self.fused_kq_fma_matvec
+            && matches!(weights.dtype, DType::Q4K | DType::Q5K | DType::Q6K);
         let fused_q4k = self.fused_q4k_matvec && weights.dtype == DType::Q4K;
-        let fused_q5k_q6k =
-            self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
-        let fused = fused_q4k || fused_q5k_q6k;
+        let llama_q4k = self.llama_q4k_matvec && weights.dtype == DType::Q4K;
 
-        if fused {
-            if parallel {
-                let chunk_rows = out_features.div_ceil(workers);
-                return self.pool.install(|| {
-                    output.par_chunks_mut(chunk_rows).enumerate().try_for_each(
-                        |(chunk_index, output_chunk)| {
-                            let first_row = chunk_index * chunk_rows;
-                            for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
-                                let row_index = first_row + local_row;
-                                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
-                                    shape_mismatch(
-                                        "matvec",
-                                        "encoded weight row offset overflowed usize",
-                                    )
-                                })?;
-                                let end = start.checked_add(row_bytes).ok_or_else(|| {
-                                    shape_mismatch(
-                                        "matvec",
-                                        "encoded weight row end overflowed usize",
-                                    )
-                                })?;
-                                let encoded_row =
-                                    weights.data.get(start..end).ok_or_else(|| {
-                                        shape_mismatch(
-                                            "matvec",
-                                            "encoded weight row is outside the tensor byte range",
-                                        )
-                                    })?;
-                                *output_value =
-                                    self.fused_k_dot(weights.dtype, encoded_row, input)?;
-                            }
-                            Ok(())
-                        },
-                    )
-                });
-            }
+        // Quantize activations once per matvec for the legacy Q8_K variants.
+        let q8k_input = if (llama_q4k && in_features >= 256 && in_features % 256 == 0)
+            || (fused_q4k && !fused_kq_fma && in_features >= 2048 && self.uses_avx2())
+        {
+            Some(quantize_q8_k(input)?)
+        } else {
+            None
+        };
 
-            for (row_index, output_value) in output.iter_mut().enumerate() {
-                let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row offset overflowed usize")
-                })?;
-                let end = start.checked_add(row_bytes).ok_or_else(|| {
-                    shape_mismatch("matvec", "encoded weight row end overflowed usize")
-                })?;
-                let encoded_row = weights.data.get(start..end).ok_or_else(|| {
-                    shape_mismatch(
-                        "matvec",
-                        "encoded weight row is outside the tensor byte range",
-                    )
-                })?;
-                *output_value = self.fused_k_dot(weights.dtype, encoded_row, input)?;
-            }
-            return Ok(());
+        // Q4_K/Q5_K minimum correction needs one sum per 32 input values.
+        // Compute those sums once and share them across every output row.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
+        let mut q4k_sums_stack = [0.0_f32; 512];
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
+        let mut q4k_sums_heap: Vec<f32>;
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut q4k_sums: &[f32] = &[];
+        #[cfg(target_arch = "x86_64")]
+        if fused_kq_fma
+            && matches!(weights.dtype, DType::Q4K | DType::Q5K)
+            && self.simd_enabled
+            && self.features.avx2
+            && self.features.fma
+        {
+            let groups = in_features / 32;
+            let buffer: &mut [f32] = if groups <= q4k_sums_stack.len() {
+                &mut q4k_sums_stack[..groups]
+            } else {
+                q4k_sums_heap = allocate_row_scratch("matvec", groups)?;
+                &mut q4k_sums_heap[..]
+            };
+            kq::group_sums(input, buffer);
+            q4k_sums = &*buffer;
         }
 
-        if parallel {
-            let chunk_rows = out_features.div_ceil(workers);
-            let simd_enabled = self.simd_enabled;
-            let features = self.features;
+        let fused_q5k_q6k =
+            self.fused_q5k_q6k_matvec && matches!(weights.dtype, DType::Q5K | DType::Q6K);
+        let fused = fused_q4k || llama_q4k || fused_kq_fma || fused_q5k_q6k;
 
-            return self.pool.install(|| {
+        let run_rows = |first_row: usize, output_rows: &mut [f32]| -> Result<(), BackendError> {
+            if fused {
+                for (offset, output_value) in output_rows.iter_mut().enumerate() {
+                    let row_index = first_row + offset;
+                    let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
+                        shape_mismatch("matvec", "encoded weight row offset overflowed usize")
+                    })?;
+                    let end = start.checked_add(row_bytes).ok_or_else(|| {
+                        shape_mismatch("matvec", "encoded weight row end overflowed usize")
+                    })?;
+                    let encoded_row = weights.data.get(start..end).ok_or_else(|| {
+                        shape_mismatch(
+                            "matvec",
+                            "encoded weight row is outside the tensor byte range",
+                        )
+                    })?;
+
+                    *output_value = match q8k_input.as_deref() {
+                        Some(quantized_input) if llama_q4k => {
+                            self.llama_q4k_q8k_dot(encoded_row, quantized_input)
+                        }
+                        Some(quantized_input) => {
+                            self.fused_q4k_q8k_dot(encoded_row, quantized_input)
+                        }
+                        None if fused_kq_fma => {
+                            self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?
+                        }
+                        None => self.fused_k_dot(weights.dtype, encoded_row, input)?,
+                    };
+                }
+                return Ok(());
+            }
+
+            with_row_scratch("matvec", in_features, |row| {
+                for (offset, output_value) in output_rows.iter_mut().enumerate() {
+                    decode_weight_row(
+                        "matvec",
+                        raw_type,
+                        columns,
+                        row_bytes,
+                        first_row + offset,
+                        &weights,
+                        row,
+                    )?;
+                    *output_value = self.dot_product(row, input);
+                }
+                Ok(())
+            })
+        };
+
+        match self.rows_per_task(out_features, row_bytes, 1) {
+            Some(chunk_rows) => self.pool.install(|| {
                 output
                     .par_chunks_mut(chunk_rows)
                     .enumerate()
-                    .try_for_each(|(chunk_index, output_chunk)| {
-                        let first_row = chunk_index * chunk_rows;
-                        let mut row = allocate_row_scratch("matvec", in_features)?;
-                        for (local_row, output_value) in output_chunk.iter_mut().enumerate() {
-                            let row_index = first_row + local_row;
-                            decode_weight_row(
-                                "matvec",
-                                raw_type,
-                                columns,
-                                row_bytes,
-                                row_index,
-                                &weights,
-                                &mut row,
-                            )?;
-                            *output_value = if simd_enabled && features.avx2 {
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    if features.fma {
-                                        dot_avx2_fma(&row, input)
-                                    } else {
-                                        dot_avx2(&row, input)
-                                    }
-                                }
-                                #[cfg(not(target_arch = "x86_64"))]
-                                dot_scalar(&row, input)
-                            } else {
-                                dot_scalar(&row, input)
-                            };
-                        }
-                        Ok(())
-                    })
-            });
+                    .try_for_each(|(index, rows)| run_rows(index * chunk_rows, rows))
+            }),
+            None => run_rows(0, output),
         }
-
-        let mut row = allocate_row_scratch("matvec", in_features)?;
-        for (row_index, output_value) in output.iter_mut().enumerate() {
-            decode_weight_row(
-                "matvec", raw_type, columns, row_bytes, row_index, &weights, &mut row,
-            )?;
-            *output_value = self.dot_product(&row, input);
-        }
-        Ok(())
     }
 
     fn matvec_batch(
@@ -1138,59 +1571,53 @@ impl Backend for CpuBackend {
         }
 
         let (raw_type, columns, row_bytes) = matrix_row_layout(&weights, m, k, "matmul")?;
-        let workers = self.worker_count.min(m);
-        let parallel = workers > 1 && m >= workers.saturating_mul(2);
+        let scratch_elements = k.checked_mul(MATMUL_ROW_TILE).ok_or_else(|| {
+            shape_mismatch("matmul", "four-row scratch element count overflowed usize")
+        })?;
 
-        if parallel {
-            let chunk_rows = m.div_ceil(workers);
-            return self.pool.install(|| {
+        let run_rows = |first_row: usize, output_rows: &mut [f32]| -> Result<(), BackendError> {
+            let rows = output_rows.len() / n;
+            with_row_scratch("matmul", scratch_elements, |scratch| {
+                let mut done = 0;
+                while done < rows {
+                    let tile_rows = (rows - done).min(MATMUL_ROW_TILE);
+                    for slot in 0..tile_rows {
+                        decode_weight_row(
+                            "matmul",
+                            raw_type,
+                            columns,
+                            row_bytes,
+                            first_row + done + slot,
+                            &weights,
+                            &mut scratch[slot * k..(slot + 1) * k],
+                        )?;
+                    }
+
+                    let output_start = done * n;
+                    let output_end = (done + tile_rows) * n;
+                    self.matmul_tile(
+                        &scratch[..tile_rows * k],
+                        tile_rows,
+                        k,
+                        input,
+                        &mut output_rows[output_start..output_end],
+                        n,
+                    );
+                    done += tile_rows;
+                }
+                Ok(())
+            })
+        };
+
+        match self.rows_per_task(m, row_bytes, MATMUL_ROW_TILE) {
+            Some(chunk_rows) => self.pool.install(|| {
                 output
                     .par_chunks_mut(chunk_rows * n)
                     .enumerate()
-                    .try_for_each(|(chunk_index, output_chunk)| {
-                        let first_row = chunk_index * chunk_rows;
-                        let mut row = allocate_row_scratch("matmul", k)?;
-                        let rows_in_chunk = output_chunk.len() / n;
-
-                        for local_row in 0..rows_in_chunk {
-                            let row_index = first_row + local_row;
-                            decode_weight_row(
-                                "matmul",
-                                raw_type,
-                                columns,
-                                row_bytes,
-                                row_index,
-                                &weights,
-                                &mut row,
-                            )?;
-                            let output_start = local_row * n;
-                            self.matmul_row(
-                                &row,
-                                input,
-                                &mut output_chunk[output_start..output_start + n],
-                                n,
-                            );
-                        }
-                        Ok(())
-                    })
-            });
+                    .try_for_each(|(index, rows)| run_rows(index * chunk_rows, rows))
+            }),
+            None => run_rows(0, output),
         }
-
-        let mut row = allocate_row_scratch("matmul", k)?;
-        for row_index in 0..m {
-            decode_weight_row(
-                "matmul", raw_type, columns, row_bytes, row_index, &weights, &mut row,
-            )?;
-
-            let output_start = row_index * n;
-            self.matmul_row(
-                &row,
-                input,
-                &mut output[output_start..output_start + n],
-                n,
-            );
-        }
-        Ok(())
     }
 
     fn parallel_for_each_mut(
@@ -1408,9 +1835,7 @@ mod tests {
             })
             .unwrap();
 
-        let expected = (0..32)
-            .map(|index| (index / 8) as f32)
-            .collect::<Vec<_>>();
+        let expected = (0..32).map(|index| (index / 8) as f32).collect::<Vec<_>>();
         assert_eq!(values, expected);
     }
 
@@ -1457,16 +1882,26 @@ mod tests {
     }
 
     #[test]
+    fn automatic_backend_selects_fused_kq_only_when_avx2_fma_are_available() {
+        let automatic = CpuBackend::new(1).unwrap();
+        assert_eq!(
+            automatic.fused_kq_fma_matvec,
+            automatic.features.avx2 && automatic.features.fma
+        );
+    }
+
+    #[test]
     fn fused_q5k_q6k_matvec_matches_scalar_and_simd_dequant_references() {
         let shape = [4, 512];
         let input = (0..512)
             .map(|index| ((index * 11 % 73) as f32 - 36.0) / 41.0)
             .collect::<Vec<_>>();
         let scalar = CpuBackend::new_scalar(1).unwrap();
-        let simd_dequant = CpuBackend::new(1).unwrap();
+        let simd_dequant = CpuBackend::new_dequant(1).unwrap();
         let fused = CpuBackend::new_fused_qk(1).unwrap();
         // Four output rows and two workers exercise the parallel fused-row path.
         let parallel_fused = CpuBackend::new_fused_qk(2).unwrap();
+        let experimental_fused = CpuBackend::new_fused_kq_fma(2).unwrap();
 
         let mut q5_k = vec![0_u8; 176 * 8];
         let half_scales = [0x3c00_u16, 0x3800, 0x4000, 0x3a00];
@@ -1505,6 +1940,7 @@ mod tests {
             let mut dequant_output = [0.0_f32; 4];
             let mut fused_output = [0.0_f32; 4];
             let mut parallel_output = [0.0_f32; 4];
+            let mut experimental_output = [0.0_f32; 4];
 
             scalar.matvec(weights, &input, &mut expected).unwrap();
             simd_dequant
@@ -1513,6 +1949,9 @@ mod tests {
             fused.matvec(weights, &input, &mut fused_output).unwrap();
             parallel_fused
                 .matvec(weights, &input, &mut parallel_output)
+                .unwrap();
+            experimental_fused
+                .matvec(weights, &input, &mut experimental_output)
                 .unwrap();
 
             for row in 0..4 {
@@ -1537,6 +1976,13 @@ mod tests {
                     dtype,
                     expected[row],
                     parallel_output[row]
+                );
+                assert!(
+                    (experimental_output[row] - expected[row]).abs() <= tolerance,
+                    "experimental AVX2/FMA {:?} mismatch at row {row}: expected={}, actual={}",
+                    dtype,
+                    expected[row],
+                    experimental_output[row]
                 );
             }
         }
@@ -1565,7 +2011,7 @@ mod tests {
             .map(|index| ((index * 7 % 41) as f32 - 20.0) / 23.0)
             .collect::<Vec<_>>();
         let scalar = CpuBackend::new_scalar(1).unwrap();
-        let simd_dequant = CpuBackend::new(1).unwrap();
+        let simd_dequant = CpuBackend::new_dequant(1).unwrap();
         let fused = CpuBackend::new_fused_q4k(1).unwrap();
         let mut expected = [0.0_f32; 2];
         let mut dequant_output = [0.0_f32; 2];
@@ -1601,6 +2047,165 @@ mod tests {
                 "parallel fused Q4_K mismatch at row {row}: expected={}, actual={}",
                 expected[row],
                 parallel_output[row]
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_q4k_q8k_dot_matches_scalar_q8k_reference() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let mut encoded = vec![0_u8; 144 * 8];
+        for (block_index, block) in encoded.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 17 + block_index * 23) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 31) as u8;
+            }
+        }
+
+        let input = (0..2048)
+            .map(|index| ((index * 7 % 113) as f32 - 56.0) / 57.0)
+            .collect::<Vec<_>>();
+        let quantized = quantize_q8_k(&input).unwrap();
+        let expected = dot_q4_k_q8_k_scalar(&encoded, &quantized);
+        let actual = unsafe { dot_q4_k_q8_k_avx2(&encoded, &quantized) };
+
+        let tolerance = 1.0e-4 * (1.0 + expected.abs());
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "AVX2 Q4_K x Q8_K mismatch: expected={expected}, actual={actual}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fused_kq_fma_matvec_matches_scalar_reference() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let shape = [4, 2048];
+        let mut bytes = vec![0_u8; 144 * 8 * shape[0]];
+        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 19 + block_index * 7) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 11) as u8;
+            }
+        }
+
+        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
+        let input = (0..2048)
+            .map(|index| ((index * 13 % 97) as f32 - 48.0) / 49.0)
+            .collect::<Vec<_>>();
+        let reference = CpuBackend::new_scalar(1).unwrap();
+        let optimized = CpuBackend::new_fused_kq_fma(4).unwrap();
+        let mut expected = [0.0_f32; 4];
+        let mut actual = [0.0_f32; 4];
+
+        reference.matvec(weights, &input, &mut expected).unwrap();
+        optimized.matvec(weights, &input, &mut actual).unwrap();
+
+        for row in 0..4 {
+            let tolerance = 1.0e-3 * (1.0 + expected[row].abs());
+            assert!(
+                (actual[row] - expected[row]).abs() <= tolerance,
+                "F32-input Q4_K FMA mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                actual[row]
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn llama_q4k_avx2_fma_matches_q8k_scalar_reference() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let mut encoded = vec![0_u8; 144 * 8];
+        for (block_index, block) in encoded.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 17 + block_index * 23) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 31) as u8;
+            }
+        }
+
+        let input = (0..2048)
+            .map(|index| ((index * 7 % 113) as f32 - 56.0) / 57.0)
+            .collect::<Vec<_>>();
+        let quantized = quantize_q8_k(&input).unwrap();
+        let expected = dot_q4_k_q8_k_scalar(&encoded, &quantized);
+        let actual = unsafe { dot_q4_k_q8_k_llama_avx2_fma(&encoded, &quantized) };
+
+        let tolerance = 1.0e-4 * (1.0 + expected.abs());
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "llama-style AVX2/FMA Q4_K x Q8_K mismatch: expected={expected}, actual={actual}"
+        );
+    }
+
+    #[test]
+    fn q4k_q8k_matvec_matches_f32_reference_with_bounded_error() {
+        let shape = [4, 2048];
+        let mut bytes = vec![0_u8; 144 * 8 * shape[0]];
+
+        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (index, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = (index * 19 + block_index * 7) as u8;
+            }
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                *byte = (index * 29 + block_index * 11) as u8;
+            }
+        }
+
+        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
+        let input = (0..2048)
+            .map(|index| ((index * 13 % 97) as f32 - 48.0) / 49.0)
+            .collect::<Vec<_>>();
+        let reference = CpuBackend::new_scalar(1).unwrap();
+        let optimized = CpuBackend::new_fused_q4k(4).unwrap();
+        let llama_style = CpuBackend::new_llama_q4k(4).unwrap();
+        let mut expected = [0.0_f32; 4];
+        let mut actual = [0.0_f32; 4];
+        let mut llama_output = [0.0_f32; 4];
+
+        reference.matvec(weights, &input, &mut expected).unwrap();
+        optimized.matvec(weights, &input, &mut actual).unwrap();
+        llama_style
+            .matvec(weights, &input, &mut llama_output)
+            .unwrap();
+
+        for row in 0..4 {
+            let tolerance = 3.0e-2 * (1.0 + expected[row].abs());
+            assert!(
+                (actual[row] - expected[row]).abs() <= tolerance,
+                "Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                actual[row]
+            );
+            assert!(
+                (llama_output[row] - expected[row]).abs() <= tolerance,
+                "llama-style Q4_K x Q8_K mismatch at row {row}: expected={}, actual={}",
+                expected[row],
+                llama_output[row]
             );
         }
     }
@@ -1675,10 +2280,7 @@ mod tests {
             .matvec(weights, &vector, &mut automatic_vector_output)
             .unwrap();
 
-        for (expected, actual) in scalar_vector_output
-            .iter()
-            .zip(&automatic_vector_output)
-        {
+        for (expected, actual) in scalar_vector_output.iter().zip(&automatic_vector_output) {
             assert!(
                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
                 "matvec mismatch: scalar={expected}, automatic={actual}"
@@ -1694,10 +2296,7 @@ mod tests {
             .matmul(weights, &matrix, &mut automatic_matrix_output, m, n, k)
             .unwrap();
 
-        for (expected, actual) in scalar_matrix_output
-            .iter()
-            .zip(&automatic_matrix_output)
-        {
+        for (expected, actual) in scalar_matrix_output.iter().zip(&automatic_matrix_output) {
             assert!(
                 (expected - actual).abs() <= 1.0e-3 * (1.0 + expected.abs()),
                 "matmul mismatch: scalar={expected}, automatic={actual}"
@@ -1719,7 +2318,9 @@ mod tests {
         let mut second = [0.0_f32; 3];
         let mut outputs: [&mut [f32]; 2] = [&mut first, &mut second];
 
-        backend.matvec_batch(&weights, &input, &mut outputs).unwrap();
+        backend
+            .matvec_batch(&weights, &input, &mut outputs)
+            .unwrap();
 
         assert_eq!(first, [4.5, 9.0]);
         assert_eq!(second, [-1.0, 4.5, 6.0]);
@@ -1741,6 +2342,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn task_sizing_is_byte_based_and_tile_aligned() {
+        let backend = CpuBackend::new(4).unwrap();
+        assert_eq!(backend.rows_per_task(64, 16, 1), None);
+
+        let chunk = backend.rows_per_task(6144, 1152, MATMUL_ROW_TILE).unwrap();
+        assert_eq!(chunk % MATMUL_ROW_TILE, 0);
+        assert!(6144_usize.div_ceil(chunk) >= 4);
+
+        assert_eq!(
+            CpuBackend::new(1).unwrap().rows_per_task(6144, 1152, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn row_scratch_is_reused_between_calls() {
+        let first = with_row_scratch("test", 128, |scratch| Ok(scratch.as_ptr() as usize)).unwrap();
+        let second = with_row_scratch("test", 64, |scratch| Ok(scratch.as_ptr() as usize)).unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -1880,6 +2503,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, [19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn four_row_tiled_matmul_matches_reference_and_handles_tail_rows_columns() {
+        let (m, k, n) = (9_usize, 32_usize, 17_usize);
+        let values = (0..m * k)
+            .map(|index| ((index * 7 % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let shape = [m, k];
+        let weights = TensorView::new(&bytes, &shape, DType::F32);
+        let input = (0..k * n)
+            .map(|index| ((index * 11 % 43) as f32 - 21.0) / 23.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0_f32; m * n];
+        for row in 0..m {
+            for column in 0..n {
+                let mut sum = 0.0_f32;
+                for inner in 0..k {
+                    sum += values[row * k + inner] * input[inner * n + column];
+                }
+                expected[row * n + column] = sum;
+            }
+        }
+
+        let mut actual = vec![0.0_f32; m * n];
+        CpuBackend::new(1)
+            .unwrap()
+            .matmul(weights, &input, &mut actual, m, n, k)
+            .unwrap();
+
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 1.0e-4 * (1.0 + expected.abs());
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "matmul mismatch at {index}: got {actual}, expected {expected}"
+            );
+        }
     }
 
     #[test]

@@ -47,6 +47,7 @@ measure performance on the same hardware as its benchmarks.
 | qarnyx-models | Model definitions, including the experimental Qwen3.5 path |
 | qarnyx-runtime | Prefill, decode, KV cache, sampling, generation |
 | qarnyx-cli | Command-line interface |
+| qarnyx-api | OpenAI-compatible HTTP serving adapter |
 
 See [docs/architecture.md](docs/architecture.md) for the architecture,
 backend contract, memory strategy, and implementation roadmap.
@@ -77,15 +78,22 @@ sizes. The reader remains little-endian only and does not read payload bytes
 during inspection.
 
 The CPU backend executes matrix-vector and matrix-matrix operations with all
-currently registered storage types. The default `auto` backend dequantizes
-Q4_K rows into reusable F32 scratch before the AVX2/FMA dot product.
-The opt-in `fused-q4k` mode evaluates Q4_K directly from packed blocks using
-runtime AVX2/FMA on supported x86_64 CPUs. The opt-in `fused-qk` mode extends
-direct-block matvec to Q4_K, Q5_K, and Q6_K, using AVX2 for Q5_K/Q6_K on
-supported x86_64 CPUs and scalar direct-block fallbacks elsewhere. These
-experimental paths do not materialize an F32 weight row. Other quantized
-formats still decode one active row at a time, and the full weight matrix is
-never expanded.
+currently registered storage types. On x86_64 hosts with AVX2+FMA, the default
+`auto` backend uses direct-block F32-input kernels for Q4_K, Q5_K, and Q6_K,
+avoiding F32 weight-row materialization. Other hosts retain the runtime-SIMD
+dequantize-then-dot path (or its portable fallback). The previous dequantized
+path remains available through the `CpuBackend::new_dequant()` API for A/B
+benchmarks.
+
+The explicit `fused-q4k` mode uses a Q8_K-quantized activation vector and an
+integer AVX2 Q4_K dot for wide inputs. The `llama-q4k` mode implements the x86
+AVX2/FMA Q4_K x Q8_K per-row dot strategy used by `ggml_vec_dot_q4_K_q8_K`
+in llama.cpp, including its SIMD minimum correction. It does not call llama.cpp
+or use its repacked/interleaved matrix format. The explicit `fused-kq-fma`
+mode selects the direct-block F32-input AVX2/FMA K-quant path for comparison;
+this is also the path selected by `auto` when AVX2+FMA are available. The
+explicit `fused-qk` mode retains the integer/AVX2 direct-block alternatives.
+Unsupported CPU features use the corresponding portable fallback.
 
 Large matvec/matmul output rows and independent Qwen3.5 projection batches use
 the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
@@ -107,17 +115,19 @@ kernel mode explicitly:
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-q4k
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel llama-q4k
+./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-kq-fma
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-qk
 ```
 
 For Qwen3.5, add `--thinking` to enable model reasoning output; without the
 flag the CLI uses the non-thinking prefix.
 
-The `auto` mode is the existing AVX2/FMA baseline with row dequantization.
-`fused-q4k` enables the experimental direct-block Q4_K matvec;
-`fused-qk` enables direct-block Q4_K/Q5_K/Q6_K matvecs. Both modes remain
-opt-in pending broader validation. `scalar` remains the non-SIMD correctness
-reference.
+The `auto` mode now prefers direct-block F32-input Q4_K/Q5_K/Q6_K AVX2/FMA
+kernels when the runtime detects both AVX2 and FMA. Use `CpuBackend::new_dequant()`
+in Rust benchmarks to compare against the previous dequantize-plus-dot baseline.
+`fused-q4k`, `llama-q4k`, and `fused-qk` remain explicit alternatives for
+same-machine comparisons. `scalar` remains the non-SIMD correctness reference.
 
 Generation is capped at 4096 combined prompt and requested output tokens by
 default. Use `--max-context-tokens N` to set a different per-request limit.
@@ -145,6 +155,88 @@ and omits the end-of-turn control token.
 Generation can be cancelled with Ctrl+C. Cancellation is cooperative: the
 currently executing token evaluation finishes, then inference stops and its
 request-local cache is released. The CLI does not print partial generated text.
+
+
+## HTTP APIs (experimental)
+
+Build and start the server with one local GGUF model:
+
+```bash
+cargo run --release -p qarnyx-api --bin qarnyx-server -- \
+  --model /path/to/model.gguf --workers 10
+```
+
+The server binds to `127.0.0.1:8000` by default. It exposes three protocol
+adapters over the same Qarnyx runtime generation path:
+
+| Protocol | Endpoint | Streaming |
+|---|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` | OpenAI-style SSE |
+| Anthropic Messages | `POST /v1/messages` | Anthropic Messages SSE events |
+| Native Qarnyx | `POST /v1/generate` | Native token/text/completion events |
+
+The shared discovery endpoints are `GET /health` and `GET /v1/models`.
+
+OpenAI-compatible request:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_completion_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+Anthropic Messages request:
+
+```bash
+curl http://127.0.0.1:8000/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0
+  }'
+```
+
+Native Qarnyx request. The prompt is passed as-is; no vendor chat template is
+inserted by this endpoint:
+
+```bash
+curl http://127.0.0.1:8000/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "prompt": "Once upon a time",
+    "config": {
+      "max_new_tokens": 64,
+      "temperature": 0,
+      "top_k": 40,
+      "top_p": 0.95,
+      "seed": 7
+    }
+  }'
+```
+
+Set `"stream": true` and use `curl -N` to receive streaming events from each
+adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
+`max_cache_mib`, `temperature`, `top_k`, `top_p`, and `seed` under its
+`config` object. Anthropic text blocks and client-executed tool-use/tool-result
+round trips are supported. The server does not execute client tools.
+
+Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
+role-labelled prompt because model-specific LLaMA chat templates are not
+implemented. Multimodal inputs, stop sequences, OpenAI logprobs, broad vendor
+parameter parity, and built-in authentication remain outstanding.
+
+The server defaults to loopback and has no built-in authentication. Do not
+expose it to an untrusted network without an authenticated gateway. Concurrent
+inference is limited by a bounded semaphore (one request by default); increase
+`--max-concurrent-requests` only after measuring available memory.
 
 ## Development
 
@@ -194,6 +286,12 @@ portable binaries without an appropriate dispatch/build strategy.
    M7-D model-load admission budget (default 8192 MiB, including the configured
    session-cache reservation) are implemented. Session isolation, stress tests,
    and reproducible benchmarks remain planned.
+
+9. **M8 - API and serving layer:** runtime token streaming, OpenAI Chat
+   Completions, Anthropic Messages, and native Qarnyx generation endpoints are
+   implemented over a shared protocol-neutral GenerationRequest/GenerationOutput
+   contract. Broader vendor parameter parity, multimodal inputs, and built-in
+   authentication remain outstanding.
 
 ## Non-goals for the first milestone
 

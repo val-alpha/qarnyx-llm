@@ -1,12 +1,13 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use qarnyx_gguf::GgufFile;
 use qarnyx_models::{LlamaModel, Qwen35Model};
 use qarnyx_runtime::{
-    CancellationToken, GenerationConfig, GenerationError, LlamaGenerator, Qwen35Generator,
+    CancellationToken, GenerationConfig, GenerationError, GenerationEvent, LlamaGenerator,
+    Qwen35Generator,
 };
 use qarnyx_tokenizer::GgufTokenizer;
 
@@ -67,7 +68,7 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
-        /// CPU kernel implementation: automatic SIMD, fused Q4_K / K-quants, or scalar reference.
+        /// CPU kernel implementation: automatic SIMD, Q4_K x Q8_K, llama.cpp-style Q4_K x Q8_K, experimental K-quant AVX2/FMA, fused K-quants, or scalar reference.
         #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.
@@ -80,6 +81,8 @@ enum Command {
 enum CpuKernelMode {
     Auto,
     FusedQ4k,
+    LlamaQ4k,
+    FusedKqFma,
     FusedQk,
     Scalar,
 }
@@ -90,8 +93,12 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Status) | None => {
             println!("Qarnyx 0.1.0 - Rust-native CPU-first GGUF inference runtime");
-            println!("GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available.");
-            println!("Use --cpu-kernel auto|fused-q4k|fused-qk|scalar to select CPU kernels.");
+            println!(
+                "GGUF v3 parsing, quantized CPU kernels, experimental Qwen3.5 generation, and runtime AVX2/FMA dispatch are available."
+            );
+            println!(
+                "Use --cpu-kernel auto|fused-q4k|llama-q4k|fused-kq-fma|fused-qk|scalar to select CPU kernels."
+            );
         }
         Some(Command::Inspect {
             model,
@@ -156,7 +163,12 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
         for tensor in &gguf.tensors {
             println!(
                 "  {:<36} shape={:?} ggml_type={} bytes={} offset={} file_offset={}",
-                tensor.name, tensor.dimensions, tensor.ggml_type, tensor.byte_len, tensor.offset, tensor.file_offset
+                tensor.name,
+                tensor.dimensions,
+                tensor.ggml_type,
+                tensor.byte_len,
+                tensor.offset,
+                tensor.file_offset
             );
         }
     } else if !gguf.tensors.is_empty() {
@@ -177,10 +189,7 @@ fn inspect_model(path: &std::path::Path, list_tensors: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn model_file_budget_bytes(
-    max_memory_mib: usize,
-    max_cache_mib: usize,
-) -> anyhow::Result<usize> {
+fn model_file_budget_bytes(max_memory_mib: usize, max_cache_mib: usize) -> anyhow::Result<usize> {
     const MIB: usize = 1024 * 1024;
 
     if max_memory_mib == 0 || max_cache_mib == 0 {
@@ -262,6 +271,8 @@ fn generate_model(
     let backend = match cpu_kernel {
         CpuKernelMode::Auto => qarnyx_cpu::CpuBackend::new(workers)?,
         CpuKernelMode::FusedQ4k => qarnyx_cpu::CpuBackend::new_fused_q4k(workers)?,
+        CpuKernelMode::LlamaQ4k => qarnyx_cpu::CpuBackend::new_llama_q4k(workers)?,
+        CpuKernelMode::FusedKqFma => qarnyx_cpu::CpuBackend::new_fused_kq_fma(workers)?,
         CpuKernelMode::FusedQk => qarnyx_cpu::CpuBackend::new_fused_qk(workers)?,
         CpuKernelMode::Scalar => qarnyx_cpu::CpuBackend::new_scalar(workers)?,
     };
@@ -281,29 +292,23 @@ fn generate_model(
             let model = Qwen35Model::from_gguf(&gguf, &data)?;
             let mut generator = Qwen35Generator::new(seed);
             let prompt_tokens = tokenizer.encode_qwen35_chat_prompt(prompt, thinking)?;
-            let result = match generator.generate_ids_with_cancellation(
-                &model,
-                &tokenizer,
-                &backend,
-                &prompt_tokens,
-                config,
+            run_streaming_generation(
                 &cancellation,
-            ) {
-                Ok(result) => result,
-                Err(GenerationError::Cancelled) => {
-                    eprintln!("\nGeneration cancelled; session cache released.");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let generated_ids = &result.token_ids[prompt_tokens.len()..];
-            let generated_content = tokenizer.decode(generated_ids)?;
-            let generated_text = if thinking {
-                format!("<think>\n{generated_content}")
-            } else {
-                generated_content
-            };
-            println!("{generated_text}");
+                thinking.then_some("<think>\n"),
+                |cancellation, on_event| {
+                    generator
+                        .generate_ids_with_events(
+                            &model,
+                            &tokenizer,
+                            &backend,
+                            &prompt_tokens,
+                            config,
+                            cancellation,
+                            on_event,
+                        )
+                        .map(|_| ())
+                },
+            )?;
         }
         Some("llama") => {
             if thinking {
@@ -311,28 +316,98 @@ fn generate_model(
             }
             let model = LlamaModel::from_gguf(&gguf, &data)?;
             let mut generator = LlamaGenerator::new(seed);
-            let result = match generator.generate_with_cancellation(
-                &model,
-                &tokenizer,
-                &backend,
-                prompt,
-                config,
-                &cancellation,
-            ) {
-                Ok(result) => result,
-                Err(GenerationError::Cancelled) => {
-                    eprintln!("\nGeneration cancelled; session cache released.");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            println!("{}", result.text);
+            run_streaming_generation(&cancellation, None, |cancellation, on_event| {
+                generator
+                    .generate_with_events(
+                        &model,
+                        &tokenizer,
+                        &backend,
+                        prompt,
+                        config,
+                        cancellation,
+                        on_event,
+                    )
+                    .map(|_| ())
+            })?;
         }
         Some(other) => anyhow::bail!("unsupported model architecture: {other}"),
         None => anyhow::bail!("GGUF is missing general.architecture metadata"),
     }
 
     Ok(())
+}
+
+/// Runs generation while writing each incremental text event to stdout.
+///
+/// The callback is synchronous, so flushing after each event makes decoded
+/// text visible immediately instead of waiting for the full generation.
+fn run_streaming_generation<F>(
+    cancellation: &CancellationToken,
+    prefix: Option<&str>,
+    run: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&CancellationToken, &mut dyn FnMut(GenerationEvent)) -> Result<(), GenerationError>,
+{
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    if let Some(prefix) = prefix {
+        output.write_all(prefix.as_bytes())?;
+        output.flush()?;
+    }
+
+    let mut write_error = None;
+    let result = {
+        let mut on_event = |event| {
+            if write_error.is_some() {
+                return;
+            }
+
+            if let Err(error) = write_generation_event(&mut output, event) {
+                write_error = Some(error);
+                cancellation.cancel();
+            }
+        };
+
+        run(cancellation, &mut on_event)
+    };
+
+    if let Some(error) = write_error {
+        return Err(error.into());
+    }
+
+    match result {
+        Ok(()) => {
+            writeln!(output)?;
+            output.flush()?;
+            Ok(())
+        }
+        Err(GenerationError::Cancelled) => {
+            writeln!(output)?;
+            output.flush()?;
+            eprintln!("Generation cancelled; session cache released.");
+            Ok(())
+        }
+        Err(error) => {
+            writeln!(output)?;
+            output.flush()?;
+            Err(error.into())
+        }
+    }
+}
+
+/// Writes one runtime event and flushes it so terminal output is incremental.
+fn write_generation_event<W: Write>(writer: &mut W, event: GenerationEvent) -> io::Result<()> {
+    match event {
+        GenerationEvent::Token { text_delta, .. } => {
+            writer.write_all(text_delta.as_bytes())?;
+        }
+        GenerationEvent::TextDelta { text } => {
+            writer.write_all(text.as_bytes())?;
+        }
+    }
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -361,33 +436,56 @@ mod memory_budget_tests {
     }
 }
 
-
 #[cfg(test)]
 mod cli_tests {
     use super::*;
 
     #[test]
-    fn thinking_is_disabled_by_default_and_can_be_enabled() {
-        let default_cli = Cli::try_parse_from([
-            "qarnyx",
-            "generate",
-            "model.gguf",
-            "hello",
-        ])
+    fn generation_events_write_incremental_utf8_text() {
+        let mut output = Vec::new();
+
+        write_generation_event(
+            &mut output,
+            GenerationEvent::Token {
+                token_id: 1,
+                text_delta: "Halo ".to_owned(),
+            },
+        )
         .unwrap();
+        write_generation_event(
+            &mut output,
+            GenerationEvent::Token {
+                token_id: 2,
+                text_delta: "dunia".to_owned(),
+            },
+        )
+        .unwrap();
+        write_generation_event(
+            &mut output,
+            GenerationEvent::TextDelta {
+                text: " 🌏".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "Halo dunia 🌏");
+    }
+
+    #[test]
+    fn thinking_is_disabled_by_default_and_can_be_enabled() {
+        let default_cli =
+            Cli::try_parse_from(["qarnyx", "generate", "model.gguf", "hello"]).unwrap();
         assert!(matches!(
             default_cli.command,
-            Some(Command::Generate { thinking: false, .. })
+            Some(Command::Generate {
+                thinking: false,
+                ..
+            })
         ));
 
-        let thinking_cli = Cli::try_parse_from([
-            "qarnyx",
-            "generate",
-            "model.gguf",
-            "hello",
-            "--thinking",
-        ])
-        .unwrap();
+        let thinking_cli =
+            Cli::try_parse_from(["qarnyx", "generate", "model.gguf", "hello", "--thinking"])
+                .unwrap();
         assert!(matches!(
             thinking_cli.command,
             Some(Command::Generate { thinking: true, .. })
