@@ -27,7 +27,6 @@ pub mod common;
 mod native;
 pub use common::{GenerationOutput, GenerationRequest};
 mod tool_call;
-use tool_call::{OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice, tool_protocol_instruction, validate_choice, validate_tools};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -44,6 +43,10 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tool_call::{
+    OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice,
+    tool_protocol_instruction, validate_choice, validate_tools,
+};
 
 const DEFAULT_SEED: u64 = 0x51_4e_52_59_58;
 static NEXT_COMPLETION_ID: AtomicU64 = AtomicU64::new(1);
@@ -336,17 +339,26 @@ fn validate_generation_request(
 
 fn validate_chat_messages(messages: &[ChatMessage]) -> Result<(), ApiError> {
     if messages.is_empty() {
-        return Err(ApiError::bad_request("messages must contain at least one message"));
+        return Err(ApiError::bad_request(
+            "messages must contain at least one message",
+        ));
     }
     let mut pending_tool_call_ids = std::collections::HashSet::new();
     for message in messages {
         if !message.unsupported.is_empty() {
-            return Err(ApiError::bad_request("unsupported message fields were provided"));
+            return Err(ApiError::bad_request(
+                "unsupported message fields were provided",
+            ));
         }
         match message.role.as_str() {
             "system" | "developer" | "user" => {
-                if message.tool_calls.is_some() || message.tool_call_id.is_some() || message.name.is_some() {
-                    return Err(ApiError::bad_request("tool-call metadata is only valid on assistant/tool messages"));
+                if message.tool_calls.is_some()
+                    || message.tool_call_id.is_some()
+                    || message.name.is_some()
+                {
+                    return Err(ApiError::bad_request(
+                        "tool-call metadata is only valid on assistant/tool messages",
+                    ));
                 }
                 if message.content.is_none() {
                     return Err(ApiError::bad_request("message content must be a string"));
@@ -354,40 +366,72 @@ fn validate_chat_messages(messages: &[ChatMessage]) -> Result<(), ApiError> {
             }
             "assistant" => {
                 if message.tool_call_id.is_some() {
-                    return Err(ApiError::bad_request("assistant messages cannot contain tool_call_id"));
+                    return Err(ApiError::bad_request(
+                        "assistant messages cannot contain tool_call_id",
+                    ));
                 }
-                if message.content.is_none() && message.tool_calls.as_ref().map_or(true, Vec::is_empty) {
-                    return Err(ApiError::bad_request("assistant message needs content or tool_calls"));
+                if message.content.is_none()
+                    && message.tool_calls.as_ref().map_or(true, Vec::is_empty)
+                {
+                    return Err(ApiError::bad_request(
+                        "assistant message needs content or tool_calls",
+                    ));
                 }
                 if let Some(calls) = &message.tool_calls {
                     for call in calls {
-                        if call.kind != "function" || call.id.trim().is_empty() || call.function.name.trim().is_empty() {
-                            return Err(ApiError::bad_request("assistant tool_calls require id, type='function', and function.name"));
+                        if call.kind != "function"
+                            || call.id.trim().is_empty()
+                            || call.function.name.trim().is_empty()
+                        {
+                            return Err(ApiError::bad_request(
+                                "assistant tool_calls require id, type='function', and function.name",
+                            ));
                         }
                         let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-                            .map_err(|_| ApiError::bad_request("tool call arguments must be a valid JSON string"))?;
+                            .map_err(|_| {
+                                ApiError::bad_request(
+                                    "tool call arguments must be a valid JSON string",
+                                )
+                            })?;
                         if !arguments.is_object() {
-                            return Err(ApiError::bad_request("tool call arguments must encode a JSON object"));
+                            return Err(ApiError::bad_request(
+                                "tool call arguments must encode a JSON object",
+                            ));
                         }
                         if !pending_tool_call_ids.insert(call.id.clone()) {
-                            return Err(ApiError::bad_request(format!("duplicate tool_call_id '{}'", call.id)));
+                            return Err(ApiError::bad_request(format!(
+                                "duplicate tool_call_id '{}'",
+                                call.id
+                            )));
                         }
                     }
                 }
             }
             "tool" => {
-                if message.tool_call_id.as_deref().map_or(true, str::is_empty) || message.content.is_none() {
-                    return Err(ApiError::bad_request("tool messages require tool_call_id and string content"));
+                if message.tool_call_id.as_deref().map_or(true, str::is_empty)
+                    || message.content.is_none()
+                {
+                    return Err(ApiError::bad_request(
+                        "tool messages require tool_call_id and string content",
+                    ));
                 }
                 if message.tool_calls.is_some() {
-                    return Err(ApiError::bad_request("tool messages cannot contain tool_calls"));
+                    return Err(ApiError::bad_request(
+                        "tool messages cannot contain tool_calls",
+                    ));
                 }
                 let call_id = message.tool_call_id.as_deref().unwrap_or_default();
                 if !pending_tool_call_ids.remove(call_id) {
-                    return Err(ApiError::bad_request(format!("tool result references unknown tool_call_id '{call_id}'")));
+                    return Err(ApiError::bad_request(format!(
+                        "tool result references unknown tool_call_id '{call_id}'"
+                    )));
                 }
             }
-            other => return Err(ApiError::bad_request(format!("unsupported message role '{other}'"))),
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported message role '{other}'"
+                )));
+            }
         }
     }
     Ok(())
@@ -448,10 +492,12 @@ impl ApiState {
         if !tools.is_empty() {
             validate_tools(&tools).map_err(ApiError::bad_request)?;
         }
-        let tool_choice = parse_tool_choice(request.tool_choice.as_ref())
-            .map_err(ApiError::bad_request)?;
+        let tool_choice =
+            parse_tool_choice(request.tool_choice.as_ref()).map_err(ApiError::bad_request)?;
         if tools.is_empty() && !matches!(tool_choice, ToolChoice::Auto | ToolChoice::None) {
-            return Err(ApiError::bad_request("tool_choice requires a non-empty tools array"));
+            return Err(ApiError::bad_request(
+                "tool_choice requires a non-empty tools array",
+            ));
         }
         validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
         if let Some(format) = request.response_format {
@@ -517,7 +563,13 @@ impl ApiState {
             ));
         }
 
-        let prompt = format_chat_prompt(&self.assets.tokenizer, &self.assets.architecture, &request.messages, &tools, &tool_choice)?;
+        let prompt = format_chat_prompt(
+            &self.assets.tokenizer,
+            &self.assets.architecture,
+            &request.messages,
+            &tools,
+            &tool_choice,
+        )?;
         let temperature = request.temperature.unwrap_or(0.8);
         let top_p = request.top_p.unwrap_or(0.95);
         let seed = request.seed.unwrap_or(DEFAULT_SEED);
@@ -563,7 +615,10 @@ impl ApiState {
                 self.assets.max_cache_mib
             )));
         }
-        let prompt_ids = self.assets.tokenizer.encode(&request.prompt)
+        let prompt_ids = self
+            .assets
+            .tokenizer
+            .encode(&request.prompt)
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
         validate_generation_request(
             prompt_ids.len(),
@@ -640,26 +695,32 @@ fn format_chat_prompt(
     tools: &[OpenAiTool],
     choice: &ToolChoice,
 ) -> Result<String, ApiError> {
-    let normalized = messages.iter().map(|message| {
-        let tool_calls = message.tool_calls.as_ref().map(|calls| {
-            let neutral = calls.iter().map(|call| {
-                let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-                    .unwrap_or(Value::Null);
-                json!({
-                    "id":call.id,
-                    "name":call.function.name,
-                    "arguments":arguments
-                })
-            }).collect::<Vec<_>>();
-            json!({"tool_calls":neutral}).to_string()
-        });
-        ChatPromptMessage {
-            role: message.role.clone(),
-            content: message.content.clone(),
-            tool_calls,
-            tool_call_id: message.tool_call_id.clone(),
-        }
-    }).collect::<Vec<_>>();
+    let normalized = messages
+        .iter()
+        .map(|message| {
+            let tool_calls = message.tool_calls.as_ref().map(|calls| {
+                let neutral = calls
+                    .iter()
+                    .map(|call| {
+                        let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                            .unwrap_or(Value::Null);
+                        json!({
+                            "id":call.id,
+                            "name":call.function.name,
+                            "arguments":arguments
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({"tool_calls":neutral}).to_string()
+            });
+            ChatPromptMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+                tool_calls,
+                tool_call_id: message.tool_call_id.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
     let instruction = if tools.is_empty() {
         None
     } else {
@@ -789,8 +850,8 @@ async fn create_chat_completion(
 
     let output = GenerationOutput::from_runtime(completion.0, &completion.1, prompt_tokens);
     let completion_tokens = output.completion_tokens;
-    let parsed = parse_model_output(&output.text, &tools, &tool_choice)
-        .map_err(ApiError::bad_request)?;
+    let parsed =
+        parse_model_output(&output.text, &tools, &tool_choice).map_err(ApiError::bad_request)?;
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
     } else if completion_tokens >= max_new_tokens {
@@ -798,7 +859,11 @@ async fn create_chat_completion(
     } else {
         "stop"
     };
-    let tool_calls = parsed.tool_calls.iter().map(|call| call.to_openai()).collect::<Vec<_>>();
+    let tool_calls = parsed
+        .tool_calls
+        .iter()
+        .map(|call| call.to_openai())
+        .collect::<Vec<_>>();
     let (id, created) = next_completion_identity();
     let mut message = json!({ "role": "assistant", "content": parsed.content });
     if !tool_calls.is_empty() {
@@ -883,9 +948,16 @@ async fn stream_chat_completion(
             };
             if should_buffer {
                 raw_output.push_str(&delta);
-            } else if !delta.is_empty() && !send(stream_chunk(
-                &id, created, &model_id, json!({"content": delta}), Value::Null, include_usage,
-            )) {
+            } else if !delta.is_empty()
+                && !send(stream_chunk(
+                    &id,
+                    created,
+                    &model_id,
+                    json!({"content": delta}),
+                    Value::Null,
+                    include_usage,
+                ))
+            {
                 task_cancellation.cancel();
             }
         });
@@ -901,28 +973,52 @@ async fn stream_chat_completion(
                     .len()
                     .saturating_sub(prompt_tokens)
                     .max(completion_tokens);
-                let parsed = match parse_model_output(&raw_output, &prepared.tools, &prepared.tool_choice) {
+                let parsed = match parse_model_output(
+                    &raw_output,
+                    &prepared.tools,
+                    &prepared.tool_choice,
+                ) {
                     Ok(parsed) => parsed,
                     Err(error) => {
-                        let _ = send(json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}));
+                        let _ = send(
+                            json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}),
+                        );
                         let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
                         return;
                     }
                 };
                 if should_buffer {
                     if let Some(content) = parsed.content {
-                        if !content.is_empty() && !send(stream_chunk(
-                            &id, created, &model_id, json!({"content": content}), Value::Null, include_usage,
-                        )) { return; }
+                        if !content.is_empty()
+                            && !send(stream_chunk(
+                                &id,
+                                created,
+                                &model_id,
+                                json!({"content": content}),
+                                Value::Null,
+                                include_usage,
+                            ))
+                        {
+                            return;
+                        }
                     }
                 }
-                let tool_calls = parsed.tool_calls.iter().map(|call| call.to_openai()).collect::<Vec<_>>();
+                let tool_calls = parsed
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.to_openai())
+                    .collect::<Vec<_>>();
                 for (index, call) in tool_calls.iter().enumerate() {
                     if !send(stream_chunk(
-                        &id, created, &model_id,
+                        &id,
+                        created,
+                        &model_id,
                         json!({"tool_calls":[{"index":index,"id":call.id,"type":"function","function":{"name":call.function.name,"arguments":call.function.arguments}}]}),
-                        Value::Null, include_usage,
-                    )) { return; }
+                        Value::Null,
+                        include_usage,
+                    )) {
+                        return;
+                    }
                 }
                 let finish_reason = if !tool_calls.is_empty() {
                     "tool_calls"
@@ -1069,7 +1165,8 @@ mod tests {
             &[message("system", "Be concise."), message("user", "Hello")],
             &[],
             &ToolChoice::Auto,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(
             prompt,
@@ -1087,19 +1184,23 @@ mod tests {
             &[message("user", "Hello"), message("assistant", "Hi")],
             &[],
             &ToolChoice::Auto,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(prompt, "USER:\nHello\n\nASSISTANT:\nHi\n\nASSISTANT:\n");
     }
 
     #[test]
     fn unsupported_chat_roles_are_rejected() {
-        assert!(format_chat_prompt(
-            &qwen35_tokenizer(),
-            "qwen35",
-            &[message("function", "result")],
-            &[],
-            &ToolChoice::Auto
-        ).is_err());
+        assert!(
+            format_chat_prompt(
+                &qwen35_tokenizer(),
+                "qwen35",
+                &[message("function", "result")],
+                &[],
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1130,7 +1231,14 @@ mod tests {
                 unsupported: HashMap::new(),
             },
         ];
-        let prompt = format_chat_prompt(&llama_tokenizer(), "llama", &messages, &[], &ToolChoice::Auto).unwrap();
+        let prompt = format_chat_prompt(
+            &llama_tokenizer(),
+            "llama",
+            &messages,
+            &[],
+            &ToolChoice::Auto,
+        )
+        .unwrap();
         assert!(prompt.contains("tool_calls"));
         assert!(prompt.contains("get_weather"));
         assert!(prompt.contains("Jakarta"));
@@ -1151,10 +1259,14 @@ mod tests {
                 }
             }],
             "tool_choice":"auto"
-        })).unwrap();
+        }))
+        .unwrap();
         let tools = request.tools.unwrap();
         validate_tools(&tools).unwrap();
-        assert_eq!(parse_tool_choice(request.tool_choice.as_ref()).unwrap(), ToolChoice::Auto);
+        assert_eq!(
+            parse_tool_choice(request.tool_choice.as_ref()).unwrap(),
+            ToolChoice::Auto
+        );
     }
 
     #[test]
