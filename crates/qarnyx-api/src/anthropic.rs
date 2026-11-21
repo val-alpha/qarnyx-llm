@@ -27,7 +27,10 @@ static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_request_id() -> String {
-    format!("req_qarnyx_{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "req_qarnyx_{}",
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn with_request_id(mut response: Response) -> Response {
@@ -37,12 +40,13 @@ fn with_request_id(mut response: Response) -> Response {
     response
 }
 
-
 #[derive(Debug)]
 pub(super) struct AnthropicApiError(ApiError);
 
 impl From<ApiError> for AnthropicApiError {
-    fn from(error: ApiError) -> Self { Self(error) }
+    fn from(error: ApiError) -> Self {
+        Self(error)
+    }
 }
 
 impl IntoResponse for AnthropicApiError {
@@ -60,7 +64,8 @@ impl IntoResponse for AnthropicApiError {
                 "error":{"type":error_type,"message":self.0.message},
                 "request_id":request_id.clone()
             })),
-        ).into_response();
+        )
+            .into_response();
         if let Ok(value) = HeaderValue::try_from(request_id.as_str()) {
             response.headers_mut().insert("request-id", value);
         }
@@ -104,8 +109,14 @@ enum AnthropicContent {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum AnthropicBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
     ToolResult {
         tool_use_id: String,
         content: Option<Value>,
@@ -130,9 +141,11 @@ fn content_to_text(content: AnthropicContent) -> Result<String, ApiError> {
             for block in blocks {
                 match block {
                     AnthropicBlock::Text { text: part } => text.push_str(&part),
-                    _ => return Err(ApiError::bad_request(
-                        "system and tool-result content may contain only text blocks",
-                    )),
+                    _ => {
+                        return Err(ApiError::bad_request(
+                            "system and tool-result content may contain only text blocks",
+                        ));
+                    }
                 }
             }
             Ok(text)
@@ -146,9 +159,9 @@ fn tool_result_text(value: Option<Value>) -> Result<String, ApiError> {
         Some(Value::Array(blocks)) => {
             let mut text = String::new();
             for block in blocks {
-                let part = block.as_object().ok_or_else(|| ApiError::bad_request(
-                    "tool_result content blocks must be objects",
-                ))?;
+                let part = block.as_object().ok_or_else(|| {
+                    ApiError::bad_request("tool_result content blocks must be objects")
+                })?;
                 if part.get("type").and_then(Value::as_str) != Some("text") {
                     return Err(ApiError::bad_request(
                         "only text blocks are supported in tool_result content",
@@ -161,7 +174,9 @@ fn tool_result_text(value: Option<Value>) -> Result<String, ApiError> {
             }
             Ok(text)
         }
-        _ => Err(ApiError::bad_request("tool_result requires string or text-block content")),
+        _ => Err(ApiError::bad_request(
+            "tool_result requires string or text-block content",
+        )),
     }
 }
 
@@ -212,7 +227,8 @@ fn normalize_messages(
                                     "tool_use blocks are only valid in assistant messages",
                                 ));
                             }
-                            if id.trim().is_empty() || name.trim().is_empty() || !input.is_object() {
+                            if id.trim().is_empty() || name.trim().is_empty() || !input.is_object()
+                            {
                                 return Err(ApiError::bad_request(
                                     "tool_use requires non-empty id/name and object input",
                                 ));
@@ -226,14 +242,20 @@ fn normalize_messages(
                                 },
                             });
                         }
-                        AnthropicBlock::ToolResult { tool_use_id, content, is_error } => {
+                        AnthropicBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
                             if message.role != "user" {
                                 return Err(ApiError::bad_request(
                                     "tool_result blocks are only valid in user messages",
                                 ));
                             }
                             if tool_use_id.trim().is_empty() {
-                                return Err(ApiError::bad_request("tool_result requires tool_use_id"));
+                                return Err(ApiError::bad_request(
+                                    "tool_result requires tool_use_id",
+                                ));
                             }
                             let mut result = tool_result_text(content)?;
                             if is_error {
@@ -265,21 +287,26 @@ fn normalize_messages(
         }
     }
     if normalized.is_empty() {
-        return Err(ApiError::bad_request("messages must contain at least one text or tool-result block"));
+        return Err(ApiError::bad_request(
+            "messages must contain at least one text or tool-result block",
+        ));
     }
     Ok(normalized)
 }
 
 fn normalize_tools(tools: Option<Vec<AnthropicTool>>) -> Result<Vec<OpenAiTool>, ApiError> {
     let tools = tools.unwrap_or_default();
-    let normalized = tools.into_iter().map(|tool| OpenAiTool {
-        kind: "function".into(),
-        function: tool_call::FunctionDefinition {
-            name: tool.name,
-            description: tool.description,
-            parameters: Some(tool.input_schema),
-        },
-    }).collect::<Vec<_>>();
+    let normalized = tools
+        .into_iter()
+        .map(|tool| OpenAiTool {
+            kind: "function".into(),
+            function: tool_call::FunctionDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters: Some(tool.input_schema),
+            },
+        })
+        .collect::<Vec<_>>();
     if !normalized.is_empty() {
         validate_tools(&normalized).map_err(ApiError::bad_request)?;
         for tool in &normalized {
@@ -296,31 +323,46 @@ fn normalize_tools(tools: Option<Vec<AnthropicTool>>) -> Result<Vec<OpenAiTool>,
 }
 
 fn normalize_tool_choice(value: Option<Value>) -> Result<Value, ApiError> {
-    let Some(value) = value else { return Ok(json!("auto")); };
-    let object = value.as_object().ok_or_else(|| {
-        ApiError::bad_request("tool_choice must be an object")
-    })?;
-    let kind = object.get("type").and_then(Value::as_str).ok_or_else(|| {
-        ApiError::bad_request("tool_choice requires a string type")
-    })?;
+    let Some(value) = value else {
+        return Ok(json!("auto"));
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("tool_choice must be an object"))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("tool_choice requires a string type"))?;
     let allowed: &[&str] = match kind {
         "auto" | "any" => &["type", "disable_parallel_tool_use"],
         "tool" => &["type", "name", "disable_parallel_tool_use"],
-        _ => return Err(ApiError::bad_request(
-            "tool_choice type must be 'auto', 'any', or 'tool'",
-        )),
+        _ => {
+            return Err(ApiError::bad_request(
+                "tool_choice type must be 'auto', 'any', or 'tool'",
+            ));
+        }
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err(ApiError::bad_request("tool_choice contains unsupported fields"));
+        return Err(ApiError::bad_request(
+            "tool_choice contains unsupported fields",
+        ));
     }
-    if object.get("disable_parallel_tool_use").and_then(Value::as_bool) == Some(true) {
-        return Err(ApiError::bad_request("disable_parallel_tool_use=true is not supported"));
+    if object
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(ApiError::bad_request(
+            "disable_parallel_tool_use=true is not supported",
+        ));
     }
     match kind {
         "auto" => Ok(json!("auto")),
         "any" => Ok(json!("required")),
         "tool" => {
-            let name = object.get("name").and_then(Value::as_str)
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
                 .filter(|name| !name.trim().is_empty())
                 .ok_or_else(|| ApiError::bad_request("tool_choice type='tool' requires name"))?;
             Ok(json!({"type":"function","function":{"name":name}}))
@@ -329,7 +371,10 @@ fn normalize_tool_choice(value: Option<Value>) -> Result<Value, ApiError> {
     }
 }
 
-fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<PreparedRequest, ApiError> {
+fn prepare_request(
+    state: &ApiState,
+    request: MessagesRequest,
+) -> Result<PreparedRequest, ApiError> {
     if request.model != state.assets.model_id && request.model != "qarnyx" {
         return Err(ApiError::not_found(format!(
             "model '{}' is not loaded; available model is '{}'",
@@ -339,14 +384,21 @@ fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<Prepare
     if request.max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be non-zero"));
     }
-    if request.stop_sequences.as_ref().is_some_and(|values| !values.is_empty()) {
-        return Err(ApiError::bad_request("stop_sequences are not supported by the runtime yet"));
+    if request
+        .stop_sequences
+        .as_ref()
+        .is_some_and(|values| !values.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "stop_sequences are not supported by the runtime yet",
+        ));
     }
     if !request.unsupported.is_empty() {
         let mut fields = request.unsupported.keys().cloned().collect::<Vec<_>>();
         fields.sort();
         return Err(ApiError::bad_request(format!(
-            "unsupported Anthropic request fields: {}", fields.join(", ")
+            "unsupported Anthropic request fields: {}",
+            fields.join(", ")
         )));
     }
 
@@ -356,11 +408,19 @@ fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<Prepare
     let choice_value = normalize_tool_choice(request.tool_choice)?;
     let tool_choice = parse_tool_choice(Some(&choice_value)).map_err(ApiError::bad_request)?;
     if tools.is_empty() && !matches!(tool_choice, ToolChoice::Auto | ToolChoice::None) {
-        return Err(ApiError::bad_request("tool_choice requires at least one tool"));
+        return Err(ApiError::bad_request(
+            "tool_choice requires at least one tool",
+        ));
     }
     validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
 
-    let prompt = format_chat_prompt(&state.assets.tokenizer, &state.assets.architecture, &messages, &tools, &tool_choice)?;
+    let prompt = format_chat_prompt(
+        &state.assets.tokenizer,
+        &state.assets.architecture,
+        &messages,
+        &tools,
+        &tool_choice,
+    )?;
     let defaults = GenerationConfig::default();
     let config = GenerationConfig {
         max_new_tokens: request.max_tokens,
@@ -379,10 +439,18 @@ fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<Prepare
     )
 }
 
-fn stop_reason(parsed: &tool_call::ParsedAssistant, completion_tokens: usize, max_tokens: usize) -> &'static str {
-    if !parsed.tool_calls.is_empty() { "tool_use" }
-    else if completion_tokens >= max_tokens { "max_tokens" }
-    else { "end_turn" }
+fn stop_reason(
+    parsed: &tool_call::ParsedAssistant,
+    completion_tokens: usize,
+    max_tokens: usize,
+) -> &'static str {
+    if !parsed.tool_calls.is_empty() {
+        "tool_use"
+    } else if completion_tokens >= max_tokens {
+        "max_tokens"
+    } else {
+        "end_turn"
+    }
 }
 
 fn anthropic_tool_id(id: &str) -> String {
@@ -411,9 +479,8 @@ pub(super) async fn create_messages(
     State(state): State<ApiState>,
     payload: Result<Json<MessagesRequest>, JsonRejection>,
 ) -> Result<Response, AnthropicApiError> {
-    let Json(request) = payload.map_err(|error| {
-        ApiError::bad_request(format!("invalid JSON request: {error}"))
-    })?;
+    let Json(request) =
+        payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
     let prepared = prepare_request(&state, request)?;
     let prompt_tokens = prepared.prompt_ids.len();
@@ -422,7 +489,12 @@ pub(super) async fn create_messages(
         return stream_messages(state, prepared, prompt_tokens, max_tokens).await;
     }
 
-    let permit = state.assets.request_slots.clone().acquire_owned().await
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
     let response_tools = prepared.tools.clone();
@@ -436,27 +508,32 @@ pub(super) async fn create_messages(
             GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
         })?;
         Ok::<_, RunError>((text, result))
-    }).await.map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
-      .map_err(ApiError::from)?;
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
+    .map_err(ApiError::from)?;
 
     let output = GenerationOutput::from_runtime(text, &result, prompt_tokens);
     let parsed = parse_model_output(&output.text, &response_tools, &response_tool_choice)
         .map_err(ApiError::bad_request)?;
     let reason = stop_reason(&parsed, output.completion_tokens, max_tokens);
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
-    Ok(with_request_id(Json(json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "model": state.assets.model_id,
-        "content": content_blocks(&parsed),
-        "stop_reason": reason,
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": output.prompt_tokens,
-            "output_tokens": output.completion_tokens
-        }
-    })).into_response()))
+    Ok(with_request_id(
+        Json(json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": state.assets.model_id,
+            "content": content_blocks(&parsed),
+            "stop_reason": reason,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": output.prompt_tokens,
+                "output_tokens": output.completion_tokens
+            }
+        }))
+        .into_response(),
+    ))
 }
 
 async fn stream_messages(
@@ -465,7 +542,12 @@ async fn stream_messages(
     prompt_tokens: usize,
     max_tokens: usize,
 ) -> Result<Response, AnthropicApiError> {
-    let permit = state.assets.request_slots.clone().acquire_owned().await
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let model = state.assets.model_id.clone();
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
@@ -480,113 +562,188 @@ async fn stream_messages(
             if sender.blocking_send(bytes).is_err() {
                 task_cancellation.cancel();
                 false
-            } else { true }
-        };
-        if !send("message_start", json!({
-            "type":"message_start",
-            "message":{
-                "id":id,"type":"message","role":"assistant","model":model,
-                "content":[],"stop_reason":null,"stop_sequence":null,
-                "usage":{"input_tokens":prompt_tokens,"output_tokens":0}
+            } else {
+                true
             }
-        })) { return; }
+        };
+        if !send(
+            "message_start",
+            json!({
+                "type":"message_start",
+                "message":{
+                    "id":id,"type":"message","role":"assistant","model":model,
+                    "content":[],"stop_reason":null,"stop_sequence":null,
+                    "usage":{"input_tokens":prompt_tokens,"output_tokens":0}
+                }
+            }),
+        ) {
+            return;
+        }
 
         let buffer_tools = !prepared.tools.is_empty();
-        if !buffer_tools && !send("content_block_start", json!({
-            "type":"content_block_start","index":0,
-            "content_block":{"type":"text","text":""}
-        })) { return; }
+        if !buffer_tools
+            && !send(
+                "content_block_start",
+                json!({
+                    "type":"content_block_start","index":0,
+                    "content_block":{"type":"text","text":""}
+                }),
+            )
+        {
+            return;
+        }
         let mut raw = String::new();
         let mut completion_tokens = 0usize;
-        let result = state.generate(&prepared, &task_cancellation, |event| {
-            match event {
-                GenerationEvent::Token { token_id, text_delta } => {
-                    completion_tokens += 1;
-                    if buffer_tools {
-                        raw.push_str(&text_delta);
-                    } else if !text_delta.is_empty() {
-                        let _ = send("content_block_delta", json!({
+        let result = state.generate(&prepared, &task_cancellation, |event| match event {
+            GenerationEvent::Token {
+                token_id,
+                text_delta,
+            } => {
+                completion_tokens += 1;
+                if buffer_tools {
+                    raw.push_str(&text_delta);
+                } else if !text_delta.is_empty() {
+                    let _ = send(
+                        "content_block_delta",
+                        json!({
                             "type":"content_block_delta","index":0,
                             "delta":{"type":"text_delta","text":text_delta}
-                        }));
-                    }
-                    let _ = token_id;
+                        }),
+                    );
                 }
-                GenerationEvent::TextDelta { text } => {
-                    if buffer_tools { raw.push_str(&text); }
-                    else if !text.is_empty() {
-                        let _ = send("content_block_delta", json!({
+                let _ = token_id;
+            }
+            GenerationEvent::TextDelta { text } => {
+                if buffer_tools {
+                    raw.push_str(&text);
+                } else if !text.is_empty() {
+                    let _ = send(
+                        "content_block_delta",
+                        json!({
                             "type":"content_block_delta","index":0,
                             "delta":{"type":"text_delta","text":text}
-                        }));
-                    }
+                        }),
+                    );
                 }
             }
         });
-        if task_cancellation.is_cancelled() { return; }
+        if task_cancellation.is_cancelled() {
+            return;
+        }
         match result {
             Ok(generation) => {
-                completion_tokens = generation.token_ids.len().saturating_sub(prompt_tokens).max(completion_tokens);
+                completion_tokens = generation
+                    .token_ids
+                    .len()
+                    .saturating_sub(prompt_tokens)
+                    .max(completion_tokens);
                 let text = if buffer_tools { raw } else { String::new() };
-                let parsed = match parse_model_output(&text, &prepared.tools, &prepared.tool_choice) {
-                    Ok(_parsed) if !buffer_tools => tool_call::ParsedAssistant { content: Some(String::new()), tool_calls: Vec::new() },
+                let parsed = match parse_model_output(&text, &prepared.tools, &prepared.tool_choice)
+                {
+                    Ok(_parsed) if !buffer_tools => tool_call::ParsedAssistant {
+                        content: Some(String::new()),
+                        tool_calls: Vec::new(),
+                    },
                     Ok(parsed) => parsed,
                     Err(error) => {
-                        let _ = send("error", json!({"type":"error","error":{"type":"api_error","message":error}}));
+                        let _ = send(
+                            "error",
+                            json!({"type":"error","error":{"type":"api_error","message":error}}),
+                        );
                         let _ = send("message_stop", json!({"type":"message_stop"}));
                         return;
                     }
                 };
                 if buffer_tools {
-                    if let Some(content) = parsed.content.as_ref().filter(|value| !value.is_empty()) {
-                        let _ = send("content_block_start", json!({
-                            "type":"content_block_start","index":0,
-                            "content_block":{"type":"text","text":""}
-                        }));
-                        let _ = send("content_block_delta", json!({
-                            "type":"content_block_delta","index":0,
-                            "delta":{"type":"text_delta","text":content}
-                        }));
-                        let _ = send("content_block_stop", json!({"type":"content_block_stop","index":0}));
+                    if let Some(content) = parsed.content.as_ref().filter(|value| !value.is_empty())
+                    {
+                        let _ = send(
+                            "content_block_start",
+                            json!({
+                                "type":"content_block_start","index":0,
+                                "content_block":{"type":"text","text":""}
+                            }),
+                        );
+                        let _ = send(
+                            "content_block_delta",
+                            json!({
+                                "type":"content_block_delta","index":0,
+                                "delta":{"type":"text_delta","text":content}
+                            }),
+                        );
+                        let _ = send(
+                            "content_block_stop",
+                            json!({"type":"content_block_stop","index":0}),
+                        );
                     }
                 }
-                let mut index = if buffer_tools && parsed.content.as_ref().is_some_and(|v| !v.is_empty()) { 1 } else { 0 };
+                let mut index =
+                    if buffer_tools && parsed.content.as_ref().is_some_and(|v| !v.is_empty()) {
+                        1
+                    } else {
+                        0
+                    };
                 for call in &parsed.tool_calls {
-                    let _ = send("content_block_start", json!({
-                        "type":"content_block_start","index":index,
-                        "content_block":{"type":"tool_use","id":anthropic_tool_id(&call.id),"name":call.name,"input":{}}
-                    }));
-                    let _ = send("content_block_delta", json!({
-                        "type":"content_block_delta","index":index,
-                        "delta":{"type":"input_json_delta","partial_json":call.arguments.to_string()}
-                    }));
-                    let _ = send("content_block_stop", json!({"type":"content_block_stop","index":index}));
+                    let _ = send(
+                        "content_block_start",
+                        json!({
+                            "type":"content_block_start","index":index,
+                            "content_block":{"type":"tool_use","id":anthropic_tool_id(&call.id),"name":call.name,"input":{}}
+                        }),
+                    );
+                    let _ = send(
+                        "content_block_delta",
+                        json!({
+                            "type":"content_block_delta","index":index,
+                            "delta":{"type":"input_json_delta","partial_json":call.arguments.to_string()}
+                        }),
+                    );
+                    let _ = send(
+                        "content_block_stop",
+                        json!({"type":"content_block_stop","index":index}),
+                    );
                     index += 1;
                 }
                 if !buffer_tools {
-                    let _ = send("content_block_stop", json!({"type":"content_block_stop","index":0}));
+                    let _ = send(
+                        "content_block_stop",
+                        json!({"type":"content_block_stop","index":0}),
+                    );
                 }
                 let reason = stop_reason(&parsed, completion_tokens, max_tokens);
-                let _ = send("message_delta", json!({
-                    "type":"message_delta",
-                    "delta":{"stop_reason":reason,"stop_sequence":null},
-                    "usage":{"output_tokens":completion_tokens}
-                }));
+                let _ = send(
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":reason,"stop_sequence":null},
+                        "usage":{"output_tokens":completion_tokens}
+                    }),
+                );
                 let _ = send("message_stop", json!({"type":"message_stop"}));
             }
             Err(error) => {
-                let _ = send("error", json!({"type":"error","error":{"type":"api_error","message":error.to_string()}}));
+                let _ = send(
+                    "error",
+                    json!({"type":"error","error":{"type":"api_error","message":error.to_string()}}),
+                );
                 let _ = send("message_stop", json!({"type":"message_stop"}));
             }
         }
     });
 
     let response = Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .header("request-id", next_request_id())
-        .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
-        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))?;
+        .body(Body::from_stream(
+            ReceiverStream::new(receiver).map(Ok::<_, Infallible>),
+        ))
+        .map_err(|error| {
+            ApiError::internal(format!("could not construct SSE response: {error}"))
+        })?;
     Ok(response)
 }
 
@@ -596,8 +753,14 @@ mod tests {
 
     #[test]
     fn anthropic_tool_choice_maps_to_common_choice() {
-        assert_eq!(normalize_tool_choice(Some(json!({"type":"auto"}))).unwrap(), json!("auto"));
-        assert_eq!(normalize_tool_choice(Some(json!({"type":"any"}))).unwrap(), json!("required"));
+        assert_eq!(
+            normalize_tool_choice(Some(json!({"type":"auto"}))).unwrap(),
+            json!("auto")
+        );
+        assert_eq!(
+            normalize_tool_choice(Some(json!({"type":"any"}))).unwrap(),
+            json!("required")
+        );
         assert_eq!(
             normalize_tool_choice(Some(json!({"type":"tool","name":"weather"}))).unwrap(),
             json!({"type":"function","function":{"name":"weather"}})
@@ -606,10 +769,16 @@ mod tests {
 
     #[test]
     fn anthropic_text_blocks_normalize_to_chat_messages() {
-        let messages = normalize_messages(None, vec![AnthropicMessage {
-            role: "user".into(),
-            content: AnthropicContent::Blocks(vec![AnthropicBlock::Text { text: "Hello".into() }]),
-        }]).unwrap();
+        let messages = normalize_messages(
+            None,
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: AnthropicContent::Blocks(vec![AnthropicBlock::Text {
+                    text: "Hello".into(),
+                }]),
+            }],
+        )
+        .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content.as_deref(), Some("Hello"));
@@ -628,14 +797,17 @@ mod tests {
                 "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}
             }],
             "tool_choice":{"type":"tool","name":"weather"}
-        })).unwrap();
+        }))
+        .unwrap();
         let messages = normalize_messages(request.system, request.messages).unwrap();
         let tools = normalize_tools(request.tools).unwrap();
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content.as_deref(), Some("Hello"));
         assert_eq!(tools[0].function.name, "weather");
-        assert_eq!(normalize_tool_choice(request.tool_choice).unwrap(),
-            json!({"type":"function","function":{"name":"weather"}}));
+        assert_eq!(
+            normalize_tool_choice(request.tool_choice).unwrap(),
+            json!({"type":"function","function":{"name":"weather"}})
+        );
     }
 
     #[test]
@@ -660,30 +832,44 @@ mod tests {
             "role":"user","content":"Hello","cache_control":{"type":"ephemeral"}
         }));
         assert!(message.is_err());
-        assert!(normalize_tool_choice(Some(json!({
-            "type":"auto","unsupported_option":true
-        }))).is_err());
-        assert!(normalize_tool_choice(Some(json!({
-            "type":"any","disable_parallel_tool_use":true
-        }))).is_err());
+        assert!(
+            normalize_tool_choice(Some(json!({
+                "type":"auto","unsupported_option":true
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_tool_choice(Some(json!({
+                "type":"any","disable_parallel_tool_use":true
+            })))
+            .is_err()
+        );
     }
 
     #[test]
     fn anthropic_tool_use_and_result_keep_call_ids() {
-        let messages = normalize_messages(None, vec![
-            AnthropicMessage {
-                role: "assistant".into(),
-                content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolUse {
-                    id: "toolu_1".into(), name: "weather".into(), input: json!({"city":"Jakarta"})
-                }]),
-            },
-            AnthropicMessage {
-                role: "user".into(),
-                content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
-                    tool_use_id: "toolu_1".into(), content: Some(json!("Sunny")), is_error: false
-                }]),
-            }
-        ]).unwrap();
+        let messages = normalize_messages(
+            None,
+            vec![
+                AnthropicMessage {
+                    role: "assistant".into(),
+                    content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "weather".into(),
+                        input: json!({"city":"Jakarta"}),
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".into(),
+                    content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: Some(json!("Sunny")),
+                        is_error: false,
+                    }]),
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(messages[0].tool_calls.as_ref().unwrap()[0].id, "toolu_1");
         assert_eq!(anthropic_tool_id("call_qarnyx_7"), "toolu_7");
         assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
