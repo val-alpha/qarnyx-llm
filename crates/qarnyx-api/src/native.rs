@@ -204,17 +204,23 @@ async fn stream_generation(
         match result {
             Ok(generation) => {
                 let output = GenerationOutput::from_runtime(text, &generation, prompt_tokens);
+                let reason = finish_reason(&output, max_new_tokens);
+                let token_ids = if output.token_ids.is_empty() {
+                    generated_ids
+                } else {
+                    output.token_ids
+                };
                 let _ = send("completed", json!({
                     "type":"completed",
                     "model":model,
                     "text":output.text,
-                    "token_ids":if output.token_ids.is_empty() { generated_ids } else { output.token_ids },
+                    "token_ids":token_ids,
                     "usage":{
                         "prompt_tokens":output.prompt_tokens,
                         "completion_tokens":output.completion_tokens,
                         "total_tokens":output.prompt_tokens + output.completion_tokens
                     },
-                    "finish_reason":finish_reason(&output, max_new_tokens)
+                    "finish_reason":reason
                 }));
                 let _ = send("done", json!({"type":"done"}));
             }
