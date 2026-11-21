@@ -835,8 +835,9 @@ async fn create_chat_completion(
     .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
     .map_err(ApiError::from)?;
 
-    let completion_tokens = completion.1.token_ids.len().saturating_sub(prompt_tokens);
-    let parsed = parse_model_output(&completion.0, &tools, &tool_choice)
+    let output = GenerationOutput::from_runtime(completion.0, &completion.1, prompt_tokens);
+    let completion_tokens = output.completion_tokens;
+    let parsed = parse_model_output(&output.text, &tools, &tool_choice)
         .map_err(ApiError::bad_request)?;
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
