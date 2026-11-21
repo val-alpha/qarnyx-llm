@@ -224,11 +224,12 @@ async fn stream_generation(
         }
     });
 
-    Response::builder()
+    let response = Response::builder()
         .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
-        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))
+        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))?;
+    Ok(response)
 }
 
 #[cfg(test)]
