@@ -425,6 +425,8 @@ pub(super) async fn create_messages(
     let permit = state.assets.request_slots.clone().acquire_owned().await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
+    let response_tools = prepared.tools.clone();
+    let response_tool_choice = prepared.tool_choice.clone();
     let state_task = state.clone();
     let (text, result) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -438,7 +440,7 @@ pub(super) async fn create_messages(
       .map_err(ApiError::from)?;
 
     let output = GenerationOutput::from_runtime(text, &result, prompt_tokens);
-    let parsed = parse_model_output(&output.text, &prepared.tools, &prepared.tool_choice)
+    let parsed = parse_model_output(&output.text, &response_tools, &response_tool_choice)
         .map_err(ApiError::bad_request)?;
     let reason = stop_reason(&parsed, output.completion_tokens, max_tokens);
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
@@ -579,12 +581,13 @@ async fn stream_messages(
         }
     });
 
-    Response::builder()
+    let response = Response::builder()
         .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .header("request-id", next_request_id())
         .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
-        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))
+        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))?;
+    Ok(response)
 }
 
 #[cfg(test)]
