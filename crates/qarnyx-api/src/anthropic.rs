@@ -237,7 +237,7 @@ fn normalize_tools(tools: Option<Vec<AnthropicTool>>) -> Result<Vec<OpenAiTool>,
     if !normalized.is_empty() {
         validate_tools(&normalized).map_err(ApiError::bad_request)?;
         for tool in &normalized {
-            if tool.function.parameters.as_ref().is_none_or(|schema| {
+            if tool.function.parameters.as_ref().map_or(true, |schema| {
                 schema.get("type").and_then(Value::as_str) != Some("object")
             }) {
                 return Err(ApiError::bad_request(
