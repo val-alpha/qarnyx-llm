@@ -48,7 +48,7 @@ impl IntoResponse for AnthropicApiError {
                 "request_id":request_id.clone()
             })),
         ).into_response();
-        if let Ok(value) = HeaderValue::from_str(&request_id) {
+        if let Ok(value) = HeaderValue::try_from(request_id.as_str()) {
             response.headers_mut().insert("request-id", value);
         }
         response
