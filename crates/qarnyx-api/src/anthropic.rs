@@ -551,6 +551,45 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_wire_request_deserializes_system_text_tools_and_blocks() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"qarnyx",
+            "max_tokens":64,
+            "system":"Be concise.",
+            "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}],
+            "tools":[{
+                "name":"weather",
+                "description":"Get weather",
+                "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}
+            }],
+            "tool_choice":{"type":"tool","name":"weather"}
+        })).unwrap();
+        let messages = normalize_messages(request.system, request.messages).unwrap();
+        let tools = normalize_tools(request.tools).unwrap();
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content.as_deref(), Some("Hello"));
+        assert_eq!(tools[0].function.name, "weather");
+        assert_eq!(normalize_tool_choice(request.tool_choice).unwrap(),
+            json!({"type":"function","function":{"name":"weather"}}));
+    }
+
+    #[test]
+    fn anthropic_response_formats_tool_use_blocks() {
+        let parsed = tool_call::ParsedAssistant {
+            content: None,
+            tool_calls: vec![tool_call::ToolCall {
+                id: "call_qarnyx_9".into(),
+                name: "weather".into(),
+                arguments: json!({"city":"Jakarta"}),
+            }],
+        };
+        let blocks = content_blocks(&parsed);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "toolu_9");
+        assert_eq!(blocks[0]["input"]["city"], "Jakarta");
+    }
+
+    #[test]
     fn anthropic_tool_use_and_result_keep_call_ids() {
         let messages = normalize_messages(None, vec![
             AnthropicMessage {
