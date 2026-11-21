@@ -303,9 +303,9 @@ fn normalize_tool_choice(value: Option<Value>) -> Result<Value, ApiError> {
     let kind = object.get("type").and_then(Value::as_str).ok_or_else(|| {
         ApiError::bad_request("tool_choice requires a string type")
     })?;
-    let allowed = match kind {
-        "auto" | "any" => ["type", "disable_parallel_tool_use", "name"].as_slice(),
-        "tool" => ["type", "name", "disable_parallel_tool_use"].as_slice(),
+    let allowed: &[&str] = match kind {
+        "auto" | "any" => &["type", "disable_parallel_tool_use"],
+        "tool" => &["type", "name", "disable_parallel_tool_use"],
         _ => return Err(ApiError::bad_request(
             "tool_choice type must be 'auto', 'any', or 'tool'",
         )),
