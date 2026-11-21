@@ -408,24 +408,25 @@ Remaining target validation:
 - Add process-wide admission/concurrency controls only when the serving layer
   is designed; do not start HTTP serving inside M7.
 
-## M8 - API and serving layer (in progress)
+## M8 - API and serving layer (implemented; protocol parity remains scoped)
 
-M8 starts only after the runtime generation contract is stable. It is an API
-adapter/serving layer, not another model or inference layer.
+M8 is an API adapter/serving layer, not another model or inference layer. OpenAI,
+Anthropic, and native Qarnyx requests are translated to one protocol-neutral
+request contract before reaching the runtime.
 
-Architecture target:
+Architecture:
 
 ```text
 OpenAI request ─┐
-Anthropic       ├──> API adapter ──> common GenerationRequest
-Native Qarnyx ─┘                         │
-                                         ▼
-                                  Qarnyx Runtime
-                                         │
-                                         ▼
-                              common GenerationResult
-                                ├── normal response
-                                └── streaming events
+Anthropic       ├──> protocol adapters ──> GenerationRequest
+Native Qarnyx ─┘                              │
+                                              ▼
+                                       Qarnyx Runtime
+                                              │
+                                              ▼
+                                       GenerationOutput
+                                         ├── JSON response
+                                         └── streaming events
 ```
 
 Milestones:
@@ -436,35 +437,59 @@ Milestones:
   Prompt tokens and end-of-turn markers are not emitted as completion events.
   Blocking generation remains backward compatible and bypasses stream decoder
   and callback work. Event callbacks run synchronously on the generation
-  thread and can request cooperative cancellation through
-  `CancellationToken`.
-- M8-B OpenAI-compatible API (initial text-only adapter implemented):
-  `qarnyx-api` exposes `GET /v1/models` and
-  `POST /v1/chat/completions`, with JSON completion responses and OpenAI-style
-  SSE chunks plus `data: [DONE]`. It maps supported chat roles and sampling
-  controls onto the existing runtime configuration, includes token usage, and
-  rejects unsupported tools, stop sequences, logprobs, and non-text request
-  shapes. LLaMA currently uses a generic role-labelled prompt; Qwen3.5 uses its
-  existing ChatML control-token format. Shared GGUF/model assets are read-only,
-  while generator/cache state is request-local. The server uses a bounded
-  inference semaphore (default one concurrent request) and binds to loopback
-  by default. Authentication, multimodal content, model-specific LLaMA chat
-  templates, and broader OpenAI parameter parity remain outstanding.
-- M8-C Anthropic Messages-compatible API: provide the corresponding adapter
-  using the same runtime request/event contract.
-- M8-D Native Qarnyx API: expose the runtime's native request/configuration
-  surface without forcing vendor-specific semantics.
-- M8-E Common API abstraction: keep authentication, HTTP routing, JSON parsing,
-  SSE/stream transport, and protocol-specific validation in the serving/API
-  layer rather than in qarnyx-runtime.
+  thread and can request cooperative cancellation through `CancellationToken`.
+- M8-B OpenAI-compatible API (implemented): `qarnyx-api` exposes
+  `GET /v1/models` and `POST /v1/chat/completions`, including JSON completion
+  responses, OpenAI-style SSE chunks, `data: [DONE]`, token usage, supported
+  chat roles, sampling controls, and client-executed function tool calls.
+  Tool-call requests and tool-result history are normalized before prompt
+  formatting; the server never executes client functions.
+- M8-C Anthropic Messages-compatible API (implemented): `POST /v1/messages`
+  accepts system instructions, user/assistant text, text content blocks,
+  function tools, `auto`/`any`/named-tool choices, assistant `tool_use`
+  history, and user `tool_result` blocks. JSON responses use Anthropic message
+  and content-block shapes. Streaming uses message/content-block lifecycle
+  events and text/input-JSON deltas. Tool execution remains the client's
+  responsibility.
+- M8-D Native Qarnyx API (implemented): `POST /v1/generate` accepts a raw
+  prompt plus a native `config` containing `max_new_tokens`,
+  `max_context_tokens`, `max_cache_mib`, `temperature`, `top_k`,
+  `top_p`, and `seed`. Raw prompts are not wrapped in vendor chat syntax.
+  JSON responses expose generated token IDs and usage. Streaming emits native
+  token, text-delta, completion, and done events.
+- M8-E Common API abstraction (implemented): all adapters normalize prompt
+  text and `GenerationConfig` into the public, protocol-neutral
+  `GenerationRequest` contract in `qarnyx-api::common`. The shared
+  `ApiState::prepare_generation` validates limits, tokenizes the prompt, and
+  produces the same prepared request consumed by the single runtime dispatch
+  path. `GenerationOutput` presents generated-only token IDs and shared usage
+  counts to protocol response serializers. HTTP routing, JSON decoding,
+  protocol validation, SSE transport, and authentication boundaries remain in
+  `qarnyx-api`; vendor-specific protocol code is not added to
+  `qarnyx-runtime`.
 
-Streaming should be implemented first because OpenAI, Anthropic, and native
-protocols can then share the same runtime event source. The API layer must not
-duplicate generation loops or model-specific logic.
+Implementation limits (not a claim of full vendor API parity):
+- The API currently serves one loaded GGUF model per server process and
+  supports the LLaMA and Qwen3.5 runtime architectures.
+- Multimodal content, stop sequences, OpenAI logprobs, broad vendor-specific
+  parameter parity, model-specific LLaMA chat templates, and built-in
+  authentication remain outstanding.
+- Anthropic system and message content is text-only. Unsupported content block
+  types and unsupported request fields are rejected rather than silently
+  ignored.
+- The native endpoint is a deliberately small, explicit runtime surface. It
+  exposes the currently supported generation configuration, not internal
+  model/cache implementation details.
+- Tool execution is always performed by the client. Qarnyx formats and returns
+  tool calls and accepts the corresponding tool-result history; it does not
+  invoke external functions.
 
-Model-specific chat formatting remains below M8: Qwen3.5 ChatML templates,
-thinking-mode control tokens, and end-of-turn handling belong to the tokenizer
-and model/runtime integration rather than the HTTP protocol adapters.
+All three adapters share the runtime event source and the same request
+admission semaphore. They must not duplicate model forward passes, decode
+loops, or model-specific prompt-formatting logic. Model-specific chat
+formatting remains below M8: Qwen3.5 ChatML templates, thinking-mode control
+tokens, and end-of-turn handling belong to tokenizer/model integration rather
+than HTTP protocol adapters.
 
 ## Benchmark methodology
 
