@@ -19,6 +19,26 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
+#[derive(Debug)]
+struct NativeApiError(ApiError);
+
+impl From<ApiError> for NativeApiError {
+    fn from(error: ApiError) -> Self { Self(error) }
+}
+
+impl IntoResponse for NativeApiError {
+    fn into_response(self) -> Response {
+        let error_type = if self.0.kind == "server_error" { "internal_error" } else { "invalid_request" };
+        (
+            self.0.status,
+            Json(json!({
+                "object":"qarnyx.error",
+                "error":{"type":error_type,"message":self.0.message}
+            })),
+        ).into_response()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct NativeGenerateRequest {
     model: String,
@@ -91,7 +111,7 @@ fn finish_reason(output: &GenerationOutput, max_new_tokens: usize) -> &'static s
 pub(super) async fn generate(
     State(state): State<ApiState>,
     payload: Result<Json<NativeGenerateRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, NativeApiError> {
     let Json(request) = payload.map_err(|error| {
         ApiError::bad_request(format!("invalid JSON request: {error}"))
     })?;
@@ -138,7 +158,7 @@ async fn stream_generation(
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_new_tokens: usize,
-) -> Result<Response, ApiError> {
+) -> Result<Response, NativeApiError> {
     let permit = state.assets.request_slots.clone().acquire_owned().await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let model = state.assets.model_id.clone();
