@@ -28,6 +28,12 @@ pub enum TokenizerError {
     #[error("tokenizer model {0} is not supported for production encoding")]
     UnsupportedModel(String),
 
+    #[error("chat prompt formatting is unavailable for architecture '{0}'")]
+    UnsupportedChatArchitecture(String),
+
+    #[error("chat prompt contains unsupported role '{0}'")]
+    UnsupportedChatRole(String),
+
     #[error("tokenizer cannot encode input at byte offset {offset}")]
     Unencodable { offset: usize },
 }
@@ -42,6 +48,19 @@ pub struct GgufTokenizer {
     pub merges: Vec<String>,
     pub bos_token_id: Option<usize>,
     pub eos_token_id: Option<usize>,
+}
+
+/// A chat message after protocol-specific JSON has been normalized.
+///
+/// This type deliberately contains no vendor protocol types. Tool calls are
+/// represented as a neutral JSON string so the tokenizer can apply the model
+/// chat template without depending on qarnyx-api.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatPromptMessage {
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
 }
 
 /// Stateful incremental text decoder for generated token streams.
@@ -142,6 +161,89 @@ impl GgufTokenizer {
         } else {
             self.encode_bpe(text)
         }
+    }
+
+    /// Formats normalized chat messages using the selected model family template.
+    ///
+    /// Vendor request parsing and validation stay in qarnyx-api. This method
+    /// owns model-specific role syntax, control tokens, and assistant prefix.
+    pub fn format_chat_prompt(
+        &self,
+        architecture: &str,
+        messages: &[ChatPromptMessage],
+        tool_instruction: Option<&str>,
+    ) -> Result<String, TokenizerError> {
+        let mut prompt = String::new();
+        match architecture {
+            "qwen35" => {
+                if self.model != "gpt2" || self.pre.as_deref() != Some("qwen35") {
+                    return Err(TokenizerError::UnsupportedModel(self.model.clone()));
+                }
+                for message in messages {
+                    let role = match message.role.as_str() {
+                        "system" | "developer" => "system",
+                        "user" => "user",
+                        "assistant" => "assistant",
+                        "tool" => "tool",
+                        other => return Err(TokenizerError::UnsupportedChatRole(other.to_owned())),
+                    };
+                    prompt.push_str("<|im_start|>");
+                    prompt.push_str(role);
+                    prompt.push('\n');
+                    if let Some(content) = &message.content {
+                        prompt.push_str(content);
+                    }
+                    if let Some(tool_calls) = &message.tool_calls {
+                        prompt.push_str(tool_calls);
+                    }
+                    if message.role == "tool" {
+                        prompt.push_str(" [tool_call_id=");
+                        prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
+                        prompt.push(']');
+                    }
+                    prompt.push_str("<|im_end|>\n");
+                }
+                if let Some(instruction) = tool_instruction {
+                    prompt.push_str("<|im_start|>system\n");
+                    prompt.push_str(instruction);
+                    prompt.push_str("<|im_end|>\n");
+                }
+                prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            }
+            "llama" => {
+                for message in messages {
+                    let role = match message.role.as_str() {
+                        "system" | "developer" => "SYSTEM",
+                        "user" => "USER",
+                        "assistant" => "ASSISTANT",
+                        "tool" => "TOOL",
+                        other => return Err(TokenizerError::UnsupportedChatRole(other.to_owned())),
+                    };
+                    prompt.push_str(role);
+                    prompt.push_str(":\n");
+                    if let Some(content) = &message.content {
+                        prompt.push_str(content);
+                    }
+                    if let Some(tool_calls) = &message.tool_calls {
+                        prompt.push_str(tool_calls);
+                    }
+                    if message.role == "tool" {
+                        prompt.push_str(" [tool_call_id=");
+                        prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
+                        prompt.push(']');
+                    }
+                    prompt.push_str("\n\n");
+                }
+                if let Some(instruction) = tool_instruction {
+                    prompt.push_str("SYSTEM:\n");
+                    prompt.push_str(instruction);
+                    prompt.push_str("\n\n");
+                }
+                prompt.push_str("ASSISTANT:\n");
+            }
+            other => return Err(TokenizerError::UnsupportedChatArchitecture(other.to_owned())),
+        }
+        Ok(prompt)
     }
 
     /// Formats a single-turn, text-only Qwen3.5 chat prompt.
@@ -683,6 +785,63 @@ mod tests {
             tokenizer.encode("<|im_start|>hi<|im_end|>").unwrap(),
             [2, 0, 1, 3]
         );
+    }
+
+    #[test]
+    fn formats_qwen35_multi_turn_chat_and_tool_history() {
+        let tokenizer = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec!["x".into()],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let messages = vec![
+            ChatPromptMessage {
+                role: "system".into(), content: Some("Be concise.".into()),
+                tool_calls: None, tool_call_id: None
+            },
+            ChatPromptMessage {
+                role: "assistant".into(), content: None,
+                tool_calls: Some(r#"{"tool_calls":[{"id":"toolu_1"}]}"#.into()),
+                tool_call_id: None
+            },
+            ChatPromptMessage {
+                role: "tool".into(), content: Some("Sunny".into()),
+                tool_calls: None, tool_call_id: Some("toolu_1".into())
+            },
+        ];
+        let prompt = tokenizer.format_chat_prompt("qwen35", &messages, Some("Call tools only when needed.")).unwrap();
+        assert!(prompt.starts_with("<|im_start|>system\nBe concise.<|im_end|>"));
+        assert!(prompt.contains(r#"{"tool_calls":[{"id":"toolu_1"}]}"#));
+        assert!(prompt.contains("TOOL").not());
+        assert!(prompt.contains(" [tool_call_id=toolu_1]"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn formats_llama_chat_and_rejects_unknown_architectures() {
+        let tokenizer = GgufTokenizer {
+            model: "llama".into(),
+            pre: None,
+            tokens: vec!["x".into()],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        };
+        let messages = vec![ChatPromptMessage {
+            role: "user".into(), content: Some("Hello".into()),
+            tool_calls: None, tool_call_id: None
+        }];
+        let prompt = tokenizer.format_chat_prompt("llama", &messages, None).unwrap();
+        assert_eq!(prompt, "USER:\nHello\n\nASSISTANT:\n");
+        assert!(matches!(
+            tokenizer.format_chat_prompt("unknown", &messages, None),
+            Err(TokenizerError::UnsupportedChatArchitecture(_))
+        ));
     }
 
     #[test]
