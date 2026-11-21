@@ -462,7 +462,7 @@ async fn stream_messages(
                 completion_tokens = generation.token_ids.len().saturating_sub(prompt_tokens).max(completion_tokens);
                 let text = if buffer_tools { raw } else { String::new() };
                 let parsed = match parse_model_output(&text, &prepared.tools, &prepared.tool_choice) {
-                    Ok(parsed) if !buffer_tools => tool_call::ParsedAssistant { content: Some(String::new()), tool_calls: Vec::new() },
+                    Ok(_parsed) if !buffer_tools => tool_call::ParsedAssistant { content: Some(String::new()), tool_calls: Vec::new() },
                     Ok(parsed) => parsed,
                     Err(error) => {
                         let _ = send("error", json!({"type":"error","error":{"type":"api_error","message":error}}));
