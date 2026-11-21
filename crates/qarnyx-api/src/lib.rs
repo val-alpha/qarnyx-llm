@@ -1,6 +1,6 @@
-//! OpenAI Chat Completions-compatible HTTP adapter for Qarnyx.
+//! OpenAI, Anthropic Messages, and native Qarnyx HTTP adapters.
 //!
-//! The adapter owns HTTP/JSON/SSE concerns and delegates all model execution to
+//! Protocol adapters own HTTP/JSON/SSE concerns and delegate all model execution to
 //! qarnyx-runtime. Model weights are shared read-only; each request creates its
 //! own generator and request-local cache.
 
