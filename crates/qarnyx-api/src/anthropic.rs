@@ -36,7 +36,7 @@ impl From<ApiError> for AnthropicApiError {
 impl IntoResponse for AnthropicApiError {
     fn into_response(self) -> Response {
         let error_type = if self.0.kind == "server_error" { "api_error" } else { self.0.kind };
-        let request_id = format!("req_qarnyx_{}", NEXT_ERROR_ID.fetch_add(1, Ordering::Relaxed));
+        let request_id = next_request_id();
         (
             self.0.status,
             Json(json!({
@@ -405,7 +405,7 @@ pub(super) async fn create_messages(
         .map_err(ApiError::bad_request)?;
     let reason = stop_reason(&parsed, output.completion_tokens, max_tokens);
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
-    Ok(Json(json!({
+    Ok(with_request_id(Json(json!({
         "id": id,
         "type": "message",
         "role": "assistant",
@@ -417,7 +417,7 @@ pub(super) async fn create_messages(
             "input_tokens": output.prompt_tokens,
             "output_tokens": output.completion_tokens
         }
-    })).into_response())
+    })).into_response()))
 }
 
 async fn stream_messages(
@@ -545,6 +545,7 @@ async fn stream_messages(
     Response::builder()
         .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+        .header("request-id", next_request_id())
         .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
         .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))
 }
