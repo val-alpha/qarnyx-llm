@@ -24,7 +24,6 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
-static NEXT_ERROR_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct AnthropicApiError(ApiError);
@@ -35,16 +34,24 @@ impl From<ApiError> for AnthropicApiError {
 
 impl IntoResponse for AnthropicApiError {
     fn into_response(self) -> Response {
-        let error_type = if self.0.kind == "server_error" { "api_error" } else { self.0.kind };
+        let error_type = match self.0.status {
+            StatusCode::NOT_FOUND => "not_found_error",
+            StatusCode::INTERNAL_SERVER_ERROR => "api_error",
+            _ => "invalid_request_error",
+        };
         let request_id = next_request_id();
-        (
+        let mut response = (
             self.0.status,
             Json(json!({
                 "type":"error",
                 "error":{"type":error_type,"message":self.0.message},
-                "request_id":request_id
+                "request_id":request_id.clone()
             })),
-        ).into_response()
+        ).into_response();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("request-id", value);
+        }
+        response
     }
 }
 
