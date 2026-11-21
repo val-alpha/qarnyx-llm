@@ -23,7 +23,9 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 pub(super) struct NativeApiError(ApiError);
 
 impl From<ApiError> for NativeApiError {
-    fn from(error: ApiError) -> Self { Self(error) }
+    fn from(error: ApiError) -> Self {
+        Self(error)
+    }
 }
 
 impl IntoResponse for NativeApiError {
@@ -39,7 +41,8 @@ impl IntoResponse for NativeApiError {
                 "object":"qarnyx.error",
                 "error":{"type":error_type,"message":self.0.message}
             })),
-        ).into_response()
+        )
+            .into_response()
     }
 }
 
@@ -85,7 +88,8 @@ fn prepare_request(
         let mut fields = request.unsupported.keys().cloned().collect::<Vec<_>>();
         fields.sort();
         return Err(ApiError::bad_request(format!(
-            "unsupported native request fields: {}", fields.join(", ")
+            "unsupported native request fields: {}",
+            fields.join(", ")
         )));
     }
 
@@ -93,7 +97,9 @@ fn prepare_request(
     let options = request.config;
     let config = GenerationConfig {
         max_new_tokens: options.max_new_tokens.unwrap_or(defaults.max_new_tokens),
-        max_context_tokens: options.max_context_tokens.unwrap_or(state.assets.max_context_tokens),
+        max_context_tokens: options
+            .max_context_tokens
+            .unwrap_or(state.assets.max_context_tokens),
         max_cache_mib: options.max_cache_mib.unwrap_or(state.assets.max_cache_mib),
         temperature: options.temperature.unwrap_or(defaults.temperature),
         top_k: options.top_k.unwrap_or(defaults.top_k),
@@ -101,7 +107,10 @@ fn prepare_request(
         seed: options.seed.unwrap_or(defaults.seed),
     };
     state.prepare_generation(
-        GenerationRequest { prompt: request.prompt, config },
+        GenerationRequest {
+            prompt: request.prompt,
+            config,
+        },
         false,
         Vec::new(),
         ToolChoice::None,
@@ -109,16 +118,19 @@ fn prepare_request(
 }
 
 fn finish_reason(output: &GenerationOutput, max_new_tokens: usize) -> &'static str {
-    if output.completion_tokens >= max_new_tokens { "length" } else { "stop" }
+    if output.completion_tokens >= max_new_tokens {
+        "length"
+    } else {
+        "stop"
+    }
 }
 
 pub(super) async fn generate(
     State(state): State<ApiState>,
     payload: Result<Json<NativeGenerateRequest>, JsonRejection>,
 ) -> Result<Response, NativeApiError> {
-    let Json(request) = payload.map_err(|error| {
-        ApiError::bad_request(format!("invalid JSON request: {error}"))
-    })?;
+    let Json(request) =
+        payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
     let prepared = prepare_request(&state, request)?;
     let prompt_tokens = prepared.prompt_ids.len();
@@ -127,7 +139,12 @@ pub(super) async fn generate(
         return stream_generation(state, prepared, prompt_tokens, max_new_tokens).await;
     }
 
-    let permit = state.assets.request_slots.clone().acquire_owned().await
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
     let state_task = state.clone();
@@ -139,8 +156,10 @@ pub(super) async fn generate(
             GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
         })?;
         Ok::<_, RunError>((text, result))
-    }).await.map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
-      .map_err(ApiError::from)?;
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
+    .map_err(ApiError::from)?;
 
     let output = GenerationOutput::from_runtime(text, &result, prompt_tokens);
     Ok(Json(json!({
@@ -154,7 +173,8 @@ pub(super) async fn generate(
             "total_tokens": output.prompt_tokens + output.completion_tokens
         },
         "finish_reason": finish_reason(&output, max_new_tokens)
-    })).into_response())
+    }))
+    .into_response())
 }
 
 async fn stream_generation(
@@ -163,7 +183,12 @@ async fn stream_generation(
     prompt_tokens: usize,
     max_new_tokens: usize,
 ) -> Result<Response, NativeApiError> {
-    let permit = state.assets.request_slots.clone().acquire_owned().await
+    let permit = state
+        .assets
+        .request_slots
+        .clone()
+        .acquire_owned()
+        .await
         .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let model = state.assets.model_id.clone();
     let cancellation = CancellationToken::new();
@@ -177,30 +202,38 @@ async fn stream_generation(
             if sender.blocking_send(bytes).is_err() {
                 task_cancellation.cancel();
                 false
-            } else { true }
+            } else {
+                true
+            }
         };
         let mut text = String::new();
         let mut generated_ids = Vec::new();
-        let result = state.generate(&prepared, &task_cancellation, |event| {
-            match event {
-                GenerationEvent::Token { token_id, text_delta } => {
-                    generated_ids.push(token_id);
-                    text.push_str(&text_delta);
-                    if !send("token", json!({
+        let result = state.generate(&prepared, &task_cancellation, |event| match event {
+            GenerationEvent::Token {
+                token_id,
+                text_delta,
+            } => {
+                generated_ids.push(token_id);
+                text.push_str(&text_delta);
+                if !send(
+                    "token",
+                    json!({
                         "type":"token","token_id":token_id,"text_delta":text_delta
-                    })) {
-                        task_cancellation.cancel();
-                    }
+                    }),
+                ) {
+                    task_cancellation.cancel();
                 }
-                GenerationEvent::TextDelta { text: delta } => {
-                    text.push_str(&delta);
-                    if !send("text_delta", json!({"type":"text_delta","text":delta})) {
-                        task_cancellation.cancel();
-                    }
+            }
+            GenerationEvent::TextDelta { text: delta } => {
+                text.push_str(&delta);
+                if !send("text_delta", json!({"type":"text_delta","text":delta})) {
+                    task_cancellation.cancel();
                 }
             }
         });
-        if task_cancellation.is_cancelled() { return; }
+        if task_cancellation.is_cancelled() {
+            return;
+        }
         match result {
             Ok(generation) => {
                 let output = GenerationOutput::from_runtime(text, &generation, prompt_tokens);
@@ -210,18 +243,21 @@ async fn stream_generation(
                 } else {
                     output.token_ids
                 };
-                let _ = send("completed", json!({
-                    "type":"completed",
-                    "model":model,
-                    "text":output.text,
-                    "token_ids":token_ids,
-                    "usage":{
-                        "prompt_tokens":output.prompt_tokens,
-                        "completion_tokens":output.completion_tokens,
-                        "total_tokens":output.prompt_tokens + output.completion_tokens
-                    },
-                    "finish_reason":reason
-                }));
+                let _ = send(
+                    "completed",
+                    json!({
+                        "type":"completed",
+                        "model":model,
+                        "text":output.text,
+                        "token_ids":token_ids,
+                        "usage":{
+                            "prompt_tokens":output.prompt_tokens,
+                            "completion_tokens":output.completion_tokens,
+                            "total_tokens":output.prompt_tokens + output.completion_tokens
+                        },
+                        "finish_reason":reason
+                    }),
+                );
                 let _ = send("done", json!({"type":"done"}));
             }
             Err(error) => {
@@ -231,10 +267,17 @@ async fn stream_generation(
     });
 
     let response = Response::builder()
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
-        .body(Body::from_stream(ReceiverStream::new(receiver).map(Ok::<_, Infallible>)))
-        .map_err(|error| ApiError::internal(format!("could not construct SSE response: {error}")))?;
+        .body(Body::from_stream(
+            ReceiverStream::new(receiver).map(Ok::<_, Infallible>),
+        ))
+        .map_err(|error| {
+            ApiError::internal(format!("could not construct SSE response: {error}"))
+        })?;
     Ok(response)
 }
 
@@ -257,7 +300,8 @@ mod tests {
                 "top_p":0.9,
                 "seed":7
             }
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(request.stream);
         assert_eq!(request.config.max_new_tokens, Some(64));
         assert_eq!(request.config.top_k, Some(20));
@@ -277,7 +321,10 @@ mod tests {
     #[test]
     fn native_finish_reason_observes_generation_limit() {
         let output = GenerationOutput {
-            text: "done".into(), token_ids: vec![1,2], prompt_tokens: 4, completion_tokens: 2
+            text: "done".into(),
+            token_ids: vec![1, 2],
+            prompt_tokens: 4,
+            completion_tokens: 2,
         };
         assert_eq!(finish_reason(&output, 2), "length");
         assert_eq!(finish_reason(&output, 3), "stop");
