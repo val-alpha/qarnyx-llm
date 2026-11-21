@@ -366,7 +366,7 @@ pub(super) async fn create_messages(
         let mut text = String::new();
         let result = state_task.generate(&prepared, &cancellation, |event| match event {
             GenerationEvent::Token { text_delta, .. } => text.push_str(&text_delta),
-            GenerationEvent::TextDelta { text } => text.push_str(&text),
+            GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
         })?;
         Ok::<_, RunError>((text, result))
     }).await.map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
@@ -415,16 +415,20 @@ async fn stream_messages(
                 false
             } else { true }
         };
-        let _ = send("message_start", json!({
+        if !send("message_start", json!({
             "type":"message_start",
             "message":{
                 "id":id,"type":"message","role":"assistant","model":model,
                 "content":[],"stop_reason":null,"stop_sequence":null,
                 "usage":{"input_tokens":prompt_tokens,"output_tokens":0}
             }
-        }));
+        })) { return; }
 
         let buffer_tools = !prepared.tools.is_empty();
+        if !buffer_tools && !send("content_block_start", json!({
+            "type":"content_block_start","index":0,
+            "content_block":{"type":"text","text":""}
+        })) { return; }
         let mut raw = String::new();
         let mut completion_tokens = 0usize;
         let result = state.generate(&prepared, &task_cancellation, |event| {
@@ -493,10 +497,6 @@ async fn stream_messages(
                     index += 1;
                 }
                 if !buffer_tools {
-                    let _ = send("content_block_start", json!({
-                        "type":"content_block_start","index":0,
-                        "content_block":{"type":"text","text":""}
-                    }));
                     let _ = send("content_block_stop", json!({"type":"content_block_stop","index":0}));
                 }
                 let reason = stop_reason(&parsed, completion_tokens, max_tokens);
