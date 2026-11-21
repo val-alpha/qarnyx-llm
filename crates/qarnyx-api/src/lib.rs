@@ -23,7 +23,7 @@ use qarnyx_runtime::{
 use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use serde::Deserialize;
 mod anthropic;
-mod common;
+pub mod common;
 mod native;
 pub use common::{GenerationOutput, GenerationRequest};
 mod tool_call;
