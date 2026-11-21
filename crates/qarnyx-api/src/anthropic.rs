@@ -24,6 +24,19 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> String {
+    format!("req_qarnyx_{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn with_request_id(mut response: Response) -> Response {
+    if let Ok(value) = HeaderValue::try_from(next_request_id().as_str()) {
+        response.headers_mut().insert("request-id", value);
+    }
+    response
+}
+
 
 #[derive(Debug)]
 struct AnthropicApiError(ApiError);
