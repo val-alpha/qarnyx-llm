@@ -94,8 +94,7 @@ impl GgufTokenizer {
             });
         }
 
-        let merges = optional_string_array(gguf, "tokenizer.ggml.merges")?
-            .unwrap_or_default();
+        let merges = optional_string_array(gguf, "tokenizer.ggml.merges")?.unwrap_or_default();
 
         Ok(Self {
             model: model.to_owned(),
@@ -133,14 +132,11 @@ impl GgufTokenizer {
             let next = special_tokens
                 .iter()
                 .filter_map(|&(id, marker)| {
-                    text[cursor..].find(marker).map(|relative| {
-                        (cursor + relative, id, marker)
-                    })
+                    text[cursor..]
+                        .find(marker)
+                        .map(|relative| (cursor + relative, id, marker))
                 })
-                .min_by(|a, b| {
-                    a.0.cmp(&b.0)
-                        .then_with(|| b.2.len().cmp(&a.2.len()))
-                });
+                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.len().cmp(&a.2.len())));
 
             let Some((position, token_id, marker)) = next else {
                 output.extend(self.encode_plain(&text[cursor..])?);
@@ -241,7 +237,11 @@ impl GgufTokenizer {
                 }
                 prompt.push_str("ASSISTANT:\n");
             }
-            other => return Err(TokenizerError::UnsupportedChatArchitecture(other.to_owned())),
+            other => {
+                return Err(TokenizerError::UnsupportedChatArchitecture(
+                    other.to_owned(),
+                ));
+            }
         }
         Ok(prompt)
     }
@@ -544,9 +544,15 @@ fn unicode_to_bytes_with_map(token: &str, reverse: &std::collections::HashMap<u3
 fn gpt2_byte_map() -> [u32; 256] {
     let mut map = [0u32; 256];
     let mut bs = Vec::new();
-    for b in 33u8..=126 { bs.push(b); }
-    for b in 161u8..=172 { bs.push(b); }
-    for b in 174u8..=255 { bs.push(b); }
+    for b in 33u8..=126 {
+        bs.push(b);
+    }
+    for b in 161u8..=172 {
+        bs.push(b);
+    }
+    for b in 174u8..=255 {
+        bs.push(b);
+    }
     let mut n = 0u32;
     for b in 0u16..=255 {
         let byte = b as u8;
@@ -727,13 +733,15 @@ fn optional_usize(gguf: &GgufFile, key: &'static str) -> Result<Option<usize>, T
             return Err(TokenizerError::InvalidMetadata {
                 key,
                 expected: "unsigned integer",
-            })
+            });
         }
     };
-    usize::try_from(raw).map(Some).map_err(|_| TokenizerError::InvalidMetadata {
-        key,
-        expected: "integer fitting usize",
-    })
+    usize::try_from(raw)
+        .map(Some)
+        .map_err(|_| TokenizerError::InvalidMetadata {
+            key,
+            expected: "integer fitting usize",
+        })
 }
 
 #[cfg(test)]
@@ -800,20 +808,27 @@ mod tests {
         };
         let messages = vec![
             ChatPromptMessage {
-                role: "system".into(), content: Some("Be concise.".into()),
-                tool_calls: None, tool_call_id: None
+                role: "system".into(),
+                content: Some("Be concise.".into()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatPromptMessage {
-                role: "assistant".into(), content: None,
+                role: "assistant".into(),
+                content: None,
                 tool_calls: Some(r#"{"tool_calls":[{"id":"toolu_1"}]}"#.into()),
-                tool_call_id: None
+                tool_call_id: None,
             },
             ChatPromptMessage {
-                role: "tool".into(), content: Some("Sunny".into()),
-                tool_calls: None, tool_call_id: Some("toolu_1".into())
+                role: "tool".into(),
+                content: Some("Sunny".into()),
+                tool_calls: None,
+                tool_call_id: Some("toolu_1".into()),
             },
         ];
-        let prompt = tokenizer.format_chat_prompt("qwen35", &messages, Some("Call tools only when needed.")).unwrap();
+        let prompt = tokenizer
+            .format_chat_prompt("qwen35", &messages, Some("Call tools only when needed."))
+            .unwrap();
         assert!(prompt.starts_with("<|im_start|>system\nBe concise.<|im_end|>"));
         assert!(prompt.contains(r#"{"tool_calls":[{"id":"toolu_1"}]}"#));
         assert!(!prompt.contains("TOOL"));
@@ -833,10 +848,14 @@ mod tests {
             eos_token_id: None,
         };
         let messages = vec![ChatPromptMessage {
-            role: "user".into(), content: Some("Hello".into()),
-            tool_calls: None, tool_call_id: None
+            role: "user".into(),
+            content: Some("Hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
         }];
-        let prompt = tokenizer.format_chat_prompt("llama", &messages, None).unwrap();
+        let prompt = tokenizer
+            .format_chat_prompt("llama", &messages, None)
+            .unwrap();
         assert_eq!(prompt, "USER:\nHello\n\nASSISTANT:\n");
         assert!(matches!(
             tokenizer.format_chat_prompt("unknown", &messages, None),
