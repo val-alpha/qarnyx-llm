@@ -360,7 +360,7 @@ fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<Prepare
     }
     validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
 
-    let prompt = format_chat_prompt(&state.assets.architecture, &messages, &tools, &tool_choice)?;
+    let prompt = format_chat_prompt(&state.assets.tokenizer, &state.assets.architecture, &messages, &tools, &tool_choice)?;
     let defaults = GenerationConfig::default();
     let config = GenerationConfig {
         max_new_tokens: request.max_tokens,
