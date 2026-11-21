@@ -39,7 +39,7 @@ fn with_request_id(mut response: Response) -> Response {
 
 
 #[derive(Debug)]
-struct AnthropicApiError(ApiError);
+pub(super) struct AnthropicApiError(ApiError);
 
 impl From<ApiError> for AnthropicApiError {
     fn from(error: ApiError) -> Self { Self(error) }
@@ -69,7 +69,7 @@ impl IntoResponse for AnthropicApiError {
 }
 
 #[derive(Debug, Deserialize)]
-struct MessagesRequest {
+pub(super) struct MessagesRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
     max_tokens: usize,
