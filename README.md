@@ -157,7 +157,7 @@ currently executing token evaluation finishes, then inference stops and its
 request-local cache is released. The CLI does not print partial generated text.
 
 
-## OpenAI-compatible HTTP API (experimental)
+## HTTP APIs (experimental)
 
 Build and start the server with one local GGUF model:
 
@@ -166,10 +166,18 @@ cargo run --release -p qarnyx-api --bin qarnyx-server -- \
   --model /path/to/model.gguf --workers 10
 ```
 
-The server binds to `127.0.0.1:8000` by default. It exposes
-`GET /health`, `GET /v1/models`, and
-`POST /v1/chat/completions`. The chat endpoint supports ordinary JSON
-responses and Server-Sent Events when `stream=true`:
+The server binds to `127.0.0.1:8000` by default. It exposes three protocol
+adapters over the same Qarnyx runtime generation path:
+
+| Protocol | Endpoint | Streaming |
+|---|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` | OpenAI-style SSE |
+| Anthropic Messages | `POST /v1/messages` | Anthropic Messages SSE events |
+| Native Qarnyx | `POST /v1/generate` | Native token/text/completion events |
+
+The shared discovery endpoints are `GET /health` and `GET /v1/models`.
+
+OpenAI-compatible request:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -182,32 +190,52 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-For streaming output, add `-N` to curl and set `"stream": true`:
+Anthropic Messages request:
 
 ```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "qarnyx",
-    "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 64,
-    "stream": true,
-    "stream_options": {"include_usage": true}
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0
   }'
 ```
 
-This first adapter is intentionally text-only: it supports system, developer,
-user, and assistant messages; one completion choice; temperature, top-p, seed,
-and output/context/cache limits. Unsupported sampling controls, stop
-sequences, tools/functions, logprobs, and non-text response formats are
-rejected instead of silently ignored. Qwen3.5 messages use the existing ChatML
-format; LLaMA currently uses a generic role-labelled prompt because this
-runtime does not yet implement model-specific LLaMA chat templates.
+Native Qarnyx request. The prompt is passed as-is; no vendor chat template is
+inserted by this endpoint:
 
-The server has no built-in authentication and defaults to loopback binding.
-Do not expose it to an untrusted network without placing it behind an
-authenticated gateway. Concurrent inference is limited to one request by
-default so each request's cache budget remains bounded; raise
+```bash
+curl http://127.0.0.1:8000/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qarnyx",
+    "prompt": "Once upon a time",
+    "config": {
+      "max_new_tokens": 64,
+      "temperature": 0,
+      "top_k": 40,
+      "top_p": 0.95,
+      "seed": 7
+    }
+  }'
+```
+
+Set `"stream": true` and use `curl -N` to receive streaming events from each
+adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
+`max_cache_mib`, `temperature`, `top_k`, `top_p`, and `seed` under its
+`config` object. Anthropic text blocks and client-executed tool-use/tool-result
+round trips are supported. The server does not execute client tools.
+
+Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
+role-labelled prompt because model-specific LLaMA chat templates are not
+implemented. Multimodal inputs, stop sequences, OpenAI logprobs, broad vendor
+parameter parity, and built-in authentication remain outstanding.
+
+The server defaults to loopback and has no built-in authentication. Do not
+expose it to an untrusted network without an authenticated gateway. Concurrent
+inference is limited by a bounded semaphore (one request by default); increase
 `--max-concurrent-requests` only after measuring available memory.
 
 ## Development
