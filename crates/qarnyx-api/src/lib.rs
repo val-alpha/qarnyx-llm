@@ -20,7 +20,7 @@ use qarnyx_runtime::{
     CancellationToken, GenerationConfig, GenerationError, GenerationEvent, GenerationResult,
     LlamaGenerator, Qwen35Generator,
 };
-use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
+use qarnyx_tokenizer::{ChatPromptMessage, GgufTokenizer, TokenizerError};
 use serde::Deserialize;
 mod anthropic;
 pub mod common;
@@ -517,7 +517,7 @@ impl ApiState {
             ));
         }
 
-        let prompt = format_chat_prompt(&self.assets.architecture, &request.messages, &tools, &tool_choice)?;
+        let prompt = format_chat_prompt(&self.assets.tokenizer, &self.assets.architecture, &request.messages, &tools, &tool_choice)?;
         let temperature = request.temperature.unwrap_or(0.8);
         let top_p = request.top_p.unwrap_or(0.95);
         let seed = request.seed.unwrap_or(DEFAULT_SEED);
@@ -633,92 +633,41 @@ impl ApiState {
     }
 }
 
-fn format_chat_prompt(architecture: &str, messages: &[ChatMessage], tools: &[OpenAiTool], choice: &ToolChoice) -> Result<String, ApiError> {
-    let mut prompt = String::new();
-    match architecture {
-        "qwen35" => {
-            for message in messages {
-                let role = match message.role.as_str() {
-                    "system" | "developer" => "system",
-                    "user" => "user",
-                    "assistant" => "assistant",
-                    "tool" => "tool",
-                    other => {
-                        return Err(ApiError::bad_request(format!(
-                            "unsupported message role '{other}'"
-                        )));
-                    }
-                };
-                prompt.push_str("<|im_start|>");
-                prompt.push_str(role);
-                prompt.push('\n');
-                if let Some(content) = &message.content { prompt.push_str(content); }
-                if let Some(calls) = &message.tool_calls {
-                    let neutral = calls.iter().map(|call| {
-                        let arguments = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
-                        json!({"id":call.id,"name":call.function.name,"arguments":arguments})
-                    }).collect::<Vec<_>>();
-                    prompt.push_str(&json!({"tool_calls":neutral}).to_string());
-                }
-                if message.role == "tool" {
-                    prompt.push_str(" [tool_call_id=");
-                    prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
-                    prompt.push(']');
-                }
-                prompt.push_str("<|im_end|>\n");
-            }
-            if !tools.is_empty() {
-                prompt.push_str("<|im_start|>system\n");
-                prompt.push_str(&tool_protocol_instruction(tools, choice));
-                prompt.push_str("<|im_end|>\n");
-            }
-            // Match the runtime's default non-thinking Qwen3.5 chat prefix.
-            prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+fn format_chat_prompt(
+    tokenizer: &GgufTokenizer,
+    architecture: &str,
+    messages: &[ChatMessage],
+    tools: &[OpenAiTool],
+    choice: &ToolChoice,
+) -> Result<String, ApiError> {
+    let normalized = messages.iter().map(|message| {
+        let tool_calls = message.tool_calls.as_ref().map(|calls| {
+            let neutral = calls.iter().map(|call| {
+                let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                    .unwrap_or(Value::Null);
+                json!({
+                    "id":call.id,
+                    "name":call.function.name,
+                    "arguments":arguments
+                })
+            }).collect::<Vec<_>>();
+            json!({"tool_calls":neutral}).to_string()
+        });
+        ChatPromptMessage {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            tool_calls,
+            tool_call_id: message.tool_call_id.clone(),
         }
-        "llama" => {
-            for message in messages {
-                let role = match message.role.as_str() {
-                    "system" | "developer" => "SYSTEM",
-                    "user" => "USER",
-                    "assistant" => "ASSISTANT",
-                    "tool" => "TOOL",
-                    other => {
-                        return Err(ApiError::bad_request(format!(
-                            "unsupported message role '{other}'"
-                        )));
-                    }
-                };
-                prompt.push_str(role);
-                prompt.push_str(":\n");
-                if let Some(content) = &message.content { prompt.push_str(content); }
-                if let Some(calls) = &message.tool_calls {
-                    let neutral = calls.iter().map(|call| {
-                        let arguments = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
-                        json!({"name":call.function.name,"arguments":arguments})
-                    }).collect::<Vec<_>>();
-                    prompt.push_str(&json!({"tool_calls":neutral}).to_string());
-                }
-                if message.role == "tool" {
-                    prompt.push_str(" [tool_call_id=");
-                    prompt.push_str(message.tool_call_id.as_deref().unwrap_or(""));
-                    prompt.push(']');
-                }
-                prompt.push_str("\n\n");
-            }
-            if !tools.is_empty() {
-                prompt.push_str("SYSTEM:\n");
-                prompt.push_str(&tool_protocol_instruction(tools, choice));
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str("ASSISTANT:\n");
-        }
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "chat prompt formatting is unavailable for architecture '{other}'"
-            )));
-        }
-    }
-    Ok(prompt)
+    }).collect::<Vec<_>>();
+    let instruction = if tools.is_empty() {
+        None
+    } else {
+        Some(tool_protocol_instruction(tools, choice))
+    };
+    tokenizer
+        .format_chat_prompt(architecture, &normalized, instruction.as_deref())
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 #[derive(Debug, Error)]
@@ -1088,15 +1037,39 @@ mod tests {
         }
     }
 
+    fn qwen35_tokenizer() -> GgufTokenizer {
+        GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: vec!["x".into()],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        }
+    }
+
+    fn llama_tokenizer() -> GgufTokenizer {
+        GgufTokenizer {
+            model: "llama".into(),
+            pre: None,
+            tokens: vec!["x".into()],
+            scores: vec![0.0],
+            merges: Vec::new(),
+            bos_token_id: None,
+            eos_token_id: None,
+        }
+    }
+
     #[test]
     fn qwen35_chat_prompt_preserves_roles_and_non_thinking_prefix() {
         let prompt = format_chat_prompt(
+            &qwen35_tokenizer(),
             "qwen35",
             &[message("system", "Be concise."), message("user", "Hello")],
             &[],
             &ToolChoice::Auto,
-        )
-        .unwrap();
+        ).unwrap();
 
         assert_eq!(
             prompt,
@@ -1109,18 +1082,24 @@ mod tests {
     #[test]
     fn llama_chat_prompt_preserves_roles() {
         let prompt = format_chat_prompt(
+            &llama_tokenizer(),
             "llama",
             &[message("user", "Hello"), message("assistant", "Hi")],
             &[],
             &ToolChoice::Auto,
-        )
-        .unwrap();
+        ).unwrap();
         assert_eq!(prompt, "USER:\nHello\n\nASSISTANT:\nHi\n\nASSISTANT:\n");
     }
 
     #[test]
     fn unsupported_chat_roles_are_rejected() {
-        assert!(format_chat_prompt("qwen35", &[message("function", "result")], &[], &ToolChoice::Auto).is_err());
+        assert!(format_chat_prompt(
+            &qwen35_tokenizer(),
+            "qwen35",
+            &[message("function", "result")],
+            &[],
+            &ToolChoice::Auto
+        ).is_err());
     }
 
     #[test]
@@ -1151,7 +1130,7 @@ mod tests {
                 unsupported: HashMap::new(),
             },
         ];
-        let prompt = format_chat_prompt("llama", &messages, &[], &ToolChoice::Auto).unwrap();
+        let prompt = format_chat_prompt(&llama_tokenizer(), "llama", &messages, &[], &ToolChoice::Auto).unwrap();
         assert!(prompt.contains("tool_calls"));
         assert!(prompt.contains("get_weather"));
         assert!(prompt.contains("Jakarta"));
