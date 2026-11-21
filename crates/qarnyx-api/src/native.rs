@@ -28,7 +28,11 @@ impl From<ApiError> for NativeApiError {
 
 impl IntoResponse for NativeApiError {
     fn into_response(self) -> Response {
-        let error_type = if self.0.kind == "server_error" { "internal_error" } else { "invalid_request" };
+        let error_type = match self.0.status {
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
+            _ => "invalid_request",
+        };
         (
             self.0.status,
             Json(json!({
