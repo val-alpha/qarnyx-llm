@@ -112,7 +112,7 @@ pub(super) async fn generate(
         let mut text = String::new();
         let result = state_task.generate(&prepared, &cancellation, |event| match event {
             GenerationEvent::Token { text_delta, .. } => text.push_str(&text_delta),
-            GenerationEvent::TextDelta { text } => text.push_str(&text),
+            GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
         })?;
         Ok::<_, RunError>((text, result))
     }).await.map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
