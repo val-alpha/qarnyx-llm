@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 #[command(
     name = "qarnyx-server",
     version,
-    about = "OpenAI-compatible HTTP server for the Qarnyx CPU inference runtime"
+    about = "HTTP API server for OpenAI, Anthropic, and native Qarnyx inference"
 )]
 struct Args {
     /// Path to a supported GGUF v3 model.
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         state.architecture(),
         listener.local_addr()?
     );
-    println!("Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions");
+    println!("Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/generate");
 
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
