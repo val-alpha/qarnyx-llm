@@ -88,6 +88,7 @@ struct MessagesRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AnthropicMessage {
     role: String,
     content: AnthropicContent,
@@ -101,7 +102,7 @@ enum AnthropicContent {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum AnthropicBlock {
     Text { text: String },
     ToolUse { id: String, name: String, input: Value },
@@ -114,6 +115,7 @@ enum AnthropicBlock {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AnthropicTool {
     name: String,
     description: Option<String>,
@@ -298,18 +300,32 @@ fn normalize_tool_choice(value: Option<Value>) -> Result<Value, ApiError> {
     let object = value.as_object().ok_or_else(|| {
         ApiError::bad_request("tool_choice must be an object")
     })?;
-    match object.get("type").and_then(Value::as_str) {
-        Some("auto") => Ok(json!("auto")),
-        Some("any") => Ok(json!("required")),
-        Some("tool") => {
+    let kind = object.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ApiError::bad_request("tool_choice requires a string type")
+    })?;
+    let allowed = match kind {
+        "auto" | "any" => ["type", "disable_parallel_tool_use", "name"].as_slice(),
+        "tool" => ["type", "name", "disable_parallel_tool_use"].as_slice(),
+        _ => return Err(ApiError::bad_request(
+            "tool_choice type must be 'auto', 'any', or 'tool'",
+        )),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(ApiError::bad_request("tool_choice contains unsupported fields"));
+    }
+    if object.get("disable_parallel_tool_use").and_then(Value::as_bool) == Some(true) {
+        return Err(ApiError::bad_request("disable_parallel_tool_use=true is not supported"));
+    }
+    match kind {
+        "auto" => Ok(json!("auto")),
+        "any" => Ok(json!("required")),
+        "tool" => {
             let name = object.get("name").and_then(Value::as_str)
                 .filter(|name| !name.trim().is_empty())
                 .ok_or_else(|| ApiError::bad_request("tool_choice type='tool' requires name"))?;
             Ok(json!({"type":"function","function":{"name":name}}))
         }
-        _ => Err(ApiError::bad_request(
-            "tool_choice type must be 'auto', 'any', or 'tool'",
-        )),
+        _ => unreachable!("tool_choice type was validated above"),
     }
 }
 
@@ -633,6 +649,20 @@ mod tests {
         assert_eq!(blocks[0]["type"], "tool_use");
         assert_eq!(blocks[0]["id"], "toolu_9");
         assert_eq!(blocks[0]["input"]["city"], "Jakarta");
+    }
+
+    #[test]
+    fn anthropic_message_and_tool_choice_reject_unsupported_fields() {
+        let message = serde_json::from_value::<AnthropicMessage>(json!({
+            "role":"user","content":"Hello","cache_control":{"type":"ephemeral"}
+        }));
+        assert!(message.is_err());
+        assert!(normalize_tool_choice(Some(json!({
+            "type":"auto","unsupported_option":true
+        }))).is_err());
+        assert!(normalize_tool_choice(Some(json!({
+            "type":"any","disable_parallel_tool_use":true
+        }))).is_err());
     }
 
     #[test]
