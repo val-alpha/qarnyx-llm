@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 #[derive(Debug)]
-struct NativeApiError(ApiError);
+pub(super) struct NativeApiError(ApiError);
 
 impl From<ApiError> for NativeApiError {
     fn from(error: ApiError) -> Self { Self(error) }
@@ -44,7 +44,7 @@ impl IntoResponse for NativeApiError {
 }
 
 #[derive(Debug, Deserialize)]
-struct NativeGenerateRequest {
+pub(super) struct NativeGenerateRequest {
     model: String,
     prompt: String,
     #[serde(default)]
