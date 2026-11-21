@@ -301,6 +301,12 @@ fn normalize_tool_choice(value: Option<Value>) -> Result<Value, ApiError> {
 }
 
 fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<PreparedRequest, ApiError> {
+    if request.model != state.assets.model_id && request.model != "qarnyx" {
+        return Err(ApiError::not_found(format!(
+            "model '{}' is not loaded; available model is '{}'",
+            request.model, state.assets.model_id
+        )));
+    }
     if request.max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be non-zero"));
     }
@@ -314,39 +320,34 @@ fn prepare_request(state: &ApiState, request: MessagesRequest) -> Result<Prepare
             "unsupported Anthropic request fields: {}", fields.join(", ")
         )));
     }
+
     let messages = normalize_messages(request.system, request.messages)?;
+    validate_chat_messages(&messages)?;
     let tools = normalize_tools(request.tools)?;
-    let tool_choice = normalize_tool_choice(request.tool_choice)?;
-    let normalized = ChatCompletionRequest {
-        model: request.model,
-        messages,
-        stream: request.stream,
-        max_tokens: Some(request.max_tokens),
-        max_completion_tokens: None,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        seed: request.seed,
-        n: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        logprobs: None,
-        top_logprobs: None,
-        logit_bias: None,
-        tools: Some(tools),
-        tool_choice: Some(tool_choice),
-        functions: None,
-        function_call: None,
-        response_format: None,
-        stream_options: None,
-        _user: None,
-        store: None,
-        max_context_tokens: None,
-        max_cache_mib: None,
-        unsupported: Default::default(),
+    let choice_value = normalize_tool_choice(request.tool_choice)?;
+    let tool_choice = parse_tool_choice(Some(&choice_value)).map_err(ApiError::bad_request)?;
+    if tools.is_empty() && !matches!(tool_choice, ToolChoice::Auto | ToolChoice::None) {
+        return Err(ApiError::bad_request("tool_choice requires at least one tool"));
+    }
+    validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
+
+    let prompt = format_chat_prompt(&state.assets.architecture, &messages, &tools, &tool_choice)?;
+    let defaults = GenerationConfig::default();
+    let config = GenerationConfig {
+        max_new_tokens: request.max_tokens,
+        max_context_tokens: state.assets.max_context_tokens,
+        max_cache_mib: state.assets.max_cache_mib,
+        temperature: request.temperature.unwrap_or(defaults.temperature),
+        top_k: request.top_k.unwrap_or(defaults.top_k),
+        top_p: request.top_p.unwrap_or(defaults.top_p),
+        seed: request.seed.unwrap_or(defaults.seed),
     };
-    state.prepare(normalized)
+    state.prepare_generation(
+        GenerationRequest { prompt, config },
+        false,
+        tools,
+        tool_choice,
+    )
 }
 
 fn stop_reason(parsed: &tool_call::ParsedAssistant, completion_tokens: usize, max_tokens: usize) -> &'static str {
