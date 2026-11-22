@@ -54,7 +54,7 @@ impl IntoResponse for AnthropicApiError {
         let error_type = match self.0.status {
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-            StatusCode::INTERNAL_SERVER_ERROR => "api_error",
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::INTERNAL_SERVER_ERROR => "api_error",
             _ => "invalid_request_error",
         };
         let request_id = next_request_id();
@@ -69,6 +69,12 @@ impl IntoResponse for AnthropicApiError {
             .into_response();
         if let Ok(value) = HeaderValue::try_from(request_id.as_str()) {
             response.headers_mut().insert("request-id", value);
+        }
+        if self.0.status == StatusCode::TOO_MANY_REQUESTS {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
         }
         response
     }
