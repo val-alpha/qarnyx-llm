@@ -179,7 +179,9 @@ The shared discovery endpoints are `GET /health`, `GET /ready`, and
 `GET /v1/models`. Health/readiness responses include the loaded model and
 current/max active inference requests. When all configured inference slots are
 occupied, new generation requests are rejected immediately with HTTP 429 and
-`Retry-After: 1` instead of waiting in an unbounded queue. The model-load
+`Retry-After: 1` instead of waiting in an unbounded queue. During graceful
+shutdown, `/health` remains a liveness check while `/ready` reports HTTP 503
+and `status="shutting_down"`. The model-load
 memory admission reserves `max_cache_mib × max_concurrent_requests` in the
 configured `max_memory_mib` budget before admitting the model file. This is an
 accounting envelope, not an operating-system RSS limit.
