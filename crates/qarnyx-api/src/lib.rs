@@ -1012,6 +1012,14 @@ impl ApiError {
         }
     }
 
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            message: message.into(),
+        }
+    }
+
     fn invalid_model_output(message: impl Into<String>) -> Self {
         Self::internal(format!(
             "model returned invalid tool-call output: {}",
@@ -1022,7 +1030,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry_after = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.status,
             Json(json!({
                 "error": {
@@ -1033,7 +1042,14 @@ impl IntoResponse for ApiError {
                 }
             })),
         )
-            .into_response()
+            .into_response();
+        if retry_after {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
