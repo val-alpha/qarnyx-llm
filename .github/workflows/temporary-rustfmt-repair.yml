@@ -1,0 +1,50 @@
+name: Temporary workspace rustfmt repair
+
+on:
+  push:
+    branches:
+      - feature/m8-f-anthropic-tool-reliability
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install stable Rust with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply workspace formatting
+        run: cargo fmt --all
+
+      - name: Commit formatting changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/qarnyx-gguf/src/parser.rs
+          git add crates/qarnyx-models/src/lib.rs
+          git add crates/qarnyx-models/src/loader.rs
+          git add crates/qarnyx-models/src/qwen35.rs
+          git add crates/qarnyx-runtime/src/lib.rs
+          if git diff --cached --quiet; then
+            echo "No formatting changes were necessary."
+            exit 0
+          fi
+          git commit -m "style: apply workspace rustfmt"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Verify formatting after commit
+        run: cargo fmt --all -- --check
+
+      - name: Verify compilation and tests
+        run: |
+          cargo check --workspace
+          cargo test --workspace
