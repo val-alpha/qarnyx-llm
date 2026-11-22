@@ -457,6 +457,15 @@ Milestones:
   `top_p`, and `seed`. Raw prompts are not wrapped in vendor chat syntax.
   JSON responses expose generated token IDs and usage. Streaming emits native
   token, text-delta, completion, and done events.
+- M8-F Tool-call reliability (implemented; model-backed validation remains):
+  tool instructions explicitly describe the forced-choice contract and the
+  Qarnyx JSON envelope. Model output normalization accepts that envelope,
+  Qwen-style `<tool_call>` JSON blocks, single-call JSON objects, and
+  OpenAI-shaped function-call objects. Encoded JSON-string arguments are
+  decoded into objects; unknown function names, mismatched forced choices,
+  malformed JSON, and non-object arguments are rejected. A model that ignores
+  a valid forced-tool request is reported as a server-side model-output error,
+  not as an invalid client request. Tool execution remains client-owned.
 - M8-E Common API abstraction (implemented): all adapters normalize prompt
   text and `GenerationConfig` into the public, protocol-neutral
   `GenerationRequest` contract in `qarnyx-api::common`. The shared
@@ -483,6 +492,10 @@ Implementation limits (not a claim of full vendor API parity):
 - Tool execution is always performed by the client. Qarnyx formats and returns
   tool calls and accepts the corresponding tool-result history; it does not
   invoke external functions.
+- Tool calling remains model-dependent: a forced `tool_choice` cannot guarantee
+  that a small or instruction-insensitive model will emit a valid function call.
+  Qarnyx validates and rejects invalid output; it does not invent or infer tool
+  arguments from ordinary assistant text.
 
 All three adapters share the runtime event source and the same request
 admission semaphore. They must not duplicate model forward passes, decode
