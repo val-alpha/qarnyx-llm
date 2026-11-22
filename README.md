@@ -249,9 +249,10 @@ adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
 `config` object. OpenAI Chat Completions accepts the `stop` string/array and
 `response_format.type="json_object"`; JSON mode is prompt-guided and validates
 the final top-level object rather than using constrained decoding. Anthropic
-Messages accepts `stop_sequences` and `metadata.user_id`. Stop sequences are
-matched against decoded text at token boundaries and excluded from returned
-content. Anthropic text blocks and client-executed tool-use/tool-result round
+Messages accepts `stop_sequences` and `metadata.user_id`. The current Qarnyx
+guard caps Anthropic requests at 16 stop sequences of at most 256 UTF-8 bytes
+each. Stop sequences are matched against decoded text at token boundaries and
+excluded from returned content. Anthropic text blocks and client-executed tool-use/tool-result round
 trips are supported. The server does not execute client tools.
 Tool-call output is normalized from the Qarnyx JSON envelope, Qwen-style
 `<tool_call>` blocks, single-call JSON, and OpenAI-shaped function-call
