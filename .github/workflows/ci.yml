@@ -22,10 +22,12 @@ jobs:
           components: rustfmt
 
       - name: Validate API test runner syntax
-        run: python3 -m py_compile scripts/api_test.py
+        run: |
+          python3 -m py_compile scripts/api_test.py
+          bash -n scripts/api-test.sh
 
       - name: Verify clean skip when API server is offline
-        run: python3 scripts/api_test.py --base-url http://127.0.0.1:1
+        run: bash scripts/api-test.sh --skip-build --base-url http://127.0.0.1:1
 
       # Run build and tests before the repository-wide formatting gate.
       # Existing formatting debt should not hide compiler or test diagnostics.
