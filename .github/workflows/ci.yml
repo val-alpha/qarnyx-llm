@@ -24,6 +24,9 @@ jobs:
       - name: Validate API test runner syntax
         run: python3 -m py_compile scripts/api_test.py
 
+      - name: Verify clean skip when API server is offline
+        run: python3 scripts/api_test.py --base-url http://127.0.0.1:1
+
       # Run build and tests before the repository-wide formatting gate.
       # Existing formatting debt should not hide compiler or test diagnostics.
       - name: Check workspace
