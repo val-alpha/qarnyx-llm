@@ -164,9 +164,12 @@ impl LlamaKvCache {
         let key_capacity = key_width
             .checked_mul(context_tokens)
             .ok_or(ModelError::InvalidConfig("LLaMA KV key capacity overflow"))?;
-        let value_capacity = value_width
-            .checked_mul(context_tokens)
-            .ok_or(ModelError::InvalidConfig("LLaMA KV value capacity overflow"))?;
+        let value_capacity =
+            value_width
+                .checked_mul(context_tokens)
+                .ok_or(ModelError::InvalidConfig(
+                    "LLaMA KV value capacity overflow",
+                ))?;
 
         Ok(Self {
             keys: (0..config.block_count)
@@ -195,7 +198,9 @@ impl LlamaKvCache {
 
     pub(crate) fn validate(&self, config: &LlamaConfig) -> Result<(), ModelError> {
         if self.keys.len() != config.block_count || self.values.len() != config.block_count {
-            return Err(ModelError::InvalidConfig("KV cache layer count does not match model"));
+            return Err(ModelError::InvalidConfig(
+                "KV cache layer count does not match model",
+            ));
         }
         let key_width = config.attention_head_count_kv * config.attention_key_length;
         let value_width = config.attention_head_count_kv * config.attention_value_length;
@@ -203,7 +208,9 @@ impl LlamaKvCache {
             if self.keys[layer].len() != self.sequence_len * key_width
                 || self.values[layer].len() != self.sequence_len * value_width
             {
-                return Err(ModelError::InvalidConfig("KV cache tensor length is inconsistent"));
+                return Err(ModelError::InvalidConfig(
+                    "KV cache tensor length is inconsistent",
+                ));
             }
         }
         Ok(())
@@ -343,8 +350,12 @@ pub fn forward_block_with_cache<B: Backend>(
     let value_len = config.attention_head_count_kv * config.attention_value_length;
 
     let mut norm = vec![0.0_f32; hidden];
-    backend.rms_norm(input, weights.attention_norm, &mut norm,
-        config.attention_layer_norm_rms_epsilon)?;
+    backend.rms_norm(
+        input,
+        weights.attention_norm,
+        &mut norm,
+        config.attention_layer_norm_rms_epsilon,
+    )?;
 
     let mut q = vec![0.0_f32; q_len];
     let mut k = vec![0.0_f32; kv_len];
@@ -355,13 +366,21 @@ pub fn forward_block_with_cache<B: Backend>(
 
     for head in 0..config.attention_head_count {
         let start = head * config.attention_key_length;
-        backend.rope(&mut q[start..start + config.attention_key_length], position,
-            config.attention_key_length, config.rope_freq_base)?;
+        backend.rope(
+            &mut q[start..start + config.attention_key_length],
+            position,
+            config.attention_key_length,
+            config.rope_freq_base,
+        )?;
     }
     for head in 0..config.attention_head_count_kv {
         let start = head * config.attention_key_length;
-        backend.rope(&mut k[start..start + config.attention_key_length], position,
-            config.attention_key_length, config.rope_freq_base)?;
+        backend.rope(
+            &mut k[start..start + config.attention_key_length],
+            position,
+            config.attention_key_length,
+            config.rope_freq_base,
+        )?;
     }
 
     cache.append_layer(layer_index, &k, &v);
@@ -382,7 +401,8 @@ pub fn forward_block_with_cache<B: Backend>(
                 .iter()
                 .zip(&cached_keys[k_start..k_start + config.attention_key_length])
                 .map(|(a, b)| a * b)
-                .sum::<f32>() * scale;
+                .sum::<f32>()
+                * scale;
         }
 
         backend.softmax(&mut scores)?;
@@ -399,8 +419,12 @@ pub fn forward_block_with_cache<B: Backend>(
     let mut projected = vec![0.0_f32; hidden];
     backend.matvec(weights.o_proj, &attention_output, &mut projected)?;
     backend.residual_add(&mut projected, input)?;
-    backend.rms_norm(&projected, weights.ffn_norm, &mut norm,
-        config.attention_layer_norm_rms_epsilon)?;
+    backend.rms_norm(
+        &projected,
+        weights.ffn_norm,
+        &mut norm,
+        config.attention_layer_norm_rms_epsilon,
+    )?;
 
     let mut gate = vec![0.0_f32; config.feed_forward_length];
     let mut up = vec![0.0_f32; config.feed_forward_length];
@@ -413,7 +437,6 @@ pub fn forward_block_with_cache<B: Backend>(
     backend.residual_add(&mut output, &projected)?;
     Ok(output)
 }
-
 
 fn validate_layer_shapes(
     config: &LlamaConfig,
@@ -511,7 +534,7 @@ fn metadata_usize(gguf: &GgufFile, key: &'static str) -> Result<usize, ModelErro
             return Err(ModelError::InvalidMetadata {
                 key,
                 expected: "unsigned integer",
-            })
+            });
         }
     };
     usize::try_from(raw).map_err(|_| ModelError::InvalidConfig("metadata value exceeds usize"))
@@ -690,12 +713,26 @@ mod tests {
         let backend = qarnyx_cpu::CpuBackend::new(1).unwrap();
         let mut cache = LlamaKvCache::new(&config);
         let first = forward_block_with_cache(
-            &backend, &config, &weights, &[1.0, 2.0, 3.0, 4.0], 0, &mut cache, 0,
-        ).unwrap();
+            &backend,
+            &config,
+            &weights,
+            &[1.0, 2.0, 3.0, 4.0],
+            0,
+            &mut cache,
+            0,
+        )
+        .unwrap();
         cache.advance();
         let second = forward_block_with_cache(
-            &backend, &config, &weights, &[4.0, 3.0, 2.0, 1.0], 1, &mut cache, 0,
-        ).unwrap();
+            &backend,
+            &config,
+            &weights,
+            &[4.0, 3.0, 2.0, 1.0],
+            1,
+            &mut cache,
+            0,
+        )
+        .unwrap();
 
         assert_eq!(first, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(second, [4.0, 3.0, 2.0, 1.0]);
