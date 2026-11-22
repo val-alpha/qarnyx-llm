@@ -21,6 +21,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Validate API test runner syntax
+        run: python3 -m py_compile scripts/api_test.py
+
       # Run build and tests before the repository-wide formatting gate.
       # Existing formatting debt should not hide compiler or test diagnostics.
       - name: Check workspace
