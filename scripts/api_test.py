@@ -541,7 +541,46 @@ class ApiTestRunner:
             except json.JSONDecodeError as error:
                 raise TestFailure(f"JSON mode returned invalid JSON: {error}; content={content!r}") from error
             require(isinstance(decoded, dict), "JSON mode did not return a top-level object")
-            return "response_format=json_object returned a valid JSON object"
+
+            streamed = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{
+                        "role": "user",
+                        "content": 'Return exactly this JSON object and nothing else: {"ok":true}',
+                    }],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": self.args.max_tokens,
+                    "temperature": 0,
+                    "stream": True,
+                },
+            )
+            expect_status(streamed, 200, "OpenAI streamed JSON object response format")
+            require(
+                "text/event-stream" in streamed.headers.get("content-type", ""),
+                "JSON mode stream content-type is not text/event-stream",
+            )
+            frames = parse_sse(streamed.body)
+            require(any(frame["data"] == "[DONE]" for frame in frames), "JSON mode stream [DONE] missing")
+            chunks = [
+                frame["data"] for frame in frames
+                if isinstance(frame["data"], dict)
+            ]
+            streamed_content = "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+                if isinstance(choice, dict)
+            )
+            try:
+                streamed_json = json.loads(streamed_content)
+            except json.JSONDecodeError as error:
+                raise TestFailure(
+                    f"streamed JSON mode returned invalid JSON: {error}; content={streamed_content!r}"
+                ) from error
+            require(isinstance(streamed_json, dict), "streamed JSON mode did not return a top-level object")
+            return "response_format=json_object passed JSON and buffered SSE validation"
 
         def invalid_stop() -> str:
             response = self.request(
