@@ -461,6 +461,7 @@ struct PreparedRequest {
     tools: Vec<OpenAiTool>,
     tool_choice: ToolChoice,
     stop_sequences: Vec<String>,
+    json_mode: bool,
 }
 
 #[derive(Default)]
@@ -500,7 +501,7 @@ impl GenerationCapture {
             let retained_tokens = self
                 .token_ranges
                 .iter()
-                .take_while(|(start, _)| start < stop_at)
+                .take_while(|range| range.0 < *stop_at)
                 .count();
             self.token_ids.truncate(retained_tokens);
         }
@@ -538,6 +539,43 @@ pub(crate) fn validate_stop_sequences(
         }
     }
     Ok(values)
+}
+
+fn apply_json_mode_instruction(messages: &mut Vec<ChatMessage>) {
+    const INSTRUCTION: &str = "Return exactly one valid JSON object. Do not include Markdown fences, comments, or explanatory text outside the JSON object.";
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        let content = system.content.get_or_insert_with(String::new);
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(INSTRUCTION);
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".into(),
+                content: Some(INSTRUCTION.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                unsupported: HashMap::new(),
+            },
+        );
+    }
+}
+
+fn validate_json_object(output: &str) -> Result<(), ApiError> {
+    let value = serde_json::from_str::<Value>(output).map_err(|error| {
+        ApiError::invalid_model_output(format!(
+            "response_format='json_object' requires valid JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(ApiError::invalid_model_output(
+            "response_format='json_object' requires a JSON object at the top level",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_stop_sequences(
@@ -616,11 +654,21 @@ impl ApiState {
         }
         validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
         if let Some(format) = request.response_format {
-            if format.kind != "text" {
-                return Err(ApiError::bad_request(
-                    "only response_format.type='text' is supported",
-                ));
+        let json_mode = match request.response_format {
+            None => false,
+            Some(format) if format.kind == "text" => false,
+            Some(format) if format.kind == "json_object" => true,
+            Some(format) => {
+                return Err(ApiError::bad_request(format!(
+                    "response_format.type='{}' is not supported; use 'text' or 'json_object'",
+                    format.kind
+                )));
             }
+        };
+        if json_mode && !tools.is_empty() {
+            return Err(ApiError::bad_request(
+                "response_format.type='json_object' cannot be combined with tools",
+            ));
         }
         if request.store.unwrap_or(false) {
             return Err(ApiError::bad_request(
@@ -678,10 +726,14 @@ impl ApiState {
             ));
         }
 
+        let mut prompt_messages = request.messages;
+        if json_mode {
+            apply_json_mode_instruction(&mut prompt_messages);
+        }
         let prompt = format_chat_prompt(
             &self.assets.tokenizer,
             &self.assets.architecture,
-            &request.messages,
+            &prompt_messages,
             &tools,
             &tool_choice,
         )?;
@@ -703,6 +755,7 @@ impl ApiState {
             tools,
             tool_choice,
             stop_sequences,
+            json_mode,
         )
     }
 
@@ -713,6 +766,7 @@ impl ApiState {
         tools: Vec<OpenAiTool>,
         tool_choice: ToolChoice,
         stop_sequences: Vec<String>,
+        json_mode: bool,
     ) -> Result<PreparedRequest, ApiError> {
         let config = request.config;
         if config.max_context_tokens == 0 || config.max_cache_mib == 0 {
@@ -752,6 +806,7 @@ impl ApiState {
             tools,
             tool_choice,
             stop_sequences,
+            json_mode,
         })
     }
 
