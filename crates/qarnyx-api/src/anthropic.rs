@@ -484,10 +484,10 @@ pub(super) async fn create_messages(
     let Json(request) =
         payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
+    let permit = state.admit_request()?;
     let prepared = prepare_request(&state, request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_tokens = prepared.config.max_new_tokens;
-    let permit = state.admit_request()?;
     if stream {
         return stream_messages(state, prepared, prompt_tokens, max_tokens, permit).await;
     }
@@ -587,6 +587,9 @@ async fn stream_messages(
 
         let result = state.generate_captured(&prepared, &task_cancellation, |event| {
             if buffer_output {
+                if sender.is_closed() {
+                    task_cancellation.cancel();
+                }
                 return;
             }
             let delta = match event {
