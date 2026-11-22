@@ -56,8 +56,9 @@ bash scripts/api-test.sh --skip-build
 All arguments after `--skip-build` are passed through to the Python runner.
 
 The runner uses only Python's standard library; no `pip install` is needed.
-Requests run sequentially because the server defaults to one concurrent
-inference slot.
+Requests run sequentially. The server defaults to one concurrent inference
+slot; increase `--max-concurrent-requests` only after sizing the aggregate
+per-request cache reservation for available memory.
 
 ## 3. Select a target or tune limits
 
@@ -90,14 +91,15 @@ Options:
 
 ## 4. Test coverage
 
-The `all` suite runs these checks serially. Check `GET /health` and
-`GET /ready` separately for current/max request-slot telemetry:
+The `all` suite runs 24 checks serially (one shared, ten OpenAI, eight
+Anthropic, and five native). The shared check validates `GET /health`,
+`GET /ready` and their request-slot telemetry:
 
 | Surface | Coverage |
 |---|---|
 | Shared | Health probe, model discovery |
-| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, stop strings, JSON-object response mode, invalid request rejection, unknown model rejection |
-| Anthropic | Basic Messages, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, `stop_sequences`, `metadata.user_id`, unsupported parameter rejection, unknown model rejection |
+| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, JSON-object response mode (live model), malformed stop-array validation, request validation, unknown model rejection |
+| Anthropic | Basic Messages including `metadata.user_id`, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, empty stop-sequence validation, unsupported parameter rejection, unknown model rejection |
 | Native Qarnyx | Raw-prompt generation, generation controls, token IDs and usage, native SSE token/text/completed/done events, empty prompt rejection, invalid generation config rejection, unknown model rejection |
 
 A successful tool round trip performs a simulated client-side tool execution:
@@ -127,18 +129,25 @@ cancellation if their handler future is dropped. Ctrl+C and SIGTERM cancel all
 active request tokens before the server drains HTTP connections. Cancellation
 is cooperative: the current model/token evaluation is allowed to finish.
 
-OpenAI `stop` accepts one string or up to four strings. Anthropic
-`stop_sequences` accepts up to sixteen strings. Stop text is excluded from
-returned content, and Anthropic reports the matching `stop_sequence` with
-`stop_reason="stop_sequence"`. Stop matching is text-based and cancels at the
-next token boundary; it does not interrupt the middle of a token evaluation.
+OpenAI `stop` accepts a non-empty string or an array containing one to four
+strings, matching the current Chat Completions contract. Anthropic
+`stop_sequences` accepts an array of strings; Qarnyx currently applies an
+implementation guard of at most sixteen sequences and 256 UTF-8 bytes per
+sequence. Stop text is excluded from returned content, and Anthropic reports
+the matching `stop_sequence` with `stop_reason="stop_sequence"`. Stop matching
+is text-based and cancels at the next token boundary; it does not interrupt the
+middle of a token evaluation. Unit tests cover stop matching across token
+boundaries and token-usage accounting. The live runner validates stop request
+shape; it does not depend on a stochastic model producing a particular stop
+string.
 
 OpenAI `response_format.type="json_object"` injects a JSON-only instruction,
 buffers streamed output, and validates that the completed response is a valid
 top-level JSON object before returning it. This is prompt-guided validation,
 not grammar-constrained decoding; a model that fails to follow the instruction
 returns a server-side model-output error. Anthropic `metadata.user_id` is
-accepted and validated but is not persisted or used for authentication.
+accepted and validated up to 512 characters but is not persisted or used for
+authentication.
 
 The native `/v1/generate` endpoint remains a raw-prompt interface and does not
 inherit OpenAI/Anthropic stop fields or response-format controls.
