@@ -460,6 +460,109 @@ struct PreparedRequest {
     include_usage: bool,
     tools: Vec<OpenAiTool>,
     tool_choice: ToolChoice,
+    stop_sequences: Vec<String>,
+}
+
+#[derive(Default)]
+struct GenerationCapture {
+    text: String,
+    token_ids: Vec<usize>,
+    token_ranges: Vec<(usize, usize)>,
+    stop: Option<(usize, String)>,
+}
+
+impl GenerationCapture {
+    fn record(&mut self, event: &GenerationEvent, stop_sequences: &[String]) -> bool {
+        if self.stop.is_some() {
+            return true;
+        }
+        let start = self.text.len();
+        match event {
+            GenerationEvent::Token { token_id, text_delta } => {
+                self.token_ids.push(*token_id);
+                self.text.push_str(text_delta);
+                self.token_ranges.push((start, self.text.len()));
+            }
+            GenerationEvent::TextDelta { text } => self.text.push_str(text),
+        }
+
+        self.stop = stop_sequences
+            .iter()
+            .filter_map(|sequence| self.text.find(sequence).map(|index| (index, sequence.clone())))
+            .min_by_key(|(index, _)| *index);
+        self.stop.is_some()
+    }
+
+    fn into_output(mut self, prompt_tokens: usize) -> (GenerationOutput, Option<String>) {
+        let stop_sequence = self.stop.as_ref().map(|(_, sequence)| sequence.clone());
+        if let Some((stop_at, _)) = &self.stop {
+            self.text.truncate(*stop_at);
+            let retained_tokens = self
+                .token_ranges
+                .iter()
+                .take_while(|(start, _)| start < stop_at)
+                .count();
+            self.token_ids.truncate(retained_tokens);
+        }
+        let completion_tokens = self.token_ids.len();
+        (
+            GenerationOutput {
+                text: self.text,
+                token_ids: self.token_ids,
+                prompt_tokens,
+                completion_tokens,
+            },
+            stop_sequence,
+        )
+    }
+}
+
+pub(crate) fn validate_stop_sequences(
+    values: Vec<String>,
+    max_count: usize,
+    field: &str,
+) -> Result<Vec<String>, ApiError> {
+    if values.len() > max_count {
+        return Err(ApiError::bad_request(format!(
+            "{field} accepts at most {max_count} sequences"
+        )));
+    }
+    for sequence in &values {
+        if sequence.is_empty() {
+            return Err(ApiError::bad_request(format!("{field} entries must not be empty")));
+        }
+        if sequence.len() > 256 {
+            return Err(ApiError::bad_request(format!(
+                "{field} entries must be no longer than 256 bytes"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn parse_stop_sequences(
+    value: Option<Value>,
+    max_count: usize,
+    field: &str,
+) -> Result<Vec<String>, ApiError> {
+    let values = match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(sequence)) => vec![sequence],
+        Some(Value::Array(values)) => values
+            .into_iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    ApiError::bad_request(format!("{field} array entries must be strings"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be a string or an array of strings"
+            )));
+        }
+    };
+    validate_stop_sequences(values, max_count, field)
 }
 
 impl ApiState {
@@ -484,11 +587,7 @@ impl ApiState {
                 )));
             }
         }
-        if request.stop.as_ref().is_some_and(|value| !value.is_null()) {
-            return Err(ApiError::bad_request(
-                "stop sequences are not supported by this runtime adapter yet",
-            ));
-        }
+        let stop_sequences = parse_stop_sequences(request.stop, 4, "stop")?;
         if request.logprobs.unwrap_or(false) || request.top_logprobs.unwrap_or(0) > 0 {
             return Err(ApiError::bad_request("logprobs are not supported"));
         }
@@ -603,6 +702,7 @@ impl ApiState {
             stream_options.include_usage,
             tools,
             tool_choice,
+            stop_sequences,
         )
     }
 
@@ -612,6 +712,7 @@ impl ApiState {
         include_usage: bool,
         tools: Vec<OpenAiTool>,
         tool_choice: ToolChoice,
+        stop_sequences: Vec<String>,
     ) -> Result<PreparedRequest, ApiError> {
         let config = request.config;
         if config.max_context_tokens == 0 || config.max_cache_mib == 0 {
@@ -650,7 +751,36 @@ impl ApiState {
             include_usage,
             tools,
             tool_choice,
+            stop_sequences,
         })
+    }
+
+    fn generate_captured<F>(
+        &self,
+        prepared: &PreparedRequest,
+        cancellation: &CancellationToken,
+        mut on_event: F,
+    ) -> Result<(GenerationOutput, Option<String>), RunError>
+    where
+        F: FnMut(&GenerationEvent),
+    {
+        let prompt_tokens = prepared.prompt_ids.len();
+        let mut capture = GenerationCapture::default();
+        let result = self.generate(prepared, cancellation, |event| {
+            let stop_requested = capture.record(&event, &prepared.stop_sequences);
+            on_event(&event);
+            if stop_requested {
+                cancellation.cancel();
+            }
+        });
+
+        match result {
+            Ok(_) => Ok(capture.into_output(prompt_tokens)),
+            Err(RunError::Generation(GenerationError::Cancelled)) if capture.stop.is_some() => {
+                Ok(capture.into_output(prompt_tokens))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn generate<F>(
