@@ -227,6 +227,11 @@ adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
 `max_cache_mib`, `temperature`, `top_k`, `top_p`, and `seed` under its
 `config` object. Anthropic text blocks and client-executed tool-use/tool-result
 round trips are supported. The server does not execute client tools.
+Tool-call output is normalized from the Qarnyx JSON envelope, Qwen-style
+`<tool_call>` blocks, single-call JSON, and OpenAI-shaped function-call
+objects. Unknown tools, malformed arguments, and failed forced-tool responses
+are rejected; a model's compliance with `tool_choice` remains model-dependent.
+The client executes returned tools and sends their results in a later request.
 
 Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
 role-labelled prompt because model-specific LLaMA chat templates are not
