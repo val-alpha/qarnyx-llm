@@ -509,7 +509,7 @@ pub(super) async fn create_messages(
         return stream_messages(state, prepared, prompt_tokens, max_tokens, permit).await;
     }
 
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let response_tools = prepared.tools.clone();
@@ -559,7 +559,7 @@ async fn stream_messages(
 ) -> Result<Response, AnthropicApiError> {
     let model = state.assets.model_id.clone();
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
