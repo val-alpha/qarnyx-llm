@@ -42,7 +42,8 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     max_cache_mib: usize,
 
-    /// Maximum simultaneous inference requests. Defaults to one to bound cache memory.
+    /// Maximum simultaneous inference requests. New requests are rejected with HTTP 429
+    /// while all slots are occupied; the server does not build an unbounded inference queue.
     #[arg(long, default_value_t = 1)]
     max_concurrent_requests: usize,
 }
@@ -68,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         listener.local_addr()?
     );
     println!(
-        "Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/generate"
+        "Endpoints: GET /health, GET /ready, GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/generate"
     );
 
     axum::serve(listener, router(state))
