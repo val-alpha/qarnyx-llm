@@ -66,7 +66,9 @@ impl ToolCall {
 }
 
 pub fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, String> {
-    let Some(value) = value else { return Ok(ToolChoice::Auto); };
+    let Some(value) = value else {
+        return Ok(ToolChoice::Auto);
+    };
     match value {
         Value::String(value) if value == "auto" => Ok(ToolChoice::Auto),
         Value::String(value) if value == "none" => Ok(ToolChoice::None),
@@ -75,10 +77,15 @@ pub fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, String> {
             if object.get("type").and_then(Value::as_str) != Some("function") {
                 return Err("tool_choice object must have type='function'".into());
             }
-            let name = object.get("function").and_then(Value::as_object)
-                .and_then(|f| f.get("name")).and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| "tool_choice.function.name must be a non-empty string".to_owned())?;
+            let name = object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    "tool_choice.function.name must be a non-empty string".to_owned()
+                })?;
             Ok(ToolChoice::Function(name.to_owned()))
         }
         _ => Err("tool_choice must be 'auto', 'none', 'required', or a function selector".into()),
@@ -86,20 +93,38 @@ pub fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, String> {
 }
 
 pub fn validate_tools(tools: &[OpenAiTool]) -> Result<(), String> {
-    if tools.is_empty() { return Err("tools must contain at least one function".into()); }
+    if tools.is_empty() {
+        return Err("tools must contain at least one function".into());
+    }
     let mut names = std::collections::HashSet::new();
     for tool in tools {
-        if tool.kind != "function" { return Err("only tools with type='function' are supported".into()); }
+        if tool.kind != "function" {
+            return Err("only tools with type='function' are supported".into());
+        }
         let name = tool.function.name.trim();
         if name.is_empty() || name.len() > 64 {
             return Err("function names must contain between 1 and 64 characters".into());
         }
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(format!("function name '{name}' contains unsupported characters"));
+        if !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+        {
+            return Err(format!(
+                "function name '{name}' contains unsupported characters"
+            ));
         }
-        if !names.insert(name.to_owned()) { return Err(format!("duplicate function name '{name}'")); }
-        if tool.function.parameters.as_ref().is_some_and(|v| !v.is_object()) {
-            return Err(format!("parameters for function '{name}' must be a JSON object"));
+        if !names.insert(name.to_owned()) {
+            return Err(format!("duplicate function name '{name}'"));
+        }
+        if tool
+            .function
+            .parameters
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(format!(
+                "parameters for function '{name}' must be a JSON object"
+            ));
         }
     }
     Ok(())
@@ -147,12 +172,15 @@ pub fn tool_protocol_instruction(tools: &[OpenAiTool], choice: &ToolChoice) -> S
 
 fn parse_tool_call_arguments(value: &Value, name: &str) -> Result<Value, String> {
     let arguments = match value {
-        Value::String(encoded) => serde_json::from_str::<Value>(encoded)
-            .map_err(|error| format!("arguments for function '{name}' are not valid JSON: {error}"))?,
+        Value::String(encoded) => serde_json::from_str::<Value>(encoded).map_err(|error| {
+            format!("arguments for function '{name}' are not valid JSON: {error}")
+        })?,
         other => other.clone(),
     };
     if !arguments.is_object() {
-        return Err(format!("arguments for function '{name}' must be a JSON object"));
+        return Err(format!(
+            "arguments for function '{name}' must be a JSON object"
+        ));
     }
     Ok(arguments)
 }
@@ -167,16 +195,26 @@ fn parse_one_tool_call(
         .ok_or_else(|| "each tool call must be a JSON object".to_owned())?;
 
     let (name, raw_arguments) = if let Some(function_value) = call.get("function") {
-        if call.keys().any(|key| !["id", "type", "function"].contains(&key.as_str())) {
+        if call
+            .keys()
+            .any(|key| !["id", "type", "function"].contains(&key.as_str()))
+        {
             return Err("OpenAI-shaped tool calls may contain only id, type, and function".into());
         }
-        if call.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "function") {
+        if call
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "function")
+        {
             return Err("tool call type must be 'function'".into());
         }
         let function = function_value
             .as_object()
             .ok_or_else(|| "tool call function must be an object".to_owned())?;
-        if function.keys().any(|key| !["name", "arguments"].contains(&key.as_str())) {
+        if function
+            .keys()
+            .any(|key| !["name", "arguments"].contains(&key.as_str()))
+        {
             return Err("tool call function may contain only name and arguments".into());
         }
         let name = function
@@ -195,7 +233,11 @@ fn parse_one_tool_call(
         {
             return Err("tool calls may contain only id, type, name, and arguments".into());
         }
-        if call.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "function") {
+        if call
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "function")
+        {
             return Err("tool call type must be 'function'".into());
         }
         let name = call
@@ -214,12 +256,17 @@ fn parse_one_tool_call(
     }
     if let ToolChoice::Function(selected) = choice {
         if selected != name {
-            return Err(format!("model called '{name}' but tool_choice selected '{selected}'"));
+            return Err(format!(
+                "model called '{name}' but tool_choice selected '{selected}'"
+            ));
         }
     }
 
     Ok(ToolCall {
-        id: format!("call_qarnyx_{}", NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed)),
+        id: format!(
+            "call_qarnyx_{}",
+            NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed)
+        ),
         name: name.to_owned(),
         arguments: parse_tool_call_arguments(raw_arguments, name)?,
     })
@@ -266,8 +313,9 @@ fn parse_tagged_tool_calls(output: &str) -> Result<Option<(Vec<Value>, String)>,
         let encoded = after_open[..end].trim();
         let value = serde_json::from_str::<Value>(encoded)
             .map_err(|error| format!("model returned invalid JSON inside <tool_call>: {error}"))?;
-        let block_calls = payload_calls(value)?
-            .ok_or_else(|| "<tool_call> block did not contain a recognized function call".to_owned())?;
+        let block_calls = payload_calls(value)?.ok_or_else(|| {
+            "<tool_call> block did not contain a recognized function call".to_owned()
+        })?;
         calls.extend(block_calls);
         remainder = &after_open[end + CLOSE.len()..];
     }
@@ -293,7 +341,10 @@ fn strip_json_code_fence(output: &str) -> &str {
         .strip_prefix("json")
         .or_else(|| after_open.strip_prefix("JSON"))
         .unwrap_or(after_open);
-    without_language.strip_suffix(fence).unwrap_or(without_language).trim()
+    without_language
+        .strip_suffix(fence)
+        .unwrap_or(without_language)
+        .trim()
 }
 
 pub fn parse_model_output(
@@ -302,9 +353,9 @@ pub fn parse_model_output(
     choice: &ToolChoice,
 ) -> Result<ParsedAssistant, String> {
     let trimmed = output.trim();
-    let (raw_calls, content) = if let Some((calls, surrounding_text)) =
-        parse_tagged_tool_calls(trimmed)?
-    {
+    let (raw_calls, content) =
+        if let Some((calls, surrounding_text)) = parse_tagged_tool_calls(trimmed)?
+        {
         (Some(calls), surrounding_text)
     } else {
         let candidate = strip_json_code_fence(trimmed);
@@ -356,7 +407,11 @@ pub fn parse_model_output(
     }
 
     Ok(ParsedAssistant {
-        content: if content.is_empty() { None } else { Some(content) },
+        content: if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
         tool_calls: parsed,
     })
 }
@@ -372,9 +427,21 @@ mod tests {
     #[test]
     fn parses_tool_choice_variants() {
         assert_eq!(parse_tool_choice(None).unwrap(), ToolChoice::Auto);
-        assert_eq!(parse_tool_choice(Some(&json!("none"))).unwrap(), ToolChoice::None);
-        assert_eq!(parse_tool_choice(Some(&json!("required"))).unwrap(), ToolChoice::Required);
-        assert_eq!(parse_tool_choice(Some(&json!({"type":"function","function":{"name":"get_weather"}}))).unwrap(), ToolChoice::Function("get_weather".into()));
+        assert_eq!(
+            parse_tool_choice(Some(&json!("none"))).unwrap(),
+            ToolChoice::None
+        );
+        assert_eq!(
+            parse_tool_choice(Some(&json!("required"))).unwrap(),
+            ToolChoice::Required
+        );
+        assert_eq!(
+            parse_tool_choice(Some(
+                &json!({"type":"function","function":{"name":"get_weather"}})
+            ))
+            .unwrap(),
+            ToolChoice::Function("get_weather".into())
+        );
     }
     #[test]
     fn validates_tools_and_selected_function() {
@@ -385,18 +452,40 @@ mod tests {
     }
     #[test]
     fn parses_neutral_envelope_and_serializes_openai_arguments() {
-        let parsed = parse_model_output(r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#, &[weather()], &ToolChoice::Auto).unwrap();
+        let parsed = parse_model_output(
+            r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#,
+            &[weather()],
+            &ToolChoice::Auto,
+        )
+        .unwrap();
         assert_eq!(parsed.content, None);
         assert_eq!(parsed.tool_calls[0].arguments["city"], "Jakarta");
         let call = parsed.tool_calls[0].to_openai();
         assert_eq!(call.kind, "function");
-        assert_eq!(serde_json::from_str::<Value>(&call.function.arguments).unwrap()["city"], "Jakarta");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.function.arguments).unwrap()["city"],
+            "Jakarta"
+        );
     }
     #[test]
     fn rejects_unknown_function_and_non_object_arguments() {
         let tools = vec![weather()];
-        assert!(parse_model_output(r#"{"tool_calls":[{"name":"missing","arguments":{}}]}"#, &tools, &ToolChoice::Auto).is_err());
-        assert!(parse_model_output(r#"{"tool_calls":[{"name":"get_weather","arguments":"x"}]}"#, &tools, &ToolChoice::Auto).is_err());
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"missing","arguments":{}}]}"#,
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"get_weather","arguments":"x"}]}"#,
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
     }
     #[test]
     fn required_choice_rejects_plain_text() {
@@ -408,7 +497,9 @@ mod tests {
         let instruction =
             tool_protocol_instruction(&[weather()], &ToolChoice::Function("get_weather".into()));
         assert!(instruction.contains("MUST call exactly the selected function"));
-        assert!(instruction.contains(r#"{"tool_calls":[{"name":"function_name","arguments":{}}]}"#));
+        assert!(
+            instruction.contains(r#"{"tool_calls":[{"name":"function_name","arguments":{}}]}"#)
+        );
         assert!(instruction.contains("Do not use markdown"));
     }
 
@@ -452,53 +543,67 @@ mod tests {
         let tools = [weather()];
         let plain = parse_model_output("It is sunny.", &tools, &ToolChoice::Auto).unwrap();
         assert_eq!(plain.content.as_deref(), Some("It is sunny."));
-        assert!(parse_model_output(
-            r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#,
-            &tools,
-            &ToolChoice::None
-        )
-        .is_err());
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#,
+                &tools,
+                &ToolChoice::None
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn malformed_tool_calls_and_forced_plain_text_are_rejected() {
         let tools = [weather()];
-        assert!(parse_model_output("I will check the weather.", &tools, &ToolChoice::Required).is_err());
-        assert!(parse_model_output(
-            r#"{"tool_calls":[{"name":"get_weather","arguments":"not-json"}]}"#,
-            &tools,
-            &ToolChoice::Auto
-        )
-        .is_err());
-        assert!(parse_model_output(
-            "<tool_call>{bad json}</tool_call>",
-            &tools,
-            &ToolChoice::Auto
-        )
-        .is_err());
-        assert!(parse_model_output(
-            "<tool_call>{\"name\":\"get_weather\"}",
-            &tools,
-            &ToolChoice::Auto
-        )
-        .is_err());
+        assert!(
+            parse_model_output("I will check the weather.", &tools, &ToolChoice::Required).is_err()
+        );
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"get_weather","arguments":"not-json"}]}"#,
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
+        assert!(
+            parse_model_output(
+                "<tool_call>{bad json}</tool_call>",
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
+        assert!(
+            parse_model_output(
+                "<tool_call>{\"name\":\"get_weather\"}",
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn selected_tool_and_tool_name_must_match_request() {
         let tools = [weather()];
-        assert!(parse_model_output(
-            r#"{"tool_calls":[{"name":"unknown","arguments":{}}]}"#,
-            &tools,
-            &ToolChoice::Auto
-        )
-        .is_err());
-        assert!(parse_model_output(
-            r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#,
-            &tools,
-            &ToolChoice::Function("another_tool".into())
-        )
-        .is_err());
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"unknown","arguments":{}}]}"#,
+                &tools,
+                &ToolChoice::Auto
+            )
+            .is_err()
+        );
+        assert!(
+            parse_model_output(
+                r#"{"tool_calls":[{"name":"get_weather","arguments":{"city":"Jakarta"}}]}"#,
+                &tools,
+                &ToolChoice::Function("another_tool".into())
+            )
+            .is_err()
+        );
     }
 
 
