@@ -770,6 +770,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn invalid_model_output(message: impl Into<String>) -> Self {
+        Self::internal(format!(
+            "model returned invalid tool-call output: {}",
+            message.into()
+        ))
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -852,7 +859,7 @@ async fn create_chat_completion(
     let completion_tokens = output.completion_tokens;
     let parsed =
         parse_model_output(&output.text, &tools, &tool_choice)
-        .map_err(|error| ApiError::internal(format!("model returned invalid tool-call output: {error}")))?;
+        .map_err(|error| ApiError::invalid_model_output(error))?;
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
     } else if completion_tokens >= max_new_tokens {
@@ -1300,6 +1307,14 @@ mod tests {
         assert!(validate_generation_request(12, 8, 16, 0.8, 0.95).is_err());
         assert!(validate_generation_request(4, 13, 16, 0.8, 0.95).is_err());
         assert!(validate_generation_request(4, 8, 16, 0.8, 0.95).is_ok());
+    }
+
+    #[test]
+    fn invalid_model_tool_output_is_classified_as_server_error() {
+        let error = ApiError::invalid_model_output("missing required tool envelope");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+        assert!(error.message.contains("invalid tool-call output"));
     }
 
     #[test]
