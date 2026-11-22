@@ -772,16 +772,23 @@ class ApiTestRunner:
             expect_status(first, 200, "Anthropic round-trip setup")
             body = json_body(first)
             call_id, _ = extract_anthropic_tool_call(body)
+            # A tool-result turn needs room for a natural-language completion;
+            # keep it independent from the smaller regular-chat default budget.
+            round_trip_max_tokens = max(self.args.max_tokens, 256)
             second = self.request(
                 "/v1/messages",
                 {
                     "model": self.model,
-                    "max_tokens": self.args.max_tokens,
+                    "max_tokens": round_trip_max_tokens,
                     "temperature": 0,
                     "messages": [
                         {
                             "role": "user",
-                            "content": "What is the weather in Jakarta?",
+                            "content": (
+                                "What is the weather in Jakarta? "
+                                "After the tool result, reply in one short sentence only. "
+                                "Do not add general climate information."
+                            ),
                         },
                         {
                             "role": "assistant",
@@ -816,7 +823,8 @@ class ApiTestRunner:
                 f"stop_reason={final.get('stop_reason')!r}, "
                 f"stop_sequence={final.get('stop_sequence')!r}, "
                 f"content={final.get('content')!r}, "
-                f"usage={final.get('usage')!r}",
+                f"usage={final.get('usage')!r}, "
+                f"max_tokens={round_trip_max_tokens}",
             )
             require(bool(text), "Anthropic final text after tool_result is empty")
             require(
