@@ -227,6 +227,11 @@ adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
 `max_cache_mib`, `temperature`, `top_k`, `top_p`, and `seed` under its
 `config` object. Anthropic text blocks and client-executed tool-use/tool-result
 round trips are supported. The server does not execute client tools.
+Tool-call output is normalized from the Qarnyx JSON envelope, Qwen-style
+`<tool_call>` blocks, single-call JSON, and OpenAI-shaped function-call
+objects. Unknown tools, malformed arguments, and failed forced-tool responses
+are rejected; a model's compliance with `tool_choice` remains model-dependent.
+The client executes returned tools and sends their results in a later request.
 
 Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
 role-labelled prompt because model-specific LLaMA chat templates are not
@@ -237,6 +242,30 @@ The server defaults to loopback and has no built-in authentication. Do not
 expose it to an untrusted network without an authenticated gateway. Concurrent
 inference is limited by a bounded semaphore (one request by default); increase
 `--max-concurrent-requests` only after measuring available memory.
+
+## API integration tests
+
+With `qarnyx-server` already running, build the API crate and execute the full
+end-to-end suite (OpenAI, Anthropic, and native Qarnyx; JSON, streaming, tool
+calls, tool-result round trips, and request validation):
+
+```bash
+bash scripts/api-test.sh
+```
+
+The wrapper first runs `cargo build --release -p qarnyx-api`, then checks
+`GET /health`. It never starts, stops, or restarts the server. If the build
+fails, the command stops; if the build succeeds but the server is unavailable,
+the API suite prints `[SKIP]` and exits without starting anything.
+
+To skip the Cargo build when you already built the current tree:
+
+```bash
+bash scripts/api-test.sh --skip-build
+```
+
+Additional arguments are passed through to `scripts/api_test.py`. See
+[docs/api-testing.md](docs/api-testing.md) for coverage, options, and examples.
 
 ## Development
 
