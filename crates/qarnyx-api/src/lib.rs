@@ -857,9 +857,8 @@ async fn create_chat_completion(
 
     let output = GenerationOutput::from_runtime(completion.0, &completion.1, prompt_tokens);
     let completion_tokens = output.completion_tokens;
-    let parsed =
-        parse_model_output(&output.text, &tools, &tool_choice)
-        .map_err(|error| ApiError::invalid_model_output(error))?;
+    let parsed = parse_model_output(&output.text, &tools, &tool_choice)
+        .map_err(ApiError::invalid_model_output)?;
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
     } else if completion_tokens >= max_new_tokens {
