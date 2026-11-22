@@ -1065,6 +1065,7 @@ async fn create_chat_completion(
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let tools = prepared.tools.clone();
     let tool_choice = prepared.tool_choice.clone();
+    let json_mode = prepared.json_mode;
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -1075,8 +1076,16 @@ async fn create_chat_completion(
     .map_err(ApiError::from)?;
     let (output, stop_sequence) = completion;
     let completion_tokens = output.completion_tokens;
-    let parsed = parse_model_output(&output.text, &tools, &tool_choice)
-        .map_err(ApiError::invalid_model_output)?;
+    let parsed = if json_mode {
+        validate_json_object(&output.text)?;
+        tool_call::ParsedAssistant {
+            content: Some(output.text.clone()),
+            tool_calls: Vec::new(),
+        }
+    } else {
+        parse_model_output(&output.text, &tools, &tool_choice)
+            .map_err(ApiError::invalid_model_output)?
+    };
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
     } else if stop_sequence.is_some() {
@@ -1154,7 +1163,9 @@ async fn stream_chat_completion(
             return;
         }
 
-        let should_buffer = !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty();
+        let should_buffer = !prepared.tools.is_empty()
+            || !prepared.stop_sequences.is_empty()
+            || prepared.json_mode;
         // Buffer tool and stop-sequence requests so protocol control text is
         // never exposed to clients before the complete response is validated.
         let result = state.generate_captured(&prepared, &task_cancellation, |event| {
@@ -1186,18 +1197,37 @@ async fn stream_chat_completion(
         match result {
             Ok((output, stop_sequence)) => {
                 let completion_tokens = output.completion_tokens;
-                let parsed = match parse_model_output(
-                    &output.text,
-                    &prepared.tools,
-                    &prepared.tool_choice,
-                ) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        let _ = send(
-                            json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}),
-                        );
+                let parsed = if prepared.json_mode {
+                    if let Err(error) = validate_json_object(&output.text) {
+                        let _ = send(json!({
+                            "error": {
+                                "message": error.message,
+                                "type": "server_error",
+                                "param": null,
+                                "code": null
+                            }
+                        }));
                         let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
                         return;
+                    }
+                    tool_call::ParsedAssistant {
+                        content: Some(output.text.clone()),
+                        tool_calls: Vec::new(),
+                    }
+                } else {
+                    match parse_model_output(
+                        &output.text,
+                        &prepared.tools,
+                        &prepared.tool_choice,
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            let _ = send(
+                                json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}),
+                            );
+                            let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
+                            return;
+                        }
                     }
                 };
                 if should_buffer {
