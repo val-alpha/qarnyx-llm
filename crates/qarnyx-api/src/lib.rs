@@ -41,7 +41,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tool_call::{
     OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice,
@@ -504,7 +504,10 @@ impl GenerationCapture {
             return true;
         }
         match event {
-            GenerationEvent::Token { token_id, text_delta } => {
+            GenerationEvent::Token {
+                token_id,
+                text_delta,
+            } => {
                 self.token_ids.push(*token_id);
                 self.text.push_str(text_delta);
             }
@@ -513,7 +516,11 @@ impl GenerationCapture {
 
         self.stop = stop_sequences
             .iter()
-            .filter_map(|sequence| self.text.find(sequence).map(|index| (index, sequence.clone())))
+            .filter_map(|sequence| {
+                self.text
+                    .find(sequence)
+                    .map(|index| (index, sequence.clone()))
+            })
             .min_by_key(|(index, _)| *index);
         self.stop.is_some()
     }
@@ -550,7 +557,9 @@ pub(crate) fn validate_stop_sequences(
     }
     for sequence in &values {
         if sequence.is_empty() {
-            return Err(ApiError::bad_request(format!("{field} entries must not be empty")));
+            return Err(ApiError::bad_request(format!(
+                "{field} entries must not be empty"
+            )));
         }
         if sequence.len() > 256 {
             return Err(ApiError::bad_request(format!(
@@ -620,7 +629,7 @@ fn parse_stop_sequences(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?
-        },
+        }
         Some(_) => {
             return Err(ApiError::bad_request(format!(
                 "{field} must be a string or an array of strings"
@@ -964,9 +973,7 @@ fn format_chat_prompt(
         .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-fn acquire_request_slot(
-    slots: &Arc<Semaphore>,
-) -> Result<OwnedSemaphorePermit, ApiError> {
+fn acquire_request_slot(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
     match Arc::clone(slots).try_acquire_owned() {
         Ok(permit) => Ok(permit),
         Err(TryAcquireError::NoPermits) => Err(ApiError::rate_limited(
@@ -1064,10 +1071,9 @@ impl IntoResponse for ApiError {
         )
             .into_response();
         if retry_after {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static("1"),
-            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -1211,9 +1217,8 @@ async fn stream_chat_completion(
             return;
         }
 
-        let should_buffer = !prepared.tools.is_empty()
-            || !prepared.stop_sequences.is_empty()
-            || prepared.json_mode;
+        let should_buffer =
+            !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty() || prepared.json_mode;
         // Buffer tool and stop-sequence requests so protocol control text is
         // never exposed to clients before the complete response is validated.
         let result = state.generate_captured(&prepared, &task_cancellation, |event| {
@@ -1266,11 +1271,7 @@ async fn stream_chat_completion(
                         tool_calls: Vec::new(),
                     }
                 } else {
-                    match parse_model_output(
-                        &output.text,
-                        &prepared.tools,
-                        &prepared.tool_choice,
-                    ) {
+                    match parse_model_output(&output.text, &prepared.tools, &prepared.tool_choice) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             let _ = send(
@@ -1662,19 +1663,25 @@ mod tests {
         );
         assert!(parse_stop_sequences(Some(json!(["ok", 7])), 4, "stop").is_err());
         assert!(parse_stop_sequences(Some(json!([])), 4, "stop").is_err());
-        assert!(parse_stop_sequences(Some(json!([])), 16, "stop_sequences").unwrap().is_empty());
+        assert!(
+            parse_stop_sequences(Some(json!([])), 16, "stop_sequences")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn stop_sequences_are_bounded_and_must_be_non_empty() {
         assert!(validate_stop_sequences(vec![String::new()], 4, "stop").is_err());
         assert!(validate_stop_sequences(vec!["x".repeat(257)], 4, "stop").is_err());
-        assert!(validate_stop_sequences(
-            vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
-            4,
-            "stop"
-        )
-        .is_err());
+        assert!(
+            validate_stop_sequences(
+                vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+                4,
+                "stop"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1716,11 +1723,13 @@ mod tests {
         let mut messages = vec![message("user", "Return a value.")];
         apply_json_mode_instruction(&mut messages);
         assert_eq!(messages[0].role, "system");
-        assert!(messages[0]
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("valid JSON object"));
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("valid JSON object")
+        );
         assert_eq!(messages[1].role, "user");
     }
 
@@ -1742,5 +1751,4 @@ mod tests {
         .unwrap();
         assert_eq!(request.response_format.unwrap().kind, "json_object");
     }
-
 }
