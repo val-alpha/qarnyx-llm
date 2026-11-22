@@ -23,17 +23,34 @@ cargo run --release -p qarnyx-api --bin qarnyx-server -- \
 Keep that process running. The default address is
 `http://127.0.0.1:8000`.
 
-## 2. Run the complete test suite
+## 2. Build and run the complete test suite
 
 In terminal 2, from the repository root:
 
 ```bash
-python3 scripts/api_test.py
+bash scripts/api-test.sh
 ```
 
-The script first calls `GET /health`. If the server is down, unreachable, or
-does not report `{"status":"ok"}`, the runner prints a `[SKIP]` message and
-exits without executing any test. It never tries to launch the server.
+The wrapper first runs:
+
+```bash
+cargo build --release -p qarnyx-api
+```
+
+If the Cargo build fails, the command stops and no API tests run. After a
+successful build, the test runner calls `GET /health`. If the server is down,
+unreachable, or does not report `{"status":"ok"}`, the runner prints a
+`[SKIP]` message and exits without executing any test. It never tries to
+launch, stop, or restart the server.
+
+If the current API binary is already built and you only want to run the
+integration suite:
+
+```bash
+bash scripts/api-test.sh --skip-build
+```
+
+All arguments after `--skip-build` are passed through to the Python runner.
 
 The runner uses only Python's standard library; no `pip install` is needed.
 Requests run sequentially because the server defaults to one concurrent
@@ -43,18 +60,18 @@ inference slot.
 
 ```bash
 # Another local port or remote test instance
-python3 scripts/api_test.py --base-url http://127.0.0.1:9000
+bash scripts/api-test.sh --base-url http://127.0.0.1:9000
 
 # Request the loaded GGUF model ID instead of the qarnyx alias
-python3 scripts/api_test.py --model "Huihui Qwen3.5 2B Abliterated"
+bash scripts/api-test.sh --model "Huihui Qwen3.5 2B Abliterated"
 
 # Run only one protocol surface
-python3 scripts/api_test.py --suite openai
-python3 scripts/api_test.py --suite anthropic
-python3 scripts/api_test.py --suite native
+bash scripts/api-test.sh --suite openai
+bash scripts/api-test.sh --suite anthropic
+bash scripts/api-test.sh --suite native
 
 # Adjust generation limits and per-request timeout
-python3 scripts/api_test.py --max-tokens 64 --tool-max-tokens 160 --timeout 900
+bash scripts/api-test.sh --max-tokens 64 --tool-max-tokens 160 --timeout 900
 ```
 
 Options:
