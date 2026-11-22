@@ -145,7 +145,8 @@ The server acquires an inference permit before prompt tokenization. If all
 return HTTP 429 with a rate-limit error; Anthropic returns its rate-limit error
 shape with the same HTTP status. The server does not accumulate waiting
 inference tasks. `/health` and `/ready` report `active_requests` and
-`max_concurrent_requests`.
+`max_concurrent_requests`. During graceful shutdown, liveness remains HTTP 200
+while readiness changes to HTTP 503 with `status="shutting_down"`.
 
 SSE workers observe a disconnected receiver while generating and cancel at the
 next token boundary. Buffered tool/stop/JSON responses also check whether the
@@ -155,10 +156,10 @@ active request tokens before the server drains HTTP connections. Cancellation
 is cooperative: the current model/token evaluation is allowed to finish.
 
 OpenAI `stop` accepts a non-empty string or an array containing one to four
-strings, matching the current Chat Completions contract. Anthropic
-`stop_sequences` accepts an array of strings; Qarnyx currently applies an
-implementation guard of at most sixteen sequences and 256 UTF-8 bytes per
-sequence. Stop text is excluded from returned content, and Anthropic reports
+strings, matching the current Chat Completions contract. Both adapters apply
+a Qarnyx implementation guard of at most 256 UTF-8 bytes per sequence.
+Anthropic `stop_sequences` accepts an array of strings; Qarnyx currently caps
+the array at sixteen entries. Stop text is excluded from returned content, and Anthropic reports
 the matching `stop_sequence` with `stop_reason="stop_sequence"`. Stop matching
 is text-based and cancels at the next token boundary; it does not interrupt the
 middle of a token evaluation. Unit tests cover stop matching across token
