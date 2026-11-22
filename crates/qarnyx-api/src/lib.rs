@@ -841,7 +841,13 @@ impl ApiState {
         });
 
         match result {
-            Ok(_) => Ok(capture.into_output(prompt_tokens)),
+            Ok(generation) => {
+                // Use the runtime's canonical generated IDs so usage remains
+                // correct even when a tokenizer emits a final text-only UTF-8
+                // replacement delta.
+                capture.token_ids = generation.token_ids;
+                Ok(capture.into_output(prompt_tokens))
+            }
             Err(RunError::Generation(GenerationError::Cancelled)) if capture.stop.is_some() => {
                 Ok(capture.into_output(prompt_tokens))
             }
