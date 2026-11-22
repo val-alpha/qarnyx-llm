@@ -1069,7 +1069,7 @@ impl From<RunError> for ApiError {
             ) => Self::bad_request(error.to_string()),
             RunError::Generation(GenerationError::Cancelled) => Self::unavailable(
                 "generation was cancelled because the server is shutting down or the client disconnected",
-            )
+            ),
             RunError::Generation(error) => Self::internal(error.to_string()),
             RunError::Model(error) => Self::internal(error),
         }
