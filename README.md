@@ -245,18 +245,27 @@ inference is limited by a bounded semaphore (one request by default); increase
 
 ## API integration tests
 
-With `qarnyx-server` already running, execute the full end-to-end suite
-(OpenAI, Anthropic, and native Qarnyx; JSON, streaming, tool calls, tool-result
-round trips, and request validation):
+With `qarnyx-server` already running, build the API crate and execute the full
+end-to-end suite (OpenAI, Anthropic, and native Qarnyx; JSON, streaming, tool
+calls, tool-result round trips, and request validation):
 
 ```bash
-python3 scripts/api_test.py
+bash scripts/api-test.sh
 ```
 
-The runner uses only Python's standard library. It first checks `GET /health`;
-if the server is unavailable it prints `[SKIP]` and exits without starting
-anything. See [docs/api-testing.md](docs/api-testing.md) for coverage, options,
-and examples.
+The wrapper first runs `cargo build --release -p qarnyx-api`, then checks
+`GET /health`. It never starts, stops, or restarts the server. If the build
+fails, the command stops; if the build succeeds but the server is unavailable,
+the API suite prints `[SKIP]` and exits without starting anything.
+
+To skip the Cargo build when you already built the current tree:
+
+```bash
+bash scripts/api-test.sh --skip-build
+```
+
+Additional arguments are passed through to `scripts/api_test.py`. See
+[docs/api-testing.md](docs/api-testing.md) for coverage, options, and examples.
 
 ## Development
 
