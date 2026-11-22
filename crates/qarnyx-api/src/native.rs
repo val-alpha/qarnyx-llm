@@ -33,17 +33,25 @@ impl IntoResponse for NativeApiError {
         let error_type = match self.0.status {
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::TOO_MANY_REQUESTS => "rate_limited",
-            StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
             _ => "invalid_request",
         };
-        (
+        let retry_after = self.0.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.0.status,
             Json(json!({
                 "object":"qarnyx.error",
                 "error":{"type":error_type,"message":self.0.message}
             })),
         )
-            .into_response()
+            .into_response();
+        if retry_after {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
