@@ -89,6 +89,31 @@ Options:
 | `--tool-max-tokens` | `128` | Output limit for tool-call tests |
 | `--timeout` | `600` | Timeout per HTTP request, in seconds |
 
+## Optional concurrent load test
+
+For an opt-in burst test against an already-running server:
+
+```bash
+python3 scripts/api_load_test.py \
+  --endpoint openai \
+  --requests 8 \
+  --parallelism 8 \
+  --max-tokens 32
+```
+
+Choose `--endpoint openai`, `anthropic`, or `native`. The script checks
+`/ready` before sending traffic, never starts or stops the server, sends a
+single concurrent burst, records HTTP status counts and latency, then verifies
+that `/health` and `/ready` recover and the active-request count returns to
+zero. HTTP 429 is an expected result when client parallelism exceeds the
+server's configured inference slots; it indicates bounded overload rejection,
+not a failed test. Other HTTP statuses, transport errors, or failure to return
+to an idle healthy state fail the run.
+
+Tune request count and concurrency carefully: each HTTP 200 represents real
+model inference and consumes CPU and per-request cache memory. Begin with a
+small burst on a development instance.
+
 ## 4. Test coverage
 
 The `all` suite runs 24 checks serially (one shared, ten OpenAI, eight
