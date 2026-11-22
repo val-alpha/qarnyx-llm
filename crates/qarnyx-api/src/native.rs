@@ -116,6 +116,7 @@ fn prepare_request(
         Vec::new(),
         ToolChoice::None,
         Vec::new(),
+        false,
     )
 }
 
