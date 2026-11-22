@@ -497,23 +497,22 @@ pub(super) async fn create_messages(
     let response_tools = prepared.tools.clone();
     let response_tool_choice = prepared.tool_choice.clone();
     let state_task = state.clone();
-    let (text, result) = tokio::task::spawn_blocking(move || {
+    let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut text = String::new();
-        let result = state_task.generate(&prepared, &task_cancellation, |event| match event {
-            GenerationEvent::Token { text_delta, .. } => text.push_str(&text_delta),
-            GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
-        })?;
-        Ok::<_, RunError>((text, result))
+        state_task.generate_captured(&prepared, &task_cancellation, |_| {})
     })
     .await
     .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
     .map_err(ApiError::from)?;
-
-    let output = GenerationOutput::from_runtime(text, &result, prompt_tokens);
+    let (output, stop_sequence) = completion;
     let parsed = parse_model_output(&output.text, &response_tools, &response_tool_choice)
         .map_err(ApiError::invalid_model_output)?;
-    let reason = stop_reason(&parsed, output.completion_tokens, max_tokens);
+    let reason = stop_reason(
+        &parsed,
+        output.completion_tokens,
+        max_tokens,
+        stop_sequence.is_some(),
+    );
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
     Ok(with_request_id(
         Json(json!({
@@ -523,7 +522,7 @@ pub(super) async fn create_messages(
             "model": state.assets.model_id,
             "content": content_blocks(&parsed),
             "stop_reason": reason,
-            "stop_sequence": null,
+            "stop_sequence": stop_sequence,
             "usage": {
                 "input_tokens": output.prompt_tokens,
                 "output_tokens": output.completion_tokens
@@ -571,8 +570,9 @@ async fn stream_messages(
             return;
         }
 
-        let buffer_tools = !prepared.tools.is_empty();
-        if !buffer_tools
+        let buffer_output =
+            !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty();
+        if !buffer_output
             && !send(
                 "content_block_start",
                 json!({
@@ -583,69 +583,55 @@ async fn stream_messages(
         {
             return;
         }
-        let mut raw = String::new();
-        let mut completion_tokens = 0usize;
-        let result = state.generate(&prepared, &task_cancellation, |event| match event {
-            GenerationEvent::Token {
-                token_id,
-                text_delta,
-            } => {
-                completion_tokens += 1;
-                if buffer_tools {
-                    raw.push_str(&text_delta);
-                } else if !text_delta.is_empty() {
-                    let _ = send(
-                        "content_block_delta",
-                        json!({
-                            "type":"content_block_delta","index":0,
-                            "delta":{"type":"text_delta","text":text_delta}
-                        }),
-                    );
-                }
-                let _ = token_id;
+
+        let result = state.generate_captured(&prepared, &task_cancellation, |event| {
+            if buffer_output {
+                return;
             }
-            GenerationEvent::TextDelta { text } => {
-                if buffer_tools {
-                    raw.push_str(&text);
-                } else if !text.is_empty() {
-                    let _ = send(
-                        "content_block_delta",
-                        json!({
-                            "type":"content_block_delta","index":0,
-                            "delta":{"type":"text_delta","text":text}
-                        }),
-                    );
-                }
+            let delta = match event {
+                GenerationEvent::Token { text_delta, .. } => text_delta,
+                GenerationEvent::TextDelta { text } => text,
+            };
+            if !delta.is_empty() {
+                let _ = send(
+                    "content_block_delta",
+                    json!({
+                        "type":"content_block_delta","index":0,
+                        "delta":{"type":"text_delta","text":delta}
+                    }),
+                );
             }
         });
-        if task_cancellation.is_cancelled() {
+        if result.is_err() && task_cancellation.is_cancelled() {
             return;
         }
         match result {
-            Ok(generation) => {
-                completion_tokens = generation
-                    .token_ids
-                    .len()
-                    .saturating_sub(prompt_tokens)
-                    .max(completion_tokens);
-                let text = if buffer_tools { raw } else { String::new() };
-                let parsed = match parse_model_output(&text, &prepared.tools, &prepared.tool_choice)
-                {
-                    Ok(_parsed) if !buffer_tools => tool_call::ParsedAssistant {
+            Ok((output, stop_sequence)) => {
+                let completion_tokens = output.completion_tokens;
+                let parsed = if buffer_output {
+                    match parse_model_output(
+                        &output.text,
+                        &prepared.tools,
+                        &prepared.tool_choice,
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            let _ = send(
+                                "error",
+                                json!({"type":"error","error":{"type":"api_error","message":error}}),
+                            );
+                            let _ = send("message_stop", json!({"type":"message_stop"}));
+                            return;
+                        }
+                    }
+                } else {
+                    tool_call::ParsedAssistant {
                         content: Some(String::new()),
                         tool_calls: Vec::new(),
-                    },
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        let _ = send(
-                            "error",
-                            json!({"type":"error","error":{"type":"api_error","message":error}}),
-                        );
-                        let _ = send("message_stop", json!({"type":"message_stop"}));
-                        return;
                     }
                 };
-                if buffer_tools {
+
+                if buffer_output {
                     if let Some(content) = parsed.content.as_ref().filter(|value| !value.is_empty())
                     {
                         let _ = send(
@@ -669,7 +655,7 @@ async fn stream_messages(
                     }
                 }
                 let mut index =
-                    if buffer_tools && parsed.content.as_ref().is_some_and(|v| !v.is_empty()) {
+                    if buffer_output && parsed.content.as_ref().is_some_and(|v| !v.is_empty()) {
                         1
                     } else {
                         0
@@ -695,18 +681,23 @@ async fn stream_messages(
                     );
                     index += 1;
                 }
-                if !buffer_tools {
+                if !buffer_output {
                     let _ = send(
                         "content_block_stop",
                         json!({"type":"content_block_stop","index":0}),
                     );
                 }
-                let reason = stop_reason(&parsed, completion_tokens, max_tokens);
+                let reason = stop_reason(
+                    &parsed,
+                    completion_tokens,
+                    max_tokens,
+                    stop_sequence.is_some(),
+                );
                 let _ = send(
                     "message_delta",
                     json!({
                         "type":"message_delta",
-                        "delta":{"stop_reason":reason,"stop_sequence":null},
+                        "delta":{"stop_reason":reason,"stop_sequence":stop_sequence},
                         "usage":{"output_tokens":completion_tokens}
                     }),
                 );
@@ -719,6 +710,7 @@ async fn stream_messages(
                 );
                 let _ = send("message_stop", json!({"type":"message_stop"}));
             }
+        }
         }
     });
 
