@@ -515,7 +515,7 @@ pub(super) async fn create_messages(
 
     let output = GenerationOutput::from_runtime(text, &result, prompt_tokens);
     let parsed = parse_model_output(&output.text, &response_tools, &response_tool_choice)
-        .map_err(ApiError::bad_request)?;
+        .map_err(|error| ApiError::internal(format!("model returned invalid tool-call output: {error}")))?;
     let reason = stop_reason(&parsed, output.completion_tokens, max_tokens);
     let id = format!("msg_{}", NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed));
     Ok(with_request_id(
