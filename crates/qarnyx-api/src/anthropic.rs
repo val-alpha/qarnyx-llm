@@ -738,7 +738,6 @@ async fn stream_messages(
                 let _ = send("message_stop", json!({"type":"message_stop"}));
             }
         }
-        }
     });
 
     let response = Response::builder()
