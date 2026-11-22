@@ -316,6 +316,20 @@ class ApiTestRunner:
 
     def common_tests(self) -> None:
         def models() -> str:
+            health = json_body(self.request("/health"))
+            ready = json_body(self.request("/ready"))
+            require(health.get("status") == "ok", "/health status is not ok")
+            require(ready.get("status") == "ok", "/ready status is not ok")
+            require(isinstance(ready.get("active_requests"), int), "/ready active_requests is missing")
+            require(
+                isinstance(ready.get("max_concurrent_requests"), int)
+                and ready["max_concurrent_requests"] >= 1,
+                "/ready max_concurrent_requests is invalid",
+            )
+            require(
+                0 <= ready["active_requests"] <= ready["max_concurrent_requests"],
+                "/ready active request count is outside its configured limit",
+            )
             response = self.request("/v1/models")
             expect_status(response, 200, "list models")
             body = json_body(response)
@@ -323,7 +337,11 @@ class ApiTestRunner:
             require(isinstance(entries, list) and bool(entries), "model list is empty")
             ids = [item.get("id") for item in entries if isinstance(item, dict)]
             require(self.model in ids or "qarnyx" == self.model, f"model {self.model!r} not listed: {ids!r}")
-            return f"loaded models: {', '.join(str(item) for item in ids)}"
+            return (
+                f"loaded models: {', '.join(str(item) for item in ids)}; "
+                f"active inference slots: {ready['active_requests']}/"
+                f"{ready['max_concurrent_requests']}"
+            )
 
         self.run_case("common", "model-discovery", models)
 
@@ -500,6 +518,43 @@ class ApiTestRunner:
             )
             return "tool result accepted; assistant completed the turn"
 
+        def json_object_mode() -> str:
+            response = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{
+                        "role": "user",
+                        "content": 'Return exactly this JSON object and nothing else: {"ok":true}',
+                    }],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": self.args.max_tokens,
+                    "temperature": 0,
+                },
+            )
+            expect_status(response, 200, "OpenAI JSON object response format")
+            body = json_body(response)
+            content = body["choices"][0]["message"].get("content")
+            require(isinstance(content, str) and bool(content.strip()), "JSON mode content is empty")
+            try:
+                decoded = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise TestFailure(f"JSON mode returned invalid JSON: {error}; content={content!r}") from error
+            require(isinstance(decoded, dict), "JSON mode did not return a top-level object")
+            return "response_format=json_object returned a valid JSON object"
+
+        def invalid_stop() -> str:
+            response = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stop": ["valid", 7],
+                },
+            )
+            expect_status(response, 400, "OpenAI invalid stop array")
+            return "non-string stop sequence rejected with HTTP 400"
+
         def invalid_request() -> str:
             response = self.request(
                 "/v1/chat/completions",
@@ -533,6 +588,8 @@ class ApiTestRunner:
             ("forced-tool-call", forced_tool),
             ("streaming-tool-call", streamed_tool),
             ("tool-result-round-trip", tool_round_trip),
+            ("json-object-mode", json_object_mode),
+            ("stop-sequence-validation", invalid_stop),
             ("request-validation", invalid_request),
             ("unknown-model", missing_model),
         ]
@@ -548,6 +605,7 @@ class ApiTestRunner:
                     "max_tokens": self.args.max_tokens,
                     "temperature": 0,
                     "system": "You are a concise assistant.",
+                    "metadata": {"user_id": "qarnyx-api-test"},
                     "messages": [
                         {
                             "role": "user",
@@ -730,14 +788,14 @@ class ApiTestRunner:
                     "model": self.model,
                     "max_tokens": self.args.max_tokens,
                     "messages": [{"role": "user", "content": "hello"}],
-                    "stop_sequences": ["STOP"],
+                    "stop_sequences": [""],
                 },
             )
-            expect_status(response, 400, "Anthropic unsupported stop_sequences")
+            expect_status(response, 400, "Anthropic empty stop sequence")
             body = json_body(response)
             require(body.get("type") == "error", "Anthropic error type envelope is missing")
             require(isinstance(body.get("error"), dict), "Anthropic error payload is missing")
-            return "unsupported stop_sequences rejected with invalid_request_error"
+            return "empty stop sequence rejected with invalid_request_error"
 
         def missing_model() -> str:
             response = self.request(
