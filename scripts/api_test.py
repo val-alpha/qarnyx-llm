@@ -805,14 +805,19 @@ class ApiTestRunner:
                             ],
                         },
                     ],
-                    "tools": [anthropic_tool_definition()],
-                    "tool_choice": {"type": "auto"},
                 },
             )
             expect_status(second, 200, "Anthropic tool_result round trip")
             final = json_body(second)
-            require(final.get("stop_reason") == "end_turn", "Anthropic did not end the tool-result turn")
             text = assistant_text(final)
+            require(
+                final.get("stop_reason") == "end_turn",
+                "Anthropic did not end the tool-result turn: "
+                f"stop_reason={final.get('stop_reason')!r}, "
+                f"stop_sequence={final.get('stop_sequence')!r}, "
+                f"content={final.get('content')!r}, "
+                f"usage={final.get('usage')!r}",
+            )
             require(bool(text), "Anthropic final text after tool_result is empty")
             require(
                 "31" in text or "sunny" in text.lower(),
