@@ -1598,6 +1598,20 @@ mod tests {
         assert_eq!(request.max_tokens, None);
     }
     #[test]
+    fn rate_limited_responses_include_retry_after() {
+        let response = ApiError::rate_limited("busy").into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[test]
+    fn shutdown_cancellation_maps_to_service_unavailable() {
+        let error = ApiError::from(RunError::Generation(GenerationError::Cancelled));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.kind, "server_error");
+    }
+
+    #[test]
     fn request_admission_rejects_without_queueing_when_capacity_is_full() {
         let slots = Arc::new(Semaphore::new(1));
         let permit = acquire_request_slot(&slots).unwrap();
