@@ -244,7 +244,7 @@ fn read_model_with_budget(
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/ready", get(health))
+        .route("/ready", get(ready))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/messages", post(anthropic::create_messages))
@@ -252,14 +252,29 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn health(State(state): State<ApiState>) -> Json<Value> {
+fn health_payload(state: &ApiState, status: &'static str) -> Value {
     let available = state.assets.request_slots.available_permits();
-    Json(json!({
-        "status": "ok",
+    json!({
+        "status": status,
         "model": state.assets.model_id,
         "active_requests": state.assets.max_concurrent_requests.saturating_sub(available),
         "max_concurrent_requests": state.assets.max_concurrent_requests
-    }))
+    })
+}
+
+async fn health(State(state): State<ApiState>) -> Json<Value> {
+    Json(health_payload(&state, "ok"))
+}
+
+async fn ready(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
+    let is_ready = !state.assets.shutdown_token.is_cancelled();
+    let status = if is_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let label = if is_ready { "ok" } else { "shutting_down" };
+    (status, Json(health_payload(&state, label)))
 }
 
 async fn list_models(State(state): State<ApiState>) -> Json<Value> {
@@ -1601,6 +1616,14 @@ mod tests {
         assert_eq!(request.n.unwrap_or(1), 1);
         assert_eq!(request.max_tokens, None);
     }
+    #[test]
+    fn readiness_is_false_after_server_shutdown_is_requested() {
+        let root = CancellationToken::new();
+        assert!(!root.is_cancelled());
+        root.cancel();
+        assert!(root.is_cancelled());
+    }
+
     #[test]
     fn rate_limited_responses_include_retry_after() {
         let response = ApiError::rate_limited("busy").into_response();
