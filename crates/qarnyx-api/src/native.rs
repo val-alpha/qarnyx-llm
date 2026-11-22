@@ -143,10 +143,9 @@ pub(super) async fn generate(
         return stream_generation(state, prepared, prompt_tokens, max_new_tokens, permit).await;
     }
 
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
-    let cancellation = CancellationToken::new();
     let state_task = state.clone();
     let (text, result) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -185,7 +184,7 @@ async fn stream_generation(
     permit: OwnedSemaphorePermit,
 ) -> Result<Response, NativeApiError> {
     let model = state.assets.model_id.clone();
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
