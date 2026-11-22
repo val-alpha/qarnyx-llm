@@ -83,9 +83,7 @@ pub fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, String> {
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| {
-                    "tool_choice.function.name must be a non-empty string".to_owned()
-                })?;
+                .ok_or_else(|| "tool_choice.function.name must be a non-empty string".to_owned())?;
             Ok(ToolChoice::Function(name.to_owned()))
         }
         _ => Err("tool_choice must be 'auto', 'none', 'required', or a function selector".into()),
@@ -105,10 +103,9 @@ pub fn validate_tools(tools: &[OpenAiTool]) -> Result<(), String> {
         if name.is_empty() || name.len() > 64 {
             return Err("function names must contain between 1 and 64 characters".into());
         }
-        if !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
-        {
+        if !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        }) {
             return Err(format!(
                 "function name '{name}' contains unsupported characters"
             ));
@@ -353,9 +350,9 @@ pub fn parse_model_output(
     choice: &ToolChoice,
 ) -> Result<ParsedAssistant, String> {
     let trimmed = output.trim();
-    let (raw_calls, content) =
-        if let Some((calls, surrounding_text)) = parse_tagged_tool_calls(trimmed)?
-        {
+    let (raw_calls, content) = if let Some((calls, surrounding_text)) =
+        parse_tagged_tool_calls(trimmed)?
+    {
         (Some(calls), surrounding_text)
     } else {
         let candidate = strip_json_code_fence(trimmed);
