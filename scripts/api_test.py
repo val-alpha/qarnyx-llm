@@ -828,7 +828,7 @@ class ApiTestRunner:
         def empty_prompt() -> str:
             response = self.request(
                 "/v1/generate",
-                {"model": self.model, "prompt": " ", "config": {"max_new_tokens": 8}},
+                {"model": self.model, "prompt": "", "config": {"max_new_tokens": 8}},
             )
             expect_status(response, 400, "Native empty prompt")
             body = json_body(response)
