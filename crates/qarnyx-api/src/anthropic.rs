@@ -402,10 +402,10 @@ fn prepare_request(
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.user_id.as_ref())
-        .is_some_and(|user_id| user_id.len() > 512 || user_id.chars().any(char::is_control))
+        .is_some_and(|user_id| user_id.chars().count() > 512 || user_id.chars().any(char::is_control))
     {
         return Err(ApiError::bad_request(
-            "metadata.user_id must be at most 512 bytes and contain no control characters",
+            "metadata.user_id must be at most 512 characters and contain no control characters",
         ));
     }
     let stop_sequences = validate_stop_sequences(
