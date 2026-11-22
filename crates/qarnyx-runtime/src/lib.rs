@@ -84,7 +84,10 @@ impl CancellationToken {
     /// Returns whether this token or any parent has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-            || self.parents.iter().any(|parent| parent.load(Ordering::Acquire))
+            || self
+                .parents
+                .iter()
+                .any(|parent| parent.load(Ordering::Acquire))
     }
 
     fn check(&self) -> Result<(), GenerationError> {
