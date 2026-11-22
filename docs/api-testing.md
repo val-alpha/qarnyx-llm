@@ -9,6 +9,9 @@ HTTP surfaces served by `qarnyx-server`:
 
 The runner talks to a running Qarnyx server. It does **not** start, stop, or
 restart the server, and it does not call the real OpenAI or Anthropic services.
+Inference admission is bounded: once all configured request slots are in use,
+new requests fail immediately with HTTP 429 rather than waiting in an
+unbounded server-side queue.
 
 ## 1. Start Qarnyx yourself
 
@@ -53,8 +56,9 @@ bash scripts/api-test.sh --skip-build
 All arguments after `--skip-build` are passed through to the Python runner.
 
 The runner uses only Python's standard library; no `pip install` is needed.
-Requests run sequentially because the server defaults to one concurrent
-inference slot.
+Requests run sequentially. The server defaults to one concurrent inference
+slot; increase `--max-concurrent-requests` only after sizing the aggregate
+per-request cache reservation for available memory.
 
 ## 3. Select a target or tune limits
 
@@ -85,15 +89,42 @@ Options:
 | `--tool-max-tokens` | `128` | Output limit for tool-call tests |
 | `--timeout` | `600` | Timeout per HTTP request, in seconds |
 
+## Optional concurrent load test
+
+For an opt-in burst test against an already-running server:
+
+```bash
+python3 scripts/api_load_test.py \
+  --endpoint openai \
+  --requests 8 \
+  --parallelism 8 \
+  --max-tokens 32
+```
+
+Choose `--endpoint openai`, `anthropic`, or `native`. The script checks
+`/ready` before sending traffic, never starts or stops the server, sends a
+single concurrent burst, records HTTP status counts and latency, then verifies
+that `/health` and `/ready` recover and the active-request count returns to
+zero. HTTP 429 is an expected result when client parallelism exceeds the
+server's configured inference slots; it indicates bounded overload rejection,
+not a failed test. Other HTTP statuses, transport errors, or failure to return
+to an idle healthy state fail the run.
+
+Tune request count and concurrency carefully: each HTTP 200 represents real
+model inference and consumes CPU and per-request cache memory. Begin with a
+small burst on a development instance.
+
 ## 4. Test coverage
 
-The `all` suite runs these checks serially:
+The `all` suite runs 24 checks serially (one shared, ten OpenAI, eight
+Anthropic, and five native). The shared check validates `GET /health`,
+`GET /ready` and their request-slot telemetry:
 
 | Surface | Coverage |
 |---|---|
 | Shared | Health probe, model discovery |
-| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, invalid request rejection, unknown model rejection |
-| Anthropic | Basic Messages, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, unsupported parameter rejection, unknown model rejection |
+| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, JSON-object response mode (live model), malformed stop-array validation, request validation, unknown model rejection |
+| Anthropic | Basic Messages including `metadata.user_id`, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, empty stop-sequence validation, unsupported parameter rejection, unknown model rejection |
 | Native Qarnyx | Raw-prompt generation, generation controls, token IDs and usage, native SSE token/text/completed/done events, empty prompt rejection, invalid generation config rejection, unknown model rejection |
 
 A successful tool round trip performs a simulated client-side tool execution:
@@ -105,6 +136,47 @@ external tools.
 The native `/v1/generate` API is a raw-prompt generation interface and does
 not expose function-tool calling. Tool-call coverage therefore belongs to the
 OpenAI and Anthropic adapters.
+
+
+## Request limits, cancellation, and protocol compatibility
+
+The server acquires an inference permit before prompt tokenization. If all
+`--max-concurrent-requests` slots are occupied, the OpenAI and native adapters
+return HTTP 429 with a rate-limit error; Anthropic returns its rate-limit error
+shape with the same HTTP status. The server does not accumulate waiting
+inference tasks. `/health` and `/ready` report `active_requests` and
+`max_concurrent_requests`. During graceful shutdown, liveness remains HTTP 200
+while readiness changes to HTTP 503 with `status="shutting_down"`.
+
+SSE workers observe a disconnected receiver while generating and cancel at the
+next token boundary. Buffered tool/stop/JSON responses also check whether the
+client receiver has closed. Non-streaming handlers use a drop guard to request
+cancellation if their handler future is dropped. Ctrl+C and SIGTERM cancel all
+active request tokens before the server drains HTTP connections. Cancellation
+is cooperative: the current model/token evaluation is allowed to finish.
+
+OpenAI `stop` accepts a non-empty string or an array containing one to four
+strings, matching the current Chat Completions contract. Both adapters apply
+a Qarnyx implementation guard of at most 256 UTF-8 bytes per sequence.
+Anthropic `stop_sequences` accepts an array of strings; Qarnyx currently caps
+the array at sixteen entries. Stop text is excluded from returned content, and Anthropic reports
+the matching `stop_sequence` with `stop_reason="stop_sequence"`. Stop matching
+is text-based and cancels at the next token boundary; it does not interrupt the
+middle of a token evaluation. Unit tests cover stop matching across token
+boundaries and token-usage accounting. The live runner validates stop request
+shape; it does not depend on a stochastic model producing a particular stop
+string.
+
+OpenAI `response_format.type="json_object"` injects a JSON-only instruction,
+buffers streamed output, and validates that the completed response is a valid
+top-level JSON object before returning it. This is prompt-guided validation,
+not grammar-constrained decoding; a model that fails to follow the instruction
+returns a server-side model-output error. Anthropic `metadata.user_id` is
+accepted and validated up to 512 characters but is not persisted or used for
+authentication.
+
+The native `/v1/generate` endpoint remains a raw-prompt interface and does not
+inherit OpenAI/Anthropic stop fields or response-format controls.
 
 ## 5. Reading results
 

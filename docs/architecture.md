@@ -476,13 +476,37 @@ Milestones:
   protocol validation, SSE transport, and authentication boundaries remain in
   `qarnyx-api`; vendor-specific protocol code is not added to
   `qarnyx-runtime`.
+- M8-G Serving hardening (implemented; live overload/disconnect tests remain):
+  the server acquires a process-wide inference permit before prompt tokenization
+  and rejects saturation immediately with HTTP 429 and `Retry-After: 1`; it
+  does not accumulate an unbounded inference queue. The configured memory
+  admission reserves the per-request cache allowance multiplied by
+  `max_concurrent_requests` before accepting the model file. `/health` and
+  `/ready` expose active and maximum request slots. Each request receives an
+  independently cancellable token linked to the server shutdown token; SSE
+  receiver closure and dropped non-stream handlers request cancellation, and
+  Ctrl+C/SIGTERM cancel active inference at token boundaries. This is an
+  admission envelope, not an operating-system RSS limit.
+- M8-H Protocol compatibility (implemented; parity remains scoped):
+  OpenAI Chat Completions accepts `stop` as a non-empty string or an array of
+  1–4 strings, excludes the matched stop text, and reports `finish_reason:
+  "stop"`. It also accepts `response_format.type="json_object"`; the adapter
+  adds a JSON-only prompt instruction, buffers streamed JSON, and validates
+  that the final result is a JSON object. This is prompt-guided output
+  validation, not grammar-constrained decoding. Anthropic Messages accepts
+  `stop_sequences` (up to 16 sequences under the Qarnyx implementation guard)
+  and returns the matched `stop_sequence` with
+  `stop_reason="stop_sequence"`; `metadata.user_id` is accepted and validated
+  up to 512 characters but is not persisted. Stop detection occurs on decoded
+  text at token boundaries.
 
 Implementation limits (not a claim of full vendor API parity):
 - The API currently serves one loaded GGUF model per server process and
   supports the LLaMA and Qwen3.5 runtime architectures.
-- Multimodal content, stop sequences, OpenAI logprobs, broad vendor-specific
-  parameter parity, model-specific LLaMA chat templates, and built-in
-  authentication remain outstanding.
+- Multimodal content, OpenAI logprobs, broad vendor-specific parameter parity,
+  model-specific LLaMA chat templates, and built-in authentication remain
+  outstanding. Native `/v1/generate` intentionally remains a raw-prompt
+  endpoint and does not accept vendor stop/response-format fields.
 - Anthropic system and message content is text-only. Unsupported content block
   types and unsupported request fields are rejected rather than silently
   ignored.
@@ -497,9 +521,10 @@ Implementation limits (not a claim of full vendor API parity):
   Qarnyx validates and rejects invalid output; it does not invent or infer tool
   arguments from ordinary assistant text.
 
-All three adapters share the runtime event source and the same request
-admission semaphore. They must not duplicate model forward passes, decode
-loops, or model-specific prompt-formatting logic. Model-specific chat
+All three adapters share the runtime event source and the same non-blocking
+request-admission gate. Saturated inference requests receive HTTP 429 rather
+than waiting in a server-side queue. They must not duplicate model forward
+passes, decode loops, or model-specific prompt-formatting logic. Model-specific chat
 formatting remains below M8: Qwen3.5 ChatML templates, thinking-mode control
 tokens, and end-of-turn handling belong to tokenizer/model integration rather
 than HTTP protocol adapters.

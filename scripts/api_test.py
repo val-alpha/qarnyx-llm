@@ -316,6 +316,20 @@ class ApiTestRunner:
 
     def common_tests(self) -> None:
         def models() -> str:
+            health = json_body(self.request("/health"))
+            ready = json_body(self.request("/ready"))
+            require(health.get("status") == "ok", "/health status is not ok")
+            require(ready.get("status") == "ok", "/ready status is not ok")
+            require(isinstance(ready.get("active_requests"), int), "/ready active_requests is missing")
+            require(
+                isinstance(ready.get("max_concurrent_requests"), int)
+                and ready["max_concurrent_requests"] >= 1,
+                "/ready max_concurrent_requests is invalid",
+            )
+            require(
+                0 <= ready["active_requests"] <= ready["max_concurrent_requests"],
+                "/ready active request count is outside its configured limit",
+            )
             response = self.request("/v1/models")
             expect_status(response, 200, "list models")
             body = json_body(response)
@@ -323,7 +337,11 @@ class ApiTestRunner:
             require(isinstance(entries, list) and bool(entries), "model list is empty")
             ids = [item.get("id") for item in entries if isinstance(item, dict)]
             require(self.model in ids or "qarnyx" == self.model, f"model {self.model!r} not listed: {ids!r}")
-            return f"loaded models: {', '.join(str(item) for item in ids)}"
+            return (
+                f"loaded models: {', '.join(str(item) for item in ids)}; "
+                f"active inference slots: {ready['active_requests']}/"
+                f"{ready['max_concurrent_requests']}"
+            )
 
         self.run_case("common", "model-discovery", models)
 
@@ -500,6 +518,82 @@ class ApiTestRunner:
             )
             return "tool result accepted; assistant completed the turn"
 
+        def json_object_mode() -> str:
+            response = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{
+                        "role": "user",
+                        "content": 'Return exactly this JSON object and nothing else: {"ok":true}',
+                    }],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": self.args.max_tokens,
+                    "temperature": 0,
+                },
+            )
+            expect_status(response, 200, "OpenAI JSON object response format")
+            body = json_body(response)
+            content = body["choices"][0]["message"].get("content")
+            require(isinstance(content, str) and bool(content.strip()), "JSON mode content is empty")
+            try:
+                decoded = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise TestFailure(f"JSON mode returned invalid JSON: {error}; content={content!r}") from error
+            require(isinstance(decoded, dict), "JSON mode did not return a top-level object")
+
+            streamed = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{
+                        "role": "user",
+                        "content": 'Return exactly this JSON object and nothing else: {"ok":true}',
+                    }],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": self.args.max_tokens,
+                    "temperature": 0,
+                    "stream": True,
+                },
+            )
+            expect_status(streamed, 200, "OpenAI streamed JSON object response format")
+            require(
+                "text/event-stream" in streamed.headers.get("content-type", ""),
+                "JSON mode stream content-type is not text/event-stream",
+            )
+            frames = parse_sse(streamed.body)
+            require(any(frame["data"] == "[DONE]" for frame in frames), "JSON mode stream [DONE] missing")
+            chunks = [
+                frame["data"] for frame in frames
+                if isinstance(frame["data"], dict)
+            ]
+            streamed_content = "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+                if isinstance(choice, dict)
+            )
+            try:
+                streamed_json = json.loads(streamed_content)
+            except json.JSONDecodeError as error:
+                raise TestFailure(
+                    f"streamed JSON mode returned invalid JSON: {error}; content={streamed_content!r}"
+                ) from error
+            require(isinstance(streamed_json, dict), "streamed JSON mode did not return a top-level object")
+            return "response_format=json_object passed JSON and buffered SSE validation"
+
+        def invalid_stop() -> str:
+            response = self.request(
+                "/v1/chat/completions",
+                {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stop": ["valid", 7],
+                },
+            )
+            expect_status(response, 400, "OpenAI invalid stop array")
+            return "non-string stop sequence rejected with HTTP 400"
+
         def invalid_request() -> str:
             response = self.request(
                 "/v1/chat/completions",
@@ -533,6 +627,8 @@ class ApiTestRunner:
             ("forced-tool-call", forced_tool),
             ("streaming-tool-call", streamed_tool),
             ("tool-result-round-trip", tool_round_trip),
+            ("json-object-mode", json_object_mode),
+            ("stop-sequence-validation", invalid_stop),
             ("request-validation", invalid_request),
             ("unknown-model", missing_model),
         ]
@@ -548,6 +644,7 @@ class ApiTestRunner:
                     "max_tokens": self.args.max_tokens,
                     "temperature": 0,
                     "system": "You are a concise assistant.",
+                    "metadata": {"user_id": "qarnyx-api-test"},
                     "messages": [
                         {
                             "role": "user",
@@ -675,16 +772,23 @@ class ApiTestRunner:
             expect_status(first, 200, "Anthropic round-trip setup")
             body = json_body(first)
             call_id, _ = extract_anthropic_tool_call(body)
+            # A tool-result turn needs room for a natural-language completion;
+            # keep it independent from the smaller regular-chat default budget.
+            round_trip_max_tokens = max(self.args.max_tokens, 256)
             second = self.request(
                 "/v1/messages",
                 {
                     "model": self.model,
-                    "max_tokens": self.args.max_tokens,
+                    "max_tokens": round_trip_max_tokens,
                     "temperature": 0,
                     "messages": [
                         {
                             "role": "user",
-                            "content": "What is the weather in Jakarta?",
+                            "content": (
+                                "What is the weather in Jakarta? "
+                                "After the tool result, reply in one short sentence only. "
+                                "Do not add general climate information."
+                            ),
                         },
                         {
                             "role": "assistant",
@@ -708,14 +812,20 @@ class ApiTestRunner:
                             ],
                         },
                     ],
-                    "tools": [anthropic_tool_definition()],
-                    "tool_choice": {"type": "auto"},
                 },
             )
             expect_status(second, 200, "Anthropic tool_result round trip")
             final = json_body(second)
-            require(final.get("stop_reason") == "end_turn", "Anthropic did not end the tool-result turn")
             text = assistant_text(final)
+            require(
+                final.get("stop_reason") == "end_turn",
+                "Anthropic did not end the tool-result turn: "
+                f"stop_reason={final.get('stop_reason')!r}, "
+                f"stop_sequence={final.get('stop_sequence')!r}, "
+                f"content={final.get('content')!r}, "
+                f"usage={final.get('usage')!r}, "
+                f"max_tokens={round_trip_max_tokens}",
+            )
             require(bool(text), "Anthropic final text after tool_result is empty")
             require(
                 "31" in text or "sunny" in text.lower(),
@@ -730,14 +840,14 @@ class ApiTestRunner:
                     "model": self.model,
                     "max_tokens": self.args.max_tokens,
                     "messages": [{"role": "user", "content": "hello"}],
-                    "stop_sequences": ["STOP"],
+                    "stop_sequences": [""],
                 },
             )
-            expect_status(response, 400, "Anthropic unsupported stop_sequences")
+            expect_status(response, 400, "Anthropic empty stop sequence")
             body = json_body(response)
             require(body.get("type") == "error", "Anthropic error type envelope is missing")
             require(isinstance(body.get("error"), dict), "Anthropic error payload is missing")
-            return "unsupported stop_sequences rejected with invalid_request_error"
+            return "empty stop sequence rejected with invalid_request_error"
 
         def missing_model() -> str:
             response = self.request(

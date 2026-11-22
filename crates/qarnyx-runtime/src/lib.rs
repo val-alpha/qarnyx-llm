@@ -53,6 +53,7 @@ pub enum GenerationError {
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    parents: Vec<Arc<AtomicBool>>,
 }
 
 impl CancellationToken {
@@ -60,6 +61,18 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            parents: Vec::new(),
+        }
+    }
+
+    /// Creates an independently cancellable child that is also cancelled when
+    /// this token (or any of its ancestors) is cancelled.
+    pub fn child_token(&self) -> Self {
+        let mut parents = self.parents.clone();
+        parents.push(Arc::clone(&self.cancelled));
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            parents,
         }
     }
 
@@ -68,9 +81,13 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Returns whether cancellation has been requested.
+    /// Returns whether this token or any parent has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .parents
+                .iter()
+                .any(|parent| parent.load(Ordering::Acquire))
     }
 
     fn check(&self) -> Result<(), GenerationError> {
@@ -560,6 +577,33 @@ mod tests {
 
         assert!(first.is_cancelled());
         assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn child_cancellation_is_independent_but_inherits_parent_shutdown() {
+        let shutdown = CancellationToken::new();
+        let first_request = shutdown.child_token();
+        let second_request = shutdown.child_token();
+
+        first_request.cancel();
+        assert!(first_request.is_cancelled());
+        assert!(!second_request.is_cancelled());
+        assert!(!shutdown.is_cancelled());
+
+        shutdown.cancel();
+        assert!(first_request.is_cancelled());
+        assert!(second_request.is_cancelled());
+    }
+
+    #[test]
+    fn nested_child_tokens_inherit_all_ancestor_cancellation() {
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        let request = child.child_token();
+
+        child.cancel();
+        assert!(request.is_cancelled());
+        assert!(!root.is_cancelled());
     }
 
     #[test]

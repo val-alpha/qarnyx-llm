@@ -41,7 +41,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tool_call::{
     OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice,
@@ -87,7 +87,9 @@ struct ModelAssets {
     model_id: String,
     max_context_tokens: usize,
     max_cache_mib: usize,
+    max_concurrent_requests: usize,
     request_slots: Arc<Semaphore>,
+    shutdown_token: CancellationToken,
 }
 
 impl ApiState {
@@ -153,7 +155,9 @@ impl ApiState {
                 model_id,
                 max_context_tokens,
                 max_cache_mib,
+                max_concurrent_requests,
                 request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
+                shutdown_token: CancellationToken::new(),
             }),
         })
     }
@@ -164,6 +168,23 @@ impl ApiState {
 
     pub fn architecture(&self) -> &str {
         &self.assets.architecture
+    }
+
+    /// Acquires one inference slot without building an unbounded wait queue.
+    ///
+    /// Saturated servers reject new inference immediately with HTTP 429.
+    pub(crate) fn admit_request(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        acquire_request_slot(&self.assets.request_slots)
+    }
+
+    /// Creates an independent request token linked to server shutdown.
+    pub(crate) fn request_cancellation(&self) -> CancellationToken {
+        self.assets.shutdown_token.child_token()
+    }
+
+    /// Cancels all currently active generations as the server begins shutdown.
+    pub fn cancel_in_flight(&self) {
+        self.assets.shutdown_token.cancel();
     }
 }
 
@@ -223,6 +244,7 @@ fn read_model_with_budget(
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/messages", post(anthropic::create_messages))
@@ -230,8 +252,29 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+fn health_payload(state: &ApiState, status: &'static str) -> Value {
+    let available = state.assets.request_slots.available_permits();
+    json!({
+        "status": status,
+        "model": state.assets.model_id,
+        "active_requests": state.assets.max_concurrent_requests.saturating_sub(available),
+        "max_concurrent_requests": state.assets.max_concurrent_requests
+    })
+}
+
+async fn health(State(state): State<ApiState>) -> Json<Value> {
+    Json(health_payload(&state, "ok"))
+}
+
+async fn ready(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
+    let is_ready = !state.assets.shutdown_token.is_cancelled();
+    let status = if is_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let label = if is_ready { "ok" } else { "shutting_down" };
+    (status, Json(health_payload(&state, label)))
 }
 
 async fn list_models(State(state): State<ApiState>) -> Json<Value> {
@@ -444,6 +487,156 @@ struct PreparedRequest {
     include_usage: bool,
     tools: Vec<OpenAiTool>,
     tool_choice: ToolChoice,
+    stop_sequences: Vec<String>,
+    json_mode: bool,
+}
+
+#[derive(Default)]
+struct GenerationCapture {
+    text: String,
+    token_ids: Vec<usize>,
+    stop: Option<(usize, String)>,
+}
+
+impl GenerationCapture {
+    fn record(&mut self, event: &GenerationEvent, stop_sequences: &[String]) -> bool {
+        if self.stop.is_some() {
+            return true;
+        }
+        match event {
+            GenerationEvent::Token {
+                token_id,
+                text_delta,
+            } => {
+                self.token_ids.push(*token_id);
+                self.text.push_str(text_delta);
+            }
+            GenerationEvent::TextDelta { text } => self.text.push_str(text),
+        }
+
+        self.stop = stop_sequences
+            .iter()
+            .filter_map(|sequence| {
+                self.text
+                    .find(sequence)
+                    .map(|index| (index, sequence.clone()))
+            })
+            .min_by_key(|(index, _)| *index);
+        self.stop.is_some()
+    }
+
+    fn into_output(mut self, prompt_tokens: usize) -> (GenerationOutput, Option<String>) {
+        let stop_sequence = self.stop.as_ref().map(|(_, sequence)| sequence.clone());
+        if let Some((stop_at, _)) = &self.stop {
+            // Token usage counts every token sampled to discover the stop
+            // string, while returned text excludes the stop string and suffix.
+            self.text.truncate(*stop_at);
+        }
+        let completion_tokens = self.token_ids.len();
+        (
+            GenerationOutput {
+                text: self.text,
+                token_ids: self.token_ids,
+                prompt_tokens,
+                completion_tokens,
+            },
+            stop_sequence,
+        )
+    }
+}
+
+pub(crate) fn validate_stop_sequences(
+    values: Vec<String>,
+    max_count: usize,
+    field: &str,
+) -> Result<Vec<String>, ApiError> {
+    if values.len() > max_count {
+        return Err(ApiError::bad_request(format!(
+            "{field} accepts at most {max_count} sequences"
+        )));
+    }
+    for sequence in &values {
+        if sequence.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "{field} entries must not be empty"
+            )));
+        }
+        if sequence.len() > 256 {
+            return Err(ApiError::bad_request(format!(
+                "{field} entries must be no longer than 256 bytes"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn apply_json_mode_instruction(messages: &mut Vec<ChatMessage>) {
+    const INSTRUCTION: &str = "Return exactly one valid JSON object. Do not include Markdown fences, comments, or explanatory text outside the JSON object.";
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        let content = system.content.get_or_insert_with(String::new);
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(INSTRUCTION);
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".into(),
+                content: Some(INSTRUCTION.into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                unsupported: HashMap::new(),
+            },
+        );
+    }
+}
+
+fn validate_json_object(output: &str) -> Result<(), ApiError> {
+    let value = serde_json::from_str::<Value>(output).map_err(|error| {
+        ApiError::invalid_model_output(format!(
+            "response_format='json_object' requires valid JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(ApiError::invalid_model_output(
+            "response_format='json_object' requires a JSON object at the top level",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_stop_sequences(
+    value: Option<Value>,
+    max_count: usize,
+    field: &str,
+) -> Result<Vec<String>, ApiError> {
+    let values = match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(sequence)) => vec![sequence],
+        Some(Value::Array(values)) => {
+            if values.is_empty() && field == "stop" {
+                return Err(ApiError::bad_request(
+                    "stop array must contain at least one sequence",
+                ));
+            }
+            values
+                .into_iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        ApiError::bad_request(format!("{field} array entries must be strings"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(format!(
+                "{field} must be a string or an array of strings"
+            )));
+        }
+    };
+    validate_stop_sequences(values, max_count, field)
 }
 
 impl ApiState {
@@ -468,11 +661,7 @@ impl ApiState {
                 )));
             }
         }
-        if request.stop.as_ref().is_some_and(|value| !value.is_null()) {
-            return Err(ApiError::bad_request(
-                "stop sequences are not supported by this runtime adapter yet",
-            ));
-        }
+        let stop_sequences = parse_stop_sequences(request.stop, 4, "stop")?;
         if request.logprobs.unwrap_or(false) || request.top_logprobs.unwrap_or(0) > 0 {
             return Err(ApiError::bad_request("logprobs are not supported"));
         }
@@ -500,12 +689,21 @@ impl ApiState {
             ));
         }
         validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
-        if let Some(format) = request.response_format {
-            if format.kind != "text" {
-                return Err(ApiError::bad_request(
-                    "only response_format.type='text' is supported",
-                ));
+        let json_mode = match request.response_format {
+            None => false,
+            Some(format) if format.kind == "text" => false,
+            Some(format) if format.kind == "json_object" => true,
+            Some(format) => {
+                return Err(ApiError::bad_request(format!(
+                    "response_format.type='{}' is not supported; use 'text' or 'json_object'",
+                    format.kind
+                )));
             }
+        };
+        if json_mode && !tools.is_empty() {
+            return Err(ApiError::bad_request(
+                "response_format.type='json_object' cannot be combined with tools",
+            ));
         }
         if request.store.unwrap_or(false) {
             return Err(ApiError::bad_request(
@@ -563,10 +761,14 @@ impl ApiState {
             ));
         }
 
+        let mut prompt_messages = request.messages;
+        if json_mode {
+            apply_json_mode_instruction(&mut prompt_messages);
+        }
         let prompt = format_chat_prompt(
             &self.assets.tokenizer,
             &self.assets.architecture,
-            &request.messages,
+            &prompt_messages,
             &tools,
             &tool_choice,
         )?;
@@ -587,6 +789,8 @@ impl ApiState {
             stream_options.include_usage,
             tools,
             tool_choice,
+            stop_sequences,
+            json_mode,
         )
     }
 
@@ -596,6 +800,8 @@ impl ApiState {
         include_usage: bool,
         tools: Vec<OpenAiTool>,
         tool_choice: ToolChoice,
+        stop_sequences: Vec<String>,
+        json_mode: bool,
     ) -> Result<PreparedRequest, ApiError> {
         let config = request.config;
         if config.max_context_tokens == 0 || config.max_cache_mib == 0 {
@@ -634,7 +840,43 @@ impl ApiState {
             include_usage,
             tools,
             tool_choice,
+            stop_sequences,
+            json_mode,
         })
+    }
+
+    fn generate_captured<F>(
+        &self,
+        prepared: &PreparedRequest,
+        cancellation: &CancellationToken,
+        mut on_event: F,
+    ) -> Result<(GenerationOutput, Option<String>), RunError>
+    where
+        F: FnMut(&GenerationEvent),
+    {
+        let prompt_tokens = prepared.prompt_ids.len();
+        let mut capture = GenerationCapture::default();
+        let result = self.generate(prepared, cancellation, |event| {
+            let stop_requested = capture.record(&event, &prepared.stop_sequences);
+            on_event(&event);
+            if stop_requested {
+                cancellation.cancel();
+            }
+        });
+
+        match result {
+            Ok(generation) => {
+                // Use the runtime's canonical generated IDs so usage remains
+                // correct even when a tokenizer emits a final text-only UTF-8
+                // replacement delta.
+                capture.token_ids = generation.token_ids;
+                Ok(capture.into_output(prompt_tokens))
+            }
+            Err(RunError::Generation(GenerationError::Cancelled)) if capture.stop.is_some() => {
+                Ok(capture.into_output(prompt_tokens))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn generate<F>(
@@ -731,6 +973,24 @@ fn format_chat_prompt(
         .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
+fn acquire_request_slot(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
+    match Arc::clone(slots).try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(TryAcquireError::NoPermits) => Err(ApiError::rate_limited(
+            "server is at its configured concurrent inference limit; retry shortly",
+        )),
+        Err(TryAcquireError::Closed) => Err(ApiError::internal("request admission is closed")),
+    }
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Error)]
 enum RunError {
     #[error("generation failed: {0}")]
@@ -771,6 +1031,22 @@ impl ApiError {
         }
     }
 
+    fn rate_limited(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            kind: "rate_limit_error",
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            message: message.into(),
+        }
+    }
+
     fn invalid_model_output(message: impl Into<String>) -> Self {
         Self::internal(format!(
             "model returned invalid tool-call output: {}",
@@ -781,7 +1057,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry_after = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.status,
             Json(json!({
                 "error": {
@@ -792,7 +1069,13 @@ impl IntoResponse for ApiError {
                 }
             })),
         )
-            .into_response()
+            .into_response();
+        if retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -805,9 +1088,9 @@ impl From<RunError> for ApiError {
                 | GenerationError::ContextLimitExceeded { .. }
                 | GenerationError::CacheBudgetExceeded { .. }),
             ) => Self::bad_request(error.to_string()),
-            RunError::Generation(GenerationError::Cancelled) => {
-                Self::bad_request("generation was cancelled")
-            }
+            RunError::Generation(GenerationError::Cancelled) => Self::unavailable(
+                "generation was cancelled because the server is shutting down or the client disconnected",
+            ),
             RunError::Generation(error) => Self::internal(error.to_string()),
             RunError::Model(error) => Self::internal(error),
         }
@@ -821,46 +1104,46 @@ async fn create_chat_completion(
     let Json(request) =
         payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
+    let permit = state.admit_request()?;
     let prepared = state.prepare(request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_new_tokens = prepared.config.max_new_tokens;
 
     if stream {
-        return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens)
-            .await
-            .map(|response| response);
+        return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens, permit)
+            .await;
     }
 
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
+    let task_cancellation = cancellation.clone();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let tools = prepared.tools.clone();
     let tool_choice = prepared.tool_choice.clone();
+    let json_mode = prepared.json_mode;
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut content = String::new();
-        let result = state_for_task.generate(&prepared, &cancellation, |event| match event {
-            GenerationEvent::Token { text_delta, .. } => content.push_str(&text_delta),
-            GenerationEvent::TextDelta { text } => content.push_str(&text),
-        })?;
-        Ok::<_, RunError>((content, result))
+        state_for_task.generate_captured(&prepared, &task_cancellation, |_| {})
     })
     .await
     .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
     .map_err(ApiError::from)?;
-
-    let output = GenerationOutput::from_runtime(completion.0, &completion.1, prompt_tokens);
+    let (output, stop_sequence) = completion;
     let completion_tokens = output.completion_tokens;
-    let parsed = parse_model_output(&output.text, &tools, &tool_choice)
-        .map_err(ApiError::invalid_model_output)?;
+    let parsed = if json_mode {
+        validate_json_object(&output.text)?;
+        tool_call::ParsedAssistant {
+            content: Some(output.text.clone()),
+            tool_calls: Vec::new(),
+        }
+    } else {
+        parse_model_output(&output.text, &tools, &tool_choice)
+            .map_err(ApiError::invalid_model_output)?
+    };
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
+    } else if stop_sequence.is_some() {
+        "stop"
     } else if completion_tokens >= max_new_tokens {
         "length"
     } else {
@@ -902,18 +1185,12 @@ async fn stream_chat_completion(
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_new_tokens: usize,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, ApiError> {
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let include_usage = prepared.include_usage;
     let (id, created) = next_completion_identity();
     let model_id = state.assets.model_id.clone();
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
@@ -940,22 +1217,22 @@ async fn stream_chat_completion(
             return;
         }
 
-        let mut completion_tokens = 0usize;
-        let mut raw_output = String::new();
-        let should_buffer = !prepared.tools.is_empty();
-        // Preserve token streaming for ordinary chat. Tool-enabled output is
-        // buffered so a partial JSON envelope is never misreported as content.
-        let result = state.generate(&prepared, &task_cancellation, |event| {
-            let delta = match event {
-                GenerationEvent::Token { text_delta, .. } => {
-                    completion_tokens += 1;
-                    text_delta
+        let should_buffer =
+            !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty() || prepared.json_mode;
+        // Buffer tool and stop-sequence requests so protocol control text is
+        // never exposed to clients before the complete response is validated.
+        let result = state.generate_captured(&prepared, &task_cancellation, |event| {
+            if should_buffer {
+                if sender.is_closed() {
+                    task_cancellation.cancel();
                 }
+                return;
+            }
+            let delta = match event {
+                GenerationEvent::Token { text_delta, .. } => text_delta,
                 GenerationEvent::TextDelta { text } => text,
             };
-            if should_buffer {
-                raw_output.push_str(&delta);
-            } else if !delta.is_empty()
+            if !delta.is_empty()
                 && !send(stream_chunk(
                     &id,
                     created,
@@ -969,29 +1246,40 @@ async fn stream_chat_completion(
             }
         });
 
-        if task_cancellation.is_cancelled() {
+        if result.is_err() && task_cancellation.is_cancelled() {
             return;
         }
 
         match result {
-            Ok(generation) => {
-                completion_tokens = generation
-                    .token_ids
-                    .len()
-                    .saturating_sub(prompt_tokens)
-                    .max(completion_tokens);
-                let parsed = match parse_model_output(
-                    &raw_output,
-                    &prepared.tools,
-                    &prepared.tool_choice,
-                ) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        let _ = send(
-                            json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}),
-                        );
+            Ok((output, stop_sequence)) => {
+                let completion_tokens = output.completion_tokens;
+                let parsed = if prepared.json_mode {
+                    if let Err(error) = validate_json_object(&output.text) {
+                        let _ = send(json!({
+                            "error": {
+                                "message": error.message,
+                                "type": "server_error",
+                                "param": null,
+                                "code": null
+                            }
+                        }));
                         let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
                         return;
+                    }
+                    tool_call::ParsedAssistant {
+                        content: Some(output.text.clone()),
+                        tool_calls: Vec::new(),
+                    }
+                } else {
+                    match parse_model_output(&output.text, &prepared.tools, &prepared.tool_choice) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            let _ = send(
+                                json!({"error":{"message":error,"type":"server_error","param":null,"code":null}}),
+                            );
+                            let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
+                            return;
+                        }
                     }
                 };
                 if should_buffer {
@@ -1029,6 +1317,8 @@ async fn stream_chat_completion(
                 }
                 let finish_reason = if !tool_calls.is_empty() {
                     "tool_calls"
+                } else if stop_sequence.is_some() {
+                    "stop"
                 } else if completion_tokens >= max_new_tokens {
                     "length"
                 } else {
@@ -1326,5 +1616,139 @@ mod tests {
         assert!(!request.stream);
         assert_eq!(request.n.unwrap_or(1), 1);
         assert_eq!(request.max_tokens, None);
+    }
+    #[test]
+    fn readiness_is_false_after_server_shutdown_is_requested() {
+        let root = CancellationToken::new();
+        assert!(!root.is_cancelled());
+        root.cancel();
+        assert!(root.is_cancelled());
+    }
+
+    #[test]
+    fn rate_limited_responses_include_retry_after() {
+        let response = ApiError::rate_limited("busy").into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[test]
+    fn shutdown_cancellation_maps_to_service_unavailable() {
+        let error = ApiError::from(RunError::Generation(GenerationError::Cancelled));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.kind, "server_error");
+    }
+
+    #[test]
+    fn request_admission_rejects_without_queueing_when_capacity_is_full() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = acquire_request_slot(&slots).unwrap();
+        let rejected = acquire_request_slot(&slots);
+        assert!(matches!(rejected, Err(ref error)
+            if error.status == StatusCode::TOO_MANY_REQUESTS
+                && error.kind == "rate_limit_error"));
+        drop(permit);
+        assert!(acquire_request_slot(&slots).is_ok());
+    }
+
+    #[test]
+    fn parses_openai_stop_sequences_as_a_string_or_string_array() {
+        assert_eq!(
+            parse_stop_sequences(Some(json!("<END>")), 4, "stop").unwrap(),
+            vec!["<END>"]
+        );
+        assert_eq!(
+            parse_stop_sequences(Some(json!(["<END>", "STOP"])), 4, "stop").unwrap(),
+            vec!["<END>", "STOP"]
+        );
+        assert!(parse_stop_sequences(Some(json!(["ok", 7])), 4, "stop").is_err());
+        assert!(parse_stop_sequences(Some(json!([])), 4, "stop").is_err());
+        assert!(
+            parse_stop_sequences(Some(json!([])), 16, "stop_sequences")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stop_sequences_are_bounded_and_must_be_non_empty() {
+        assert!(validate_stop_sequences(vec![String::new()], 4, "stop").is_err());
+        assert!(validate_stop_sequences(vec!["x".repeat(257)], 4, "stop").is_err());
+        assert!(
+            validate_stop_sequences(
+                vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+                4,
+                "stop"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_capture_truncates_a_stop_sequence_across_token_events() {
+        let stop_sequences = vec!["<STOP>".to_owned()];
+        let mut capture = GenerationCapture::default();
+        assert!(!capture.record(
+            &GenerationEvent::Token {
+                token_id: 11,
+                text_delta: "visible ".into()
+            },
+            &stop_sequences
+        ));
+        assert!(!capture.record(
+            &GenerationEvent::Token {
+                token_id: 12,
+                text_delta: "<ST".into()
+            },
+            &stop_sequences
+        ));
+        assert!(capture.record(
+            &GenerationEvent::Token {
+                token_id: 13,
+                text_delta: "OP>hidden".into()
+            },
+            &stop_sequences
+        ));
+
+        let (output, stop_sequence) = capture.into_output(5);
+        assert_eq!(output.text, "visible ");
+        assert_eq!(output.token_ids, vec![11, 12, 13]);
+        assert_eq!(output.prompt_tokens, 5);
+        assert_eq!(output.completion_tokens, 3);
+        assert_eq!(stop_sequence.as_deref(), Some("<STOP>"));
+    }
+
+    #[test]
+    fn json_mode_instruction_is_added_as_a_system_message() {
+        let mut messages = vec![message("user", "Return a value.")];
+        apply_json_mode_instruction(&mut messages);
+        assert_eq!(messages[0].role, "system");
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("valid JSON object")
+        );
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn json_mode_accepts_only_a_top_level_json_object() {
+        assert!(validate_json_object(r#"{"ok":true}"#).is_ok());
+        assert!(validate_json_object(r#"[1,2,3]"#).is_err());
+        assert!(validate_json_object("not json").is_err());
+        assert!(validate_json_object("null").is_err());
+    }
+
+    #[test]
+    fn response_format_deserializes_json_object_mode() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"qarnyx",
+            "messages":[{"role":"user","content":"Return JSON"}],
+            "response_format":{"type":"json_object"}
+        }))
+        .unwrap();
+        assert_eq!(request.response_format.unwrap().kind, "json_object");
     }
 }

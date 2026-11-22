@@ -175,7 +175,30 @@ adapters over the same Qarnyx runtime generation path:
 | Anthropic Messages | `POST /v1/messages` | Anthropic Messages SSE events |
 | Native Qarnyx | `POST /v1/generate` | Native token/text/completion events |
 
-The shared discovery endpoints are `GET /health` and `GET /v1/models`.
+The shared discovery endpoints are `GET /health`, `GET /ready`, and
+`GET /v1/models`. Health/readiness responses include the loaded model and
+current/max active inference requests. When all configured inference slots are
+occupied, new generation requests are rejected immediately with HTTP 429 and
+`Retry-After: 1` instead of waiting in an unbounded queue. During graceful
+shutdown, `/health` remains a liveness check while `/ready` reports HTTP 503
+and `status="shutting_down"`. The model-load
+memory admission reserves `max_cache_mib × max_concurrent_requests` in the
+configured `max_memory_mib` budget before admitting the model file. This is an
+accounting envelope, not an operating-system RSS limit.
+
+For example, allow at most two active requests and reserve up to 512 MiB per
+request:
+
+```bash
+cargo run --release -p qarnyx-api --bin qarnyx-server -- \
+  --model /path/to/model.gguf --workers 10 \
+  --max-memory-mib 8192 --max-cache-mib 512 \
+  --max-concurrent-requests 2
+```
+
+When all slots are occupied, clients should retry after the `Retry-After`
+interval. Ctrl+C and SIGTERM request cooperative cancellation of active
+generation at the next token boundary.
 
 OpenAI-compatible request:
 
@@ -225,8 +248,14 @@ curl http://127.0.0.1:8000/v1/generate \
 Set `"stream": true` and use `curl -N` to receive streaming events from each
 adapter. The native endpoint accepts `max_new_tokens`, `max_context_tokens`,
 `max_cache_mib`, `temperature`, `top_k`, `top_p`, and `seed` under its
-`config` object. Anthropic text blocks and client-executed tool-use/tool-result
-round trips are supported. The server does not execute client tools.
+`config` object. OpenAI Chat Completions accepts the `stop` string/array and
+`response_format.type="json_object"`; JSON mode is prompt-guided and validates
+the final top-level object rather than using constrained decoding. Anthropic
+Messages accepts `stop_sequences` and `metadata.user_id`. The current Qarnyx
+guard caps Anthropic requests at 16 stop sequences of at most 256 UTF-8 bytes
+each. Stop sequences are matched against decoded text at token boundaries and
+excluded from returned content. Anthropic text blocks and client-executed tool-use/tool-result round
+trips are supported. The server does not execute client tools.
 Tool-call output is normalized from the Qarnyx JSON envelope, Qwen-style
 `<tool_call>` blocks, single-call JSON, and OpenAI-shaped function-call
 objects. Unknown tools, malformed arguments, and failed forced-tool responses
@@ -235,8 +264,9 @@ The client executes returned tools and sends their results in a later request.
 
 Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
 role-labelled prompt because model-specific LLaMA chat templates are not
-implemented. Multimodal inputs, stop sequences, OpenAI logprobs, broad vendor
-parameter parity, and built-in authentication remain outstanding.
+implemented. Multimodal inputs, OpenAI logprobs, broad vendor parameter parity,
+model-specific LLaMA chat templates, and built-in authentication remain
+outstanding.
 
 The server defaults to loopback and has no built-in authentication. Do not
 expose it to an untrusted network without an authenticated gateway. Concurrent
@@ -266,6 +296,12 @@ bash scripts/api-test.sh --skip-build
 
 Additional arguments are passed through to `scripts/api_test.py`. See
 [docs/api-testing.md](docs/api-testing.md) for coverage, options, and examples.
+
+For an opt-in concurrent load burst across the OpenAI, Anthropic, or native
+endpoint, use `python3 scripts/api_load_test.py --endpoint openai --requests 8
+--parallelism 8`. It reports latency, HTTP 429 overload rejections, and checks
+that the server returns to a healthy idle state. It does not start or stop the
+server; see [docs/api-testing.md](docs/api-testing.md) for details.
 
 ## Development
 

@@ -32,17 +32,25 @@ impl IntoResponse for NativeApiError {
     fn into_response(self) -> Response {
         let error_type = match self.0.status {
             StatusCode::NOT_FOUND => "not_found",
-            StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
+            StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
             _ => "invalid_request",
         };
-        (
+        let retry_after = self.0.status == StatusCode::TOO_MANY_REQUESTS;
+        let mut response = (
             self.0.status,
             Json(json!({
                 "object":"qarnyx.error",
                 "error":{"type":error_type,"message":self.0.message}
             })),
         )
-            .into_response()
+            .into_response();
+        if retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -114,6 +122,8 @@ fn prepare_request(
         false,
         Vec::new(),
         ToolChoice::None,
+        Vec::new(),
+        false,
     )
 }
 
@@ -132,26 +142,22 @@ pub(super) async fn generate(
     let Json(request) =
         payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
+    let permit = state.admit_request().map_err(NativeApiError::from)?;
     let prepared = prepare_request(&state, request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_new_tokens = prepared.config.max_new_tokens;
     if stream {
-        return stream_generation(state, prepared, prompt_tokens, max_new_tokens).await;
+        return stream_generation(state, prepared, prompt_tokens, max_new_tokens, permit).await;
     }
 
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
+    let task_cancellation = cancellation.clone();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let state_task = state.clone();
     let (text, result) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut text = String::new();
-        let result = state_task.generate(&prepared, &cancellation, |event| match event {
+        let result = state_task.generate(&prepared, &task_cancellation, |event| match event {
             GenerationEvent::Token { text_delta, .. } => text.push_str(&text_delta),
             GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
         })?;
@@ -182,16 +188,10 @@ async fn stream_generation(
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_new_tokens: usize,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, NativeApiError> {
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let model = state.assets.model_id.clone();
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
