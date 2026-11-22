@@ -352,27 +352,27 @@ pub fn parse_model_output(
     let trimmed = output.trim();
     let (raw_calls, content) =
         if let Some((calls, surrounding_text)) = parse_tagged_tool_calls(trimmed)? {
-        (Some(calls), surrounding_text)
-    } else {
-        let candidate = strip_json_code_fence(trimmed);
-        match serde_json::from_str::<Value>(candidate) {
-            Ok(value) => (payload_calls(value)?, String::new()),
-            Err(error) => {
-                let looks_like_tool_json = candidate.contains("\"tool_calls\"");
-                if matches!(choice, ToolChoice::Required | ToolChoice::Function(_))
-                    || looks_like_tool_json
-                {
-                    return Err(format!(
-                        "model did not return a valid tool-call JSON object: {error}"
-                    ));
+            (Some(calls), surrounding_text)
+        } else {
+            let candidate = strip_json_code_fence(trimmed);
+            match serde_json::from_str::<Value>(candidate) {
+                Ok(value) => (payload_calls(value)?, String::new()),
+                Err(error) => {
+                    let looks_like_tool_json = candidate.contains("\"tool_calls\"");
+                    if matches!(choice, ToolChoice::Required | ToolChoice::Function(_))
+                        || looks_like_tool_json
+                    {
+                        return Err(format!(
+                            "model did not return a valid tool-call JSON object: {error}"
+                        ));
+                    }
+                    return Ok(ParsedAssistant {
+                        content: Some(output.to_owned()),
+                        tool_calls: Vec::new(),
+                    });
                 }
-                return Ok(ParsedAssistant {
-                    content: Some(output.to_owned()),
-                    tool_calls: Vec::new(),
-                });
             }
-        }
-    };
+        };
 
     let Some(raw_calls) = raw_calls else {
         if matches!(choice, ToolChoice::Required | ToolChoice::Function(_)) {
