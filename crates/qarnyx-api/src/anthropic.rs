@@ -89,8 +89,15 @@ pub(super) struct MessagesRequest {
     tools: Option<Vec<AnthropicTool>>,
     tool_choice: Option<Value>,
     stop_sequences: Option<Vec<String>>,
+    metadata: Option<AnthropicMetadata>,
     #[serde(flatten)]
     unsupported: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AnthropicMetadata {
+    user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +391,16 @@ fn prepare_request(
     }
     if request.max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be non-zero"));
+    }
+    if request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_ref())
+        .is_some_and(|user_id| user_id.len() > 256 || user_id.chars().any(char::is_control))
+    {
+        return Err(ApiError::bad_request(
+            "metadata.user_id must be at most 256 bytes and contain no control characters",
+        ));
     }
     let stop_sequences = validate_stop_sequences(
         request.stop_sequences.unwrap_or_default(),
