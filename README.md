@@ -175,7 +175,12 @@ adapters over the same Qarnyx runtime generation path:
 | Anthropic Messages | `POST /v1/messages` | Anthropic Messages SSE events |
 | Native Qarnyx | `POST /v1/generate` | Native token/text/completion events |
 
-The shared discovery endpoints are `GET /health` and `GET /v1/models`.
+The shared discovery endpoints are `GET /health`, `GET /ready`, and
+`GET /v1/models`. Health/readiness responses include the loaded model and
+current/max active inference requests. When all configured inference slots are
+occupied, new generation requests are rejected immediately with HTTP 429
+instead of waiting in an unbounded queue. The configured memory admission
+reserves one cache budget per concurrent request.
 
 OpenAI-compatible request:
 
@@ -235,8 +240,8 @@ The client executes returned tools and sends their results in a later request.
 
 Qwen3.5 messages use its ChatML format. LLaMA currently uses a generic
 role-labelled prompt because model-specific LLaMA chat templates are not
-implemented. Multimodal inputs, stop sequences, OpenAI logprobs, broad vendor
-parameter parity, and built-in authentication remain outstanding.
+implemented. Multimodal inputs, OpenAI logprobs, broad vendor parameter parity, model-specific
+LLaMA chat templates, and built-in authentication remain outstanding.
 
 The server defaults to loopback and has no built-in authentication. Do not
 expose it to an untrusted network without an authenticated gateway. Concurrent
