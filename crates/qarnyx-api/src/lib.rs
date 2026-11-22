@@ -1360,4 +1360,16 @@ mod tests {
         assert_eq!(request.n.unwrap_or(1), 1);
         assert_eq!(request.max_tokens, None);
     }
+    #[test]
+    fn request_admission_rejects_without_queueing_when_capacity_is_full() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = acquire_request_slot(&slots).unwrap();
+        let rejected = acquire_request_slot(&slots);
+        assert!(matches!(rejected, Err(ref error)
+            if error.status == StatusCode::TOO_MANY_REQUESTS
+                && error.kind == "rate_limit_error"));
+        drop(permit);
+        assert!(acquire_request_slot(&slots).is_ok());
+    }
+
 }
