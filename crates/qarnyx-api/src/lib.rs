@@ -89,6 +89,7 @@ struct ModelAssets {
     max_cache_mib: usize,
     max_concurrent_requests: usize,
     request_slots: Arc<Semaphore>,
+    shutdown_token: CancellationToken,
 }
 
 impl ApiState {
@@ -156,6 +157,7 @@ impl ApiState {
                 max_cache_mib,
                 max_concurrent_requests,
                 request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
+                shutdown_token: CancellationToken::new(),
             }),
         })
     }
@@ -173,6 +175,16 @@ impl ApiState {
     /// Saturated servers reject new inference immediately with HTTP 429.
     pub(crate) fn admit_request(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         acquire_request_slot(&self.assets.request_slots)
+    }
+
+    /// Creates an independent request token linked to server shutdown.
+    pub(crate) fn request_cancellation(&self) -> CancellationToken {
+        self.assets.shutdown_token.child_token()
+    }
+
+    /// Cancels all currently active generations as the server begins shutdown.
+    pub fn cancel_in_flight(&self) {
+        self.assets.shutdown_token.cancel();
     }
 }
 
@@ -1060,7 +1072,7 @@ async fn create_chat_completion(
             .await;
     }
 
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let tools = prepared.tools.clone();
@@ -1136,7 +1148,7 @@ async fn stream_chat_completion(
     let include_usage = prepared.include_usage;
     let (id, created) = next_completion_identity();
     let model_id = state.assets.model_id.clone();
-    let cancellation = CancellationToken::new();
+    let cancellation = state.request_cancellation();
     let task_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel::<Bytes>(8);
 
