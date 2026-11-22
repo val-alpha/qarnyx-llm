@@ -9,6 +9,9 @@ HTTP surfaces served by `qarnyx-server`:
 
 The runner talks to a running Qarnyx server. It does **not** start, stop, or
 restart the server, and it does not call the real OpenAI or Anthropic services.
+Inference admission is bounded: once all configured request slots are in use,
+new requests fail immediately with HTTP 429 rather than waiting in an
+unbounded server-side queue.
 
 ## 1. Start Qarnyx yourself
 
@@ -87,13 +90,14 @@ Options:
 
 ## 4. Test coverage
 
-The `all` suite runs these checks serially:
+The `all` suite runs these checks serially. Check `GET /health` and
+`GET /ready` separately for current/max request-slot telemetry:
 
 | Surface | Coverage |
 |---|---|
 | Shared | Health probe, model discovery |
-| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, invalid request rejection, unknown model rejection |
-| Anthropic | Basic Messages, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, unsupported parameter rejection, unknown model rejection |
+| OpenAI | Basic chat, system role, multi-turn history, JSON completion and usage, text SSE, forced tool call, streamed tool call, tool-result round trip, stop strings, JSON-object response mode, invalid request rejection, unknown model rejection |
+| Anthropic | Basic Messages, system prompt, text content blocks, multi-turn history, message SSE lifecycle, forced `tool_use`, streamed `tool_use`, `tool_result` round trip, `stop_sequences`, `metadata.user_id`, unsupported parameter rejection, unknown model rejection |
 | Native Qarnyx | Raw-prompt generation, generation controls, token IDs and usage, native SSE token/text/completed/done events, empty prompt rejection, invalid generation config rejection, unknown model rejection |
 
 A successful tool round trip performs a simulated client-side tool execution:
@@ -105,6 +109,39 @@ external tools.
 The native `/v1/generate` API is a raw-prompt generation interface and does
 not expose function-tool calling. Tool-call coverage therefore belongs to the
 OpenAI and Anthropic adapters.
+
+
+## Request limits, cancellation, and protocol compatibility
+
+The server acquires an inference permit before prompt tokenization. If all
+`--max-concurrent-requests` slots are occupied, the OpenAI and native adapters
+return HTTP 429 with a rate-limit error; Anthropic returns its rate-limit error
+shape with the same HTTP status. The server does not accumulate waiting
+inference tasks. `/health` and `/ready` report `active_requests` and
+`max_concurrent_requests`.
+
+SSE workers observe a disconnected receiver while generating and cancel at the
+next token boundary. Buffered tool/stop/JSON responses also check whether the
+client receiver has closed. Non-streaming handlers use a drop guard to request
+cancellation if their handler future is dropped. Ctrl+C and SIGTERM cancel all
+active request tokens before the server drains HTTP connections. Cancellation
+is cooperative: the current model/token evaluation is allowed to finish.
+
+OpenAI `stop` accepts one string or up to four strings. Anthropic
+`stop_sequences` accepts up to sixteen strings. Stop text is excluded from
+returned content, and Anthropic reports the matching `stop_sequence` with
+`stop_reason="stop_sequence"`. Stop matching is text-based and cancels at the
+next token boundary; it does not interrupt the middle of a token evaluation.
+
+OpenAI `response_format.type="json_object"` injects a JSON-only instruction,
+buffers streamed output, and validates that the completed response is a valid
+top-level JSON object before returning it. This is prompt-guided validation,
+not grammar-constrained decoding; a model that fails to follow the instruction
+returns a server-side model-output error. Anthropic `metadata.user_id` is
+accepted and validated but is not persisted or used for authentication.
+
+The native `/v1/generate` endpoint remains a raw-prompt interface and does not
+inherit OpenAI/Anthropic stop fields or response-format controls.
 
 ## 5. Reading results
 
