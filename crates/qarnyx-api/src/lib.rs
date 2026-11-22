@@ -41,7 +41,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tool_call::{
     OpenAiTool, OpenAiToolCall, ToolChoice, parse_model_output, parse_tool_choice,
@@ -87,6 +87,7 @@ struct ModelAssets {
     model_id: String,
     max_context_tokens: usize,
     max_cache_mib: usize,
+    max_concurrent_requests: usize,
     request_slots: Arc<Semaphore>,
 }
 
@@ -153,6 +154,7 @@ impl ApiState {
                 model_id,
                 max_context_tokens,
                 max_cache_mib,
+                max_concurrent_requests,
                 request_slots: Arc::new(Semaphore::new(max_concurrent_requests)),
             }),
         })
@@ -164,6 +166,13 @@ impl ApiState {
 
     pub fn architecture(&self) -> &str {
         &self.assets.architecture
+    }
+
+    /// Acquires one inference slot without building an unbounded wait queue.
+    ///
+    /// Saturated servers reject new inference immediately with HTTP 429.
+    pub(crate) fn admit_request(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        acquire_request_slot(&self.assets.request_slots)
     }
 }
 
@@ -223,6 +232,7 @@ fn read_model_with_budget(
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/messages", post(anthropic::create_messages))
@@ -230,8 +240,14 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<ApiState>) -> Json<Value> {
+    let available = state.assets.request_slots.available_permits();
+    Json(json!({
+        "status": "ok",
+        "model": state.assets.model_id,
+        "active_requests": state.assets.max_concurrent_requests.saturating_sub(available),
+        "max_concurrent_requests": state.assets.max_concurrent_requests
+    }))
 }
 
 async fn list_models(State(state): State<ApiState>) -> Json<Value> {
@@ -731,6 +747,26 @@ fn format_chat_prompt(
         .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
+fn acquire_request_slot(
+    slots: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    match Arc::clone(slots).try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(TryAcquireError::NoPermits) => Err(ApiError::rate_limited(
+            "server is at its configured concurrent inference limit; retry shortly",
+        )),
+        Err(TryAcquireError::Closed) => Err(ApiError::internal("request admission is closed")),
+    }
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Error)]
 enum RunError {
     #[error("generation failed: {0}")]
@@ -767,6 +803,14 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             kind: "server_error",
+            message: message.into(),
+        }
+    }
+
+    fn rate_limited(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            kind: "rate_limit_error",
             message: message.into(),
         }
     }
@@ -824,28 +868,23 @@ async fn create_chat_completion(
     let prepared = state.prepare(request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_new_tokens = prepared.config.max_new_tokens;
+    let permit = state.admit_request()?;
 
     if stream {
-        return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens)
-            .await
-            .map(|response| response);
+        return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens, permit)
+            .await;
     }
 
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let tools = prepared.tools.clone();
     let tool_choice = prepared.tool_choice.clone();
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut content = String::new();
-        let result = state_for_task.generate(&prepared, &cancellation, |event| match event {
+        let result = state_for_task.generate(&prepared, &task_cancellation, |event| match event {
             GenerationEvent::Token { text_delta, .. } => content.push_str(&text_delta),
             GenerationEvent::TextDelta { text } => content.push_str(&text),
         })?;
@@ -902,14 +941,8 @@ async fn stream_chat_completion(
     prepared: PreparedRequest,
     prompt_tokens: usize,
     max_new_tokens: usize,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, ApiError> {
-    let permit = state
-        .assets
-        .request_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| ApiError::internal(format!("request admission failed: {error}")))?;
     let include_usage = prepared.include_usage;
     let (id, created) = next_completion_identity();
     let model_id = state.assets.model_id.clone();
