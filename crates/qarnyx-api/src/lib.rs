@@ -1013,23 +1013,19 @@ async fn create_chat_completion(
     let state_for_task = state.clone();
     let completion = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut content = String::new();
-        let result = state_for_task.generate(&prepared, &task_cancellation, |event| match event {
-            GenerationEvent::Token { text_delta, .. } => content.push_str(&text_delta),
-            GenerationEvent::TextDelta { text } => content.push_str(&text),
-        })?;
-        Ok::<_, RunError>((content, result))
+        state_for_task.generate_captured(&prepared, &task_cancellation, |_| {})
     })
     .await
     .map_err(|error| ApiError::internal(format!("generation task failed: {error}")))?
     .map_err(ApiError::from)?;
-
-    let output = GenerationOutput::from_runtime(completion.0, &completion.1, prompt_tokens);
+    let (output, stop_sequence) = completion;
     let completion_tokens = output.completion_tokens;
     let parsed = parse_model_output(&output.text, &tools, &tool_choice)
         .map_err(ApiError::invalid_model_output)?;
     let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
+    } else if stop_sequence.is_some() {
+        "stop"
     } else if completion_tokens >= max_new_tokens {
         "length"
     } else {
@@ -1103,22 +1099,18 @@ async fn stream_chat_completion(
             return;
         }
 
-        let mut completion_tokens = 0usize;
-        let mut raw_output = String::new();
-        let should_buffer = !prepared.tools.is_empty();
-        // Preserve token streaming for ordinary chat. Tool-enabled output is
-        // buffered so a partial JSON envelope is never misreported as content.
-        let result = state.generate(&prepared, &task_cancellation, |event| {
+        let should_buffer = !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty();
+        // Buffer tool and stop-sequence requests so protocol control text is
+        // never exposed to clients before the complete response is validated.
+        let result = state.generate_captured(&prepared, &task_cancellation, |event| {
+            if should_buffer {
+                return;
+            }
             let delta = match event {
-                GenerationEvent::Token { text_delta, .. } => {
-                    completion_tokens += 1;
-                    text_delta
-                }
+                GenerationEvent::Token { text_delta, .. } => text_delta,
                 GenerationEvent::TextDelta { text } => text,
             };
-            if should_buffer {
-                raw_output.push_str(&delta);
-            } else if !delta.is_empty()
+            if !delta.is_empty()
                 && !send(stream_chunk(
                     &id,
                     created,
@@ -1132,19 +1124,15 @@ async fn stream_chat_completion(
             }
         });
 
-        if task_cancellation.is_cancelled() {
+        if result.is_err() && task_cancellation.is_cancelled() {
             return;
         }
 
         match result {
-            Ok(generation) => {
-                completion_tokens = generation
-                    .token_ids
-                    .len()
-                    .saturating_sub(prompt_tokens)
-                    .max(completion_tokens);
+            Ok((output, stop_sequence)) => {
+                let completion_tokens = output.completion_tokens;
                 let parsed = match parse_model_output(
-                    &raw_output,
+                    &output.text,
                     &prepared.tools,
                     &prepared.tool_choice,
                 ) {
@@ -1192,6 +1180,8 @@ async fn stream_chat_completion(
                 }
                 let finish_reason = if !tool_calls.is_empty() {
                     "tool_calls"
+                } else if stop_sequence.is_some() {
+                    "stop"
                 } else if completion_tokens >= max_new_tokens {
                     "length"
                 } else {
@@ -1236,6 +1226,7 @@ async fn stream_chat_completion(
                 }));
                 let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
             }
+        }
         }
     });
 
