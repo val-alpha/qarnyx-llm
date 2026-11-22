@@ -480,7 +480,6 @@ struct PreparedRequest {
 struct GenerationCapture {
     text: String,
     token_ids: Vec<usize>,
-    token_ranges: Vec<(usize, usize)>,
     stop: Option<(usize, String)>,
 }
 
@@ -489,12 +488,10 @@ impl GenerationCapture {
         if self.stop.is_some() {
             return true;
         }
-        let start = self.text.len();
         match event {
             GenerationEvent::Token { token_id, text_delta } => {
                 self.token_ids.push(*token_id);
                 self.text.push_str(text_delta);
-                self.token_ranges.push((start, self.text.len()));
             }
             GenerationEvent::TextDelta { text } => self.text.push_str(text),
         }
@@ -509,13 +506,9 @@ impl GenerationCapture {
     fn into_output(mut self, prompt_tokens: usize) -> (GenerationOutput, Option<String>) {
         let stop_sequence = self.stop.as_ref().map(|(_, sequence)| sequence.clone());
         if let Some((stop_at, _)) = &self.stop {
+            // Token usage counts every token sampled to discover the stop
+            // string, while returned text excludes the stop string and suffix.
             self.text.truncate(*stop_at);
-            let retained_tokens = self
-                .token_ranges
-                .iter()
-                .take_while(|range| range.0 < *stop_at)
-                .count();
-            self.token_ids.truncate(retained_tokens);
         }
         let completion_tokens = self.token_ids.len();
         (
@@ -598,14 +591,21 @@ fn parse_stop_sequences(
     let values = match value {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(sequence)) => vec![sequence],
-        Some(Value::Array(values)) => values
-            .into_iter()
-            .map(|value| {
-                value.as_str().map(str::to_owned).ok_or_else(|| {
-                    ApiError::bad_request(format!("{field} array entries must be strings"))
+        Some(Value::Array(values)) => {
+            if values.is_empty() && field == "stop" {
+                return Err(ApiError::bad_request(
+                    "stop array must contain at least one sequence",
+                ));
+            }
+            values
+                .into_iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        ApiError::bad_request(format!("{field} array entries must be strings"))
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?
+        },
         Some(_) => {
             return Err(ApiError::bad_request(format!(
                 "{field} must be a string or an array of strings"
@@ -1604,7 +1604,8 @@ mod tests {
             vec!["<END>", "STOP"]
         );
         assert!(parse_stop_sequences(Some(json!(["ok", 7])), 4, "stop").is_err());
-        assert!(parse_stop_sequences(Some(json!([])), 4, "stop").unwrap().is_empty());
+        assert!(parse_stop_sequences(Some(json!([])), 4, "stop").is_err());
+        assert!(parse_stop_sequences(Some(json!([])), 16, "stop_sequences").unwrap().is_empty());
     }
 
     #[test]
@@ -1647,9 +1648,9 @@ mod tests {
 
         let (output, stop_sequence) = capture.into_output(5);
         assert_eq!(output.text, "visible ");
-        assert_eq!(output.token_ids, vec![11]);
+        assert_eq!(output.token_ids, vec![11, 12, 13]);
         assert_eq!(output.prompt_tokens, 5);
-        assert_eq!(output.completion_tokens, 1);
+        assert_eq!(output.completion_tokens, 3);
         assert_eq!(stop_sequence.as_deref(), Some("<STOP>"));
     }
 
