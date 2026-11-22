@@ -385,15 +385,11 @@ fn prepare_request(
     if request.max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be non-zero"));
     }
-    if request
-        .stop_sequences
-        .as_ref()
-        .is_some_and(|values| !values.is_empty())
-    {
-        return Err(ApiError::bad_request(
-            "stop_sequences are not supported by the runtime yet",
-        ));
-    }
+    let stop_sequences = validate_stop_sequences(
+        request.stop_sequences.unwrap_or_default(),
+        16,
+        "stop_sequences",
+    )?;
     if !request.unsupported.is_empty() {
         let mut fields = request.unsupported.keys().cloned().collect::<Vec<_>>();
         fields.sort();
@@ -437,6 +433,7 @@ fn prepare_request(
         false,
         tools,
         tool_choice,
+        stop_sequences,
     )
 }
 
@@ -444,9 +441,12 @@ fn stop_reason(
     parsed: &tool_call::ParsedAssistant,
     completion_tokens: usize,
     max_tokens: usize,
+    stopped_by_sequence: bool,
 ) -> &'static str {
     if !parsed.tool_calls.is_empty() {
         "tool_use"
+    } else if stopped_by_sequence {
+        "stop_sequence"
     } else if completion_tokens >= max_tokens {
         "max_tokens"
     } else {
