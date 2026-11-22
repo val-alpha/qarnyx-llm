@@ -243,6 +243,21 @@ expose it to an untrusted network without an authenticated gateway. Concurrent
 inference is limited by a bounded semaphore (one request by default); increase
 `--max-concurrent-requests` only after measuring available memory.
 
+## API integration tests
+
+With `qarnyx-server` already running, execute the full end-to-end suite
+(OpenAI, Anthropic, and native Qarnyx; JSON, streaming, tool calls, tool-result
+round trips, and request validation):
+
+```bash
+python3 scripts/api_test.py
+```
+
+The runner uses only Python's standard library. It first checks `GET /health`;
+if the server is unavailable it prints `[SKIP]` and exits without starting
+anything. See [docs/api-testing.md](docs/api-testing.md) for coverage, options,
+and examples.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
