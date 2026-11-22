@@ -800,11 +800,15 @@ mod tests {
                 "description":"Get weather",
                 "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}
             }],
-            "tool_choice":{"type":"tool","name":"weather"}
+            "tool_choice":{"type":"tool","name":"weather"},
+            "stop_sequences":["<END>","STOP"],
+            "metadata":{"user_id":"client-123"}
         }))
         .unwrap();
         let messages = normalize_messages(request.system, request.messages).unwrap();
         let tools = normalize_tools(request.tools).unwrap();
+        assert_eq!(request.stop_sequences.unwrap(), vec!["<END>", "STOP"]);
+        assert_eq!(request.metadata.unwrap().user_id.as_deref(), Some("client-123"));
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content.as_deref(), Some("Hello"));
         assert_eq!(tools[0].function.name, "weather");
@@ -879,4 +883,14 @@ mod tests {
         assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
         assert_eq!(messages[1].content.as_deref(), Some("Sunny"));
     }
+    #[test]
+    fn anthropic_stop_reason_reports_stop_sequence() {
+        let parsed = tool_call::ParsedAssistant {
+            content: Some("done".into()),
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(stop_reason(&parsed, 4, 16, true), "stop_sequence");
+        assert_eq!(stop_reason(&parsed, 16, 16, false), "max_tokens");
+    }
+
 }
