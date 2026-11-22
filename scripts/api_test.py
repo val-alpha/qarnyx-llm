@@ -596,7 +596,7 @@ class ApiTestRunner:
             )
             expect_status(response, 200, "Anthropic streaming messages")
             require(
-                "text/event-stream" in response.headers.get("Content-Type", ""),
+                "text/event-stream" in response.headers.get("content-type", ""),
                 "Anthropic stream content-type is not text/event-stream",
             )
             frames = parse_sse(response.body)
@@ -809,7 +809,7 @@ class ApiTestRunner:
             )
             expect_status(response, 200, "Native streaming generation")
             require(
-                "text/event-stream" in response.headers.get("Content-Type", ""),
+                "text/event-stream" in response.headers.get("content-type", ""),
                 "native stream content-type is not text/event-stream",
             )
             frames = parse_sse(response.body)
