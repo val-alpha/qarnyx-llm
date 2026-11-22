@@ -64,14 +64,14 @@ def http_request(
             body = response.read().decode("utf-8", errors="replace")
             return HttpResponse(
                 status=response.status,
-                headers=dict(response.headers.items()),
+                headers={key.lower(): value for key, value in response.headers.items()},
                 body=body,
             )
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         return HttpResponse(
             status=error.code,
-            headers=dict(error.headers.items()) if error.headers else {},
+            headers={key.lower(): value for key, value in error.headers.items()} if error.headers else {},
             body=body,
         )
 
@@ -387,7 +387,7 @@ class ApiTestRunner:
             )
             expect_status(response, 200, "OpenAI streaming chat")
             require(
-                "text/event-stream" in response.headers.get("Content-Type", ""),
+                "text/event-stream" in response.headers.get("content-type", ""),
                 "OpenAI stream content-type is not text/event-stream",
             )
             frames = parse_sse(response.body)
