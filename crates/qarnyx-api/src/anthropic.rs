@@ -71,10 +71,9 @@ impl IntoResponse for AnthropicApiError {
             response.headers_mut().insert("request-id", value);
         }
         if self.0.status == StatusCode::TOO_MANY_REQUESTS {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static("1"),
-            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -402,7 +401,9 @@ fn prepare_request(
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.user_id.as_ref())
-        .is_some_and(|user_id| user_id.chars().count() > 512 || user_id.chars().any(char::is_control))
+        .is_some_and(|user_id| {
+            user_id.chars().count() > 512 || user_id.chars().any(char::is_control)
+        })
     {
         return Err(ApiError::bad_request(
             "metadata.user_id must be at most 512 characters and contain no control characters",
@@ -594,8 +595,7 @@ async fn stream_messages(
             return;
         }
 
-        let buffer_output =
-            !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty();
+        let buffer_output = !prepared.tools.is_empty() || !prepared.stop_sequences.is_empty();
         if !buffer_output
             && !send(
                 "content_block_start",
@@ -636,11 +636,7 @@ async fn stream_messages(
             Ok((output, stop_sequence)) => {
                 let completion_tokens = output.completion_tokens;
                 let parsed = if buffer_output {
-                    match parse_model_output(
-                        &output.text,
-                        &prepared.tools,
-                        &prepared.tool_choice,
-                    ) {
+                    match parse_model_output(&output.text, &prepared.tools, &prepared.tool_choice) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             let _ = send(
@@ -813,7 +809,10 @@ mod tests {
         let messages = normalize_messages(request.system, request.messages).unwrap();
         let tools = normalize_tools(request.tools).unwrap();
         assert_eq!(request.stop_sequences.unwrap(), vec!["<END>", "STOP"]);
-        assert_eq!(request.metadata.unwrap().user_id.as_deref(), Some("client-123"));
+        assert_eq!(
+            request.metadata.unwrap().user_id.as_deref(),
+            Some("client-123")
+        );
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content.as_deref(), Some("Hello"));
         assert_eq!(tools[0].function.name, "weather");
@@ -897,5 +896,4 @@ mod tests {
         assert_eq!(stop_reason(&parsed, 4, 16, true), "stop_sequence");
         assert_eq!(stop_reason(&parsed, 16, 16, false), "max_tokens");
     }
-
 }
