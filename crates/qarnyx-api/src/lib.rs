@@ -665,7 +665,6 @@ impl ApiState {
             ));
         }
         validate_choice(&tool_choice, &tools).map_err(ApiError::bad_request)?;
-        if let Some(format) = request.response_format {
         let json_mode = match request.response_format {
             None => false,
             Some(format) if format.kind == "text" => false,
