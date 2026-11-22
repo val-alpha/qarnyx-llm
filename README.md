@@ -295,6 +295,12 @@ bash scripts/api-test.sh --skip-build
 Additional arguments are passed through to `scripts/api_test.py`. See
 [docs/api-testing.md](docs/api-testing.md) for coverage, options, and examples.
 
+For an opt-in concurrent load burst across the OpenAI, Anthropic, or native
+endpoint, use `python3 scripts/api_load_test.py --endpoint openai --requests 8
+--parallelism 8`. It reports latency, HTTP 429 overload rejections, and checks
+that the server returns to a healthy idle state. It does not start or stop the
+server; see [docs/api-testing.md](docs/api-testing.md) for details.
+
 ## Development
 
 A recent stable Rust toolchain with Cargo is required.
