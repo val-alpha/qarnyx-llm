@@ -72,14 +72,15 @@ async fn main() -> anyhow::Result<()> {
         "Endpoints: GET /health, GET /ready, GET /v1/models, POST /v1/chat/completions, POST /v1/messages, POST /v1/generate"
     );
 
+    let shutdown_state = state.clone();
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
         .await?;
 
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: ApiState) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             eprintln!("failed to listen for Ctrl+C: {error}");
@@ -103,4 +104,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+
+    // Cancel active inference at token boundaries before Hyper drains connections.
+    state.cancel_in_flight();
 }
