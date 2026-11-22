@@ -1343,7 +1343,6 @@ async fn stream_chat_completion(
                 let _ = sender.blocking_send(Bytes::from_static(b"data: [DONE]\n\n"));
             }
         }
-        }
     });
 
     Response::builder()
