@@ -135,10 +135,10 @@ pub(super) async fn generate(
     let Json(request) =
         payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
+    let permit = state.admit_request().map_err(NativeApiError::from)?;
     let prepared = prepare_request(&state, request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_new_tokens = prepared.config.max_new_tokens;
-    let permit = state.admit_request().map_err(NativeApiError::from)?;
     if stream {
         return stream_generation(state, prepared, prompt_tokens, max_new_tokens, permit).await;
     }
