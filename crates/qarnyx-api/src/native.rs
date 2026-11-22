@@ -46,10 +46,9 @@ impl IntoResponse for NativeApiError {
         )
             .into_response();
         if retry_after {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_static("1"),
-            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
