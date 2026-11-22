@@ -434,6 +434,7 @@ fn prepare_request(
         tools,
         tool_choice,
         stop_sequences,
+        false,
     )
 }
 
