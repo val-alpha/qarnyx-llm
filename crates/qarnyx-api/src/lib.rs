@@ -1050,10 +1050,10 @@ async fn create_chat_completion(
     let Json(request) =
         payload.map_err(|error| ApiError::bad_request(format!("invalid JSON request: {error}")))?;
     let stream = request.stream;
+    let permit = state.admit_request()?;
     let prepared = state.prepare(request)?;
     let prompt_tokens = prepared.prompt_ids.len();
     let max_new_tokens = prepared.config.max_new_tokens;
-    let permit = state.admit_request()?;
 
     if stream {
         return stream_chat_completion(state, prepared, prompt_tokens, max_new_tokens, permit)
@@ -1170,6 +1170,9 @@ async fn stream_chat_completion(
         // never exposed to clients before the complete response is validated.
         let result = state.generate_captured(&prepared, &task_cancellation, |event| {
             if should_buffer {
+                if sender.is_closed() {
+                    task_cancellation.cancel();
+                }
                 return;
             }
             let delta = match event {
