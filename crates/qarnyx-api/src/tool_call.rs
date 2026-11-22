@@ -350,9 +350,8 @@ pub fn parse_model_output(
     choice: &ToolChoice,
 ) -> Result<ParsedAssistant, String> {
     let trimmed = output.trim();
-    let (raw_calls, content) = if let Some((calls, surrounding_text)) =
-        parse_tagged_tool_calls(trimmed)?
-    {
+    let (raw_calls, content) =
+        if let Some((calls, surrounding_text)) = parse_tagged_tool_calls(trimmed)? {
         (Some(calls), surrounding_text)
     } else {
         let candidate = strip_json_code_fence(trimmed);
@@ -602,6 +601,4 @@ mod tests {
             .is_err()
         );
     }
-
-
 }
