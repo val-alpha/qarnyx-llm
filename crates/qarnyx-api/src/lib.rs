@@ -1593,4 +1593,96 @@ mod tests {
         assert!(acquire_request_slot(&slots).is_ok());
     }
 
+    #[test]
+    fn parses_openai_stop_sequences_as_a_string_or_string_array() {
+        assert_eq!(
+            parse_stop_sequences(Some(json!("<END>")), 4, "stop").unwrap(),
+            vec!["<END>"]
+        );
+        assert_eq!(
+            parse_stop_sequences(Some(json!(["<END>", "STOP"])), 4, "stop").unwrap(),
+            vec!["<END>", "STOP"]
+        );
+        assert!(parse_stop_sequences(Some(json!(["ok", 7])), 4, "stop").is_err());
+        assert!(parse_stop_sequences(Some(json!([])), 4, "stop").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_sequences_are_bounded_and_must_be_non_empty() {
+        assert!(validate_stop_sequences(vec![String::new()], 4, "stop").is_err());
+        assert!(validate_stop_sequences(vec!["x".repeat(257)], 4, "stop").is_err());
+        assert!(validate_stop_sequences(
+            vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+            4,
+            "stop"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn generation_capture_truncates_a_stop_sequence_across_token_events() {
+        let stop_sequences = vec!["<STOP>".to_owned()];
+        let mut capture = GenerationCapture::default();
+        assert!(!capture.record(
+            &GenerationEvent::Token {
+                token_id: 11,
+                text_delta: "visible ".into()
+            },
+            &stop_sequences
+        ));
+        assert!(!capture.record(
+            &GenerationEvent::Token {
+                token_id: 12,
+                text_delta: "<ST".into()
+            },
+            &stop_sequences
+        ));
+        assert!(capture.record(
+            &GenerationEvent::Token {
+                token_id: 13,
+                text_delta: "OP>hidden".into()
+            },
+            &stop_sequences
+        ));
+
+        let (output, stop_sequence) = capture.into_output(5);
+        assert_eq!(output.text, "visible ");
+        assert_eq!(output.token_ids, vec![11]);
+        assert_eq!(output.prompt_tokens, 5);
+        assert_eq!(output.completion_tokens, 1);
+        assert_eq!(stop_sequence.as_deref(), Some("<STOP>"));
+    }
+
+    #[test]
+    fn json_mode_instruction_is_added_as_a_system_message() {
+        let mut messages = vec![message("user", "Return a value.")];
+        apply_json_mode_instruction(&mut messages);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("valid JSON object"));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn json_mode_accepts_only_a_top_level_json_object() {
+        assert!(validate_json_object(r#"{"ok":true}"#).is_ok());
+        assert!(validate_json_object(r#"[1,2,3]"#).is_err());
+        assert!(validate_json_object("not json").is_err());
+        assert!(validate_json_object("null").is_err());
+    }
+
+    #[test]
+    fn response_format_deserializes_json_object_mode() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"qarnyx",
+            "messages":[{"role":"user","content":"Return JSON"}],
+            "response_format":{"type":"json_object"}
+        }))
+        .unwrap();
+        assert_eq!(request.response_format.unwrap().kind, "json_object");
+    }
+
 }
