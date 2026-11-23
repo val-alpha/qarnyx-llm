@@ -21,9 +21,12 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Validate API test runner syntax
+      - name: Validate Python test runner syntax
         run: |
-          python3 -m py_compile scripts/api_test.py scripts/api_load_test.py
+          python3 -m py_compile \
+            scripts/api_test.py \
+            scripts/api_load_test.py \
+            scripts/cpu_kernel_cli_test.py
           bash -n scripts/api-test.sh
 
       - name: Verify clean skip when API server is offline
@@ -38,6 +41,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Validate retained CPU kernel CLI modes
+        run: |
+          cargo build -p qarnyx-cli
+          python3 scripts/cpu_kernel_cli_test.py --bin target/debug/qarnyx
 
       - name: Check formatting
         run: cargo fmt --all -- --check
