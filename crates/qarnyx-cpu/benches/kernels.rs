@@ -152,10 +152,8 @@ fn benchmark_matmul(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let scalar_backend = CpuBackend::new_scalar(1)?;
-    let dequant_backend = CpuBackend::new_dequant(1)?;
     let auto_backend = CpuBackend::new(1)?;
-    let fused_q4k_backend = CpuBackend::new_fused_q4k(1)?;
+    let fused_backend = CpuBackend::new_fused_kq_fma(1)?;
     let features = auto_backend.features();
     println!(
         "CPU features: avx2={} fma={} avx512f={} neon={} (AVX2 active: {})",
@@ -166,122 +164,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         auto_backend.uses_avx2()
     );
 
-    // Keep the original F32 fixtures as a baseline comparable to earlier runs.
-    let (m, k) = (256, 512);
-    let weights = encode_f32((0..m * k).map(|index| (index % 31) as f32 / 31.0 - 0.5));
-    let shape = [m, k];
-    let view = TensorView::new(&weights, &shape, DType::F32);
-    let input = vec![0.25_f32; k];
-    let mut output = vec![0.0_f32; m];
-
-    let iterations = 30;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        scalar_backend.matvec(black_box(view), black_box(&input), black_box(&mut output))?;
-    }
-    let elapsed = start.elapsed();
-    black_box(&output);
-    println!(
-        "scalar F32 matvec [{m}, {k}]: {iterations} iterations in {elapsed:?} ({:.2} us/op)",
-        elapsed.as_secs_f64() * 1.0e6 / iterations as f64
-    );
-
-    let (m, k, n) = (96, 128, 64);
-    let weights = encode_f32((0..m * k).map(|index| (index % 23) as f32 / 23.0 - 0.5));
-    let shape = [m, k];
-    let view = TensorView::new(&weights, &shape, DType::F32);
-    let input = vec![0.125_f32; k * n];
-    let mut output = vec![0.0_f32; m * n];
-
-    let iterations = 10;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        scalar_backend.matmul(
-            black_box(view),
-            black_box(&input),
-            black_box(&mut output),
-            m,
-            n,
-            k,
-        )?;
-    }
-    let elapsed = start.elapsed();
-    black_box(&output);
-    println!(
-        "scalar F32 matmul [{m}, {k}] x [{k}, {n}]: {iterations} iterations in {elapsed:?} ({:.2} ms/op)",
-        elapsed.as_secs_f64() * 1.0e3 / iterations as f64
-    );
-
-    // Equal logical dimensions make timings comparable across storage formats.
-    let formats = [
-        ("F32", DType::F32, 0),
-        ("F16", DType::F16, 1),
-        ("Q4_0", DType::Q4_0, 2),
-        ("Q8_0", DType::Q8_0, 8),
+    println!("\\nRetained CPU kernel comparison (only auto vs fused-kq-fma):");
+    for (label, dtype, raw_type) in [
         ("Q4_K", DType::Q4K, 12),
         ("Q5_K", DType::Q5K, 13),
         ("Q6_K", DType::Q6K, 14),
-    ];
-
-    println!("\nMatvec storage-format comparison (scalar vs automatic dispatch):");
-    for (label, dtype, raw_type) in formats {
-        benchmark_matvec(&scalar_backend, "scalar", label, dtype, raw_type)?;
+    ] {
         benchmark_matvec(&auto_backend, "auto", label, dtype, raw_type)?;
+        benchmark_matvec(&fused_backend, "fused-kq-fma", label, dtype, raw_type)?;
     }
 
-    println!("\nQ4_K matvec A/B (dequant baseline vs automatic fused K-quant):");
-    benchmark_matvec(&dequant_backend, "dequant", "Q4_K", DType::Q4K, 12)?;
-    benchmark_matvec(&auto_backend, "auto-fused-kq-fma", "Q4_K", DType::Q4K, 12)?;
-    benchmark_matvec(&fused_q4k_backend, "fused-q4k", "Q4_K", DType::Q4K, 12)?;
-
-    println!("\nQ5_K / Q6_K matvec A/B (dequant baseline vs automatic fused K-quant):");
-    for workers in [1, 10] {
-        let dequant_qk_backend = CpuBackend::new_dequant(workers)?;
-        let auto_qk_backend = CpuBackend::new(workers)?;
-        let fused_qk_backend = CpuBackend::new_fused_qk(workers)?;
-        for (label, dtype, raw_type) in [("Q5_K", DType::Q5K, 13), ("Q6_K", DType::Q6K, 14)] {
-            benchmark_matvec(
-                &dequant_qk_backend,
-                &format!("workers={workers} dequant"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-            benchmark_matvec(
-                &auto_qk_backend,
-                &format!("workers={workers} auto-fused-kq-fma"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-            benchmark_matvec(
-                &fused_qk_backend,
-                &format!("workers={workers} fused-qk"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-        }
-    }
-
-    println!("\nMatmul storage-format comparison (scalar vs runtime dispatch):");
-    for (label, dtype, raw_type) in formats {
-        benchmark_matmul(&scalar_backend, "scalar", label, dtype, raw_type)?;
-        benchmark_matmul(&auto_backend, "auto", label, dtype, raw_type)?;
-    }
-
-    println!("\nPersistent worker-pool matvec scaling (steady-state, F32 and Q4_K):");
-    for (label, dtype, raw_type) in [("F32", DType::F32, 0), ("Q4_K", DType::Q4K, 12)] {
-        for workers in [1, 2, 4, 6, 8, 10] {
-            let backend = CpuBackend::new(workers)?;
-            benchmark_matvec(
-                &backend,
-                &format!("workers={workers}"),
-                label,
-                dtype,
-                raw_type,
-            )?;
-        }
+    println!("\\nRetained-kernel worker scaling (auto):");
+    for workers in [1, 2, 4, 6, 8, 10] {
+        let backend = CpuBackend::new(workers)?;
+        benchmark_matvec(
+            &backend,
+            &format!("workers={workers}"),
+            "Q4_K",
+            DType::Q4K,
+            12,
+        )?;
     }
 
     Ok(())
