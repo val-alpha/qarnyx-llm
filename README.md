@@ -85,15 +85,12 @@ dequantize-then-dot path (or its portable fallback). The previous dequantized
 path remains available through the `CpuBackend::new_dequant()` API for A/B
 benchmarks.
 
-The explicit `fused-q4k` mode uses a Q8_K-quantized activation vector and an
-integer AVX2 Q4_K dot for wide inputs. The `llama-q4k` mode implements the x86
-AVX2/FMA Q4_K x Q8_K per-row dot strategy used by `ggml_vec_dot_q4_K_q8_K`
-in llama.cpp, including its SIMD minimum correction. It does not call llama.cpp
-or use its repacked/interleaved matrix format. The explicit `fused-kq-fma`
-mode selects the direct-block F32-input AVX2/FMA K-quant path for comparison;
-this is also the path selected by `auto` when AVX2+FMA are available. The
-explicit `fused-qk` mode retains the integer/AVX2 direct-block alternatives.
-Unsupported CPU features use the corresponding portable fallback.
+The CPU CLI intentionally exposes only two kernel modes: `auto` and
+`fused-kq-fma`. Both select the direct-block F32-input AVX2/FMA K-quant path
+on supported x86_64 hosts; `auto` is the production/default mode and keeps
+the portable fallback when the required ISA is unavailable. Keeping one
+explicit optimized mode avoids benchmark/test matrix explosion while retaining
+a deterministic path for performance experiments.
 
 Large matvec/matmul output rows and independent Qwen3.5 projection batches use
 the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
@@ -112,22 +109,19 @@ To compare end-to-end generation using the same model and prompt, select a
 kernel mode explicitly:
 
 ```bash
-./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel scalar
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel auto
-./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-q4k
-./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel llama-q4k
 ./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-kq-fma
-./target/release/qarnyx generate model.gguf "hi there!" --max-new-tokens 32 --cpu-kernel fused-qk
 ```
 
 For Qwen3.5, add `--thinking` to enable model reasoning output; without the
 flag the CLI uses the non-thinking prefix.
 
-The `auto` mode now prefers direct-block F32-input Q4_K/Q5_K/Q6_K AVX2/FMA
-kernels when the runtime detects both AVX2 and FMA. Use `CpuBackend::new_dequant()`
-in Rust benchmarks to compare against the previous dequantize-plus-dot baseline.
-`fused-q4k`, `llama-q4k`, and `fused-qk` remain explicit alternatives for
-same-machine comparisons. `scalar` remains the non-SIMD correctness reference.
+The `auto` mode uses the retained direct-block F32-input Q4_K/Q5_K/Q6_K
+AVX2/FMA path when the runtime detects AVX2+FMA. `fused-kq-fma` exposes that
+same optimized path explicitly for controlled performance testing. Other
+experimental kernel modes were removed to keep the runtime and benchmark
+surface small; portable scalar/dequantization code remains internal as a
+fallback and correctness reference.
 
 Generation is capped at 4096 combined prompt and requested output tokens by
 default. Use `--max-context-tokens N` to set a different per-request limit.
