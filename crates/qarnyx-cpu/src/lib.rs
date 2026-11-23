@@ -135,7 +135,11 @@ impl CpuBackend {
             .build()
             .map_err(|error| CpuBackendError::WorkerPoolBuild(error.to_string()))?;
         let features = CpuFeatures::detect();
-        let fused_kq_fma_matvec = fused_kq_fma_matvec && simd_enabled && features.avx2 && features.fma;
+        let fused_kq_fma_matvec = fused_kq_fma_matvec
+            && simd_enabled
+            && cfg!(target_arch = "x86_64")
+            && features.avx2
+            && features.fma;
         Ok(Self {
             worker_count,
             pool: Arc::new(pool),
@@ -1083,7 +1087,7 @@ mod tests {
         let automatic = CpuBackend::new(1).unwrap();
         assert_eq!(
             automatic.fused_kq_fma_matvec,
-            automatic.features.avx2 && automatic.features.fma
+            cfg!(target_arch = "x86_64") && automatic.features.avx2 && automatic.features.fma
         );
     }
 
