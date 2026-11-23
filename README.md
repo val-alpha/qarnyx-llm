@@ -81,9 +81,7 @@ The CPU backend executes matrix-vector and matrix-matrix operations with all
 currently registered storage types. On x86_64 hosts with AVX2+FMA, the default
 `auto` backend uses direct-block F32-input kernels for Q4_K, Q5_K, and Q6_K,
 avoiding F32 weight-row materialization. Other hosts retain the runtime-SIMD
-dequantize-then-dot path (or its portable fallback). The previous dequantized
-path remains available through the `CpuBackend::new_dequant()` API for A/B
-benchmarks.
+dequantize-then-dot path (or its portable fallback).
 
 The CPU CLI intentionally exposes only two kernel modes: `auto` and
 `fused-kq-fma`. Both select the direct-block F32-input AVX2/FMA K-quant path
@@ -99,9 +97,11 @@ Its recurrent and attention workspaces are retained in the per-session cache
 and reused across tokens/layers rather than repeatedly allocating the same
 intermediate buffers.
 
-Run the CPU microbenchmarks with `cargo bench -p qarnyx-cpu --bench kernels`.
-The harness compares scalar/reference and runtime-dispatched matvec paths,
-including opt-in fused Q4_K/Q5_K/Q6_K comparisons at selected worker counts.
+Validate the two selectable CPU kernel modes with
+`python3 scripts/cpu_kernel_cli_test.py --bin target/release/qarnyx`.
+Run the focused CPU microbenchmarks with
+`cargo bench -p qarnyx-cpu --bench kernels`; the harness compares only
+`auto` and `fused-kq-fma` for Q4_K/Q5_K/Q6_K, plus `auto` worker scaling.
 Cargo's bench profile is optimized by default; do not pass `--release` to
 `cargo bench`.
 
