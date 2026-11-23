@@ -1,3 +1,8 @@
+> **Current kernel policy:** only `auto` and `fused-kq-fma` are selectable.
+> Historical benchmark sections below may contain retired kernel names and
+> measurements from earlier revisions; those names are not valid CLI options
+> on the current branch.
+
 # Qarnyx benchmarking protocol
 
 This document defines a repeatable end-to-end CLI comparison. Keep the same
@@ -49,7 +54,7 @@ MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-4096}"
 MAX_CACHE_MIB="${MAX_CACHE_MIB:-512}"
 MAX_MEMORY_MIB="${MAX_MEMORY_MIB:-8192}"
 
-KERNELS=(auto fused-q4k fused-qk scalar)
+KERNELS=(auto fused-kq-fma)
 WORKERS=(1 2 4 6 8 10)
 
 tmpdir="$(mktemp -d)"
@@ -91,10 +96,11 @@ done
 echo "Wrote $RESULTS"
 ```
 
-Adjust `KERNELS` and `WORKERS` to the hardware under test. If a format is
-not supported by the selected model, omit kernel modes that do not apply.
-The `scalar` mode is a correctness/performance reference, not necessarily a
-production recommendation.
+Keep the kernel matrix intentionally small: `auto` is the production/default
+mode and `fused-kq-fma` is the explicit optimized path. Use the worker sweep
+only when investigating CPU scaling; do not reintroduce retired kernel modes
+just to enlarge the test matrix. Portable scalar/dequantization code remains
+internal and is covered by unit tests rather than exposed as a CLI mode.
 
 ## Interpret the results
 
