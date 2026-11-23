@@ -135,15 +135,15 @@ RMSNorm requires a positive finite epsilon. RoPE pairs the first and second
 halves of one head vector, matching the split-half convention used by
 LLaMA-style rotary embeddings. Softmax rejects empty or non-finite inputs.
 
-The explicit `fused-q4k` mode computes directly from packed Q4_K blocks without
-materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
-falls back to the scalar direct-block dot elsewhere. The explicit `fused-qk`
-mode extends direct-block matvec to Q5_K and Q6_K, using AVX2 on supported
-x86_64 CPUs and scalar direct-block references elsewhere; it also enables the
-fused Q4_K path. The automatic mode selects the F32-input direct-block K-quant
-kernels when AVX2+FMA are available. The explicit `llama-q4k` and
-`fused-q4k` modes remain available for controlled A/B comparisons. RMSNorm,
-RoPE, softmax, and residual addition currently use scalar implementations.
+The CPU runtime intentionally keeps only two selectable kernel modes: `auto`
+and `fused-kq-fma`. On x86_64 with AVX2+FMA, both use the direct-block
+F32-input Q4_K/Q5_K/Q6_K path. `auto` is the production/default mode and
+retains the portable fallback when the required ISA is unavailable;
+`fused-kq-fma` exposes the optimized path explicitly for controlled
+benchmarking. Older experimental Q4_K/Q8_K and direct-block variants were
+removed from the selectable surface to keep runtime dispatch and tests small.
+RMSNorm, RoPE, softmax, and residual addition currently use scalar
+implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
