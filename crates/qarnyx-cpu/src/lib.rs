@@ -7,9 +7,7 @@
 //! and portable fallback. Large matrix operations partition independent rows.
 
 use qarnyx_core::{Backend, BackendError, DType, TensorView};
-use qarnyx_quant::{
-    dequantize_into, encoded_len,
-};
+use qarnyx_quant::{dequantize_into, encoded_len};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -624,8 +622,11 @@ impl Backend for CpuBackend {
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut q4k_sums: &[f32] = &[];
         #[cfg(target_arch = "x86_64")]
-        if fused_kq_fma && matches!(weights.dtype, DType::Q4K | DType::Q5K)
-            && self.simd_enabled && self.features.avx2 && self.features.fma
+        if fused_kq_fma
+            && matches!(weights.dtype, DType::Q4K | DType::Q5K)
+            && self.simd_enabled
+            && self.features.avx2
+            && self.features.fma
         {
             let groups = in_features / 32;
             let buffer: &mut [f32] = if groups <= q4k_sums_stack.len() {
@@ -657,12 +658,8 @@ impl Backend for CpuBackend {
                         )
                     })?;
 
-                    *output_value = self.fused_kq_fma_dot(
-                        weights.dtype,
-                        encoded_row,
-                        input,
-                        q4k_sums,
-                    )?;
+                    *output_value =
+                        self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?;
                 }
                 return Ok(());
             }
