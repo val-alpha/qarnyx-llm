@@ -34,7 +34,14 @@ Build once before collecting measurements:
 
 ```bash
 cargo build --release -p qarnyx-cli
+python3 scripts/cpu_kernel_cli_test.py --bin target/release/qarnyx
 ```
+
+The Python smoke test verifies that help advertises exactly `auto` and
+`fused-kq-fma`, that both are accepted by the argument parser, and that the
+retired `fused-q4k`, `llama-q4k`, `fused-qk`, and `scalar` CLI values are
+rejected. It uses a deliberately missing model path, so no model download or
+inference run is required.
 
 The following Bash example runs one warm-up and five measured trials for each
 kernel/worker combination. It writes elapsed wall time, peak process RSS, and
