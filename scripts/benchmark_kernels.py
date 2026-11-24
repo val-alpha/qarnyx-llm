@@ -72,7 +72,9 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_once(args: argparse.Namespace, kernel: str) -> tuple[float, str, str]:
+def run_once(
+    args: argparse.Namespace, kernel: str, *, profile: bool = False
+) -> tuple[float, str, str]:
     binary = args.bin.expanduser().resolve()
     model = args.model.expanduser().resolve()
     if not binary.is_file():
@@ -108,7 +110,7 @@ def run_once(args: argparse.Namespace, kernel: str) -> tuple[float, str, str]:
     ]
 
     env = os.environ.copy()
-    if args.profile:
+    if profile:
         env["QARNYX_PROFILE"] = "1"
     else:
         env.pop("QARNYX_PROFILE", None)
@@ -171,7 +173,7 @@ def main() -> int:
                     "workers": args.workers,
                     "run": run_index,
                     "elapsed_seconds": f"{elapsed:.6f}",
-                    "profiled": str(args.profile).lower(),
+                    "profiled": "false",
                     "output_sha256": output_hash,
                 }
             )
@@ -224,10 +226,9 @@ def main() -> int:
     print(f"  output SHA-256: {next(iter(all_hashes))}")
     print(f"  CSV: {csv_path}")
     if args.profile:
-        print(
-            "  NOTE: profiling was enabled; do not compare these wall times "
-            "with unprofiled runs."
-        )
+        print("\\nRunning separate instrumented phase-profile samples (not timed above).")
+        for kernel in KERNELS:
+            run_once(args, kernel, profile=True)
     return 0
 
 
