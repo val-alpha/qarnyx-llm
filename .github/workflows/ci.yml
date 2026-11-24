@@ -28,7 +28,8 @@ jobs:
           python3 -m py_compile \
             scripts/api_test.py \
             scripts/api_load_test.py \
-            scripts/cpu_kernel_cli_test.py
+            scripts/cpu_kernel_cli_test.py \
+            scripts/benchmark_kernels.py
           bash -n scripts/api-test.sh
 
       - name: Verify clean skip when API server is offline
