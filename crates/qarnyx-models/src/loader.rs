@@ -1,9 +1,9 @@
 use qarnyx_core::{DType, TensorView};
 use qarnyx_gguf::{GgufFile, TensorInfo};
-use qarnyx_quant::{dequantize, GgmlType};
+use qarnyx_quant::{GgmlType, dequantize};
 use thiserror::Error;
 
-use crate::{forward_block_with_cache, LlamaConfig, LlamaKvCache, LlamaLayerWeights, ModelError};
+use crate::{LlamaConfig, LlamaKvCache, LlamaLayerWeights, ModelError, forward_block_with_cache};
 
 /// Errors raised while mapping a parsed GGUF tensor directory onto a
 /// LLaMA-style model.
@@ -107,8 +107,8 @@ impl<'a> LlamaModel<'a> {
     /// Matrix tensor payloads are borrowed directly from `data`; the caller
     /// must keep the GGUF byte buffer alive for the lifetime of this model.
     pub fn from_gguf(gguf: &GgufFile, data: &'a [u8]) -> Result<Self, TensorLoadError> {
-        let config =
-            LlamaConfig::from_gguf(gguf).map_err(|error| TensorLoadError::Config(error.to_string()))?;
+        let config = LlamaConfig::from_gguf(gguf)
+            .map_err(|error| TensorLoadError::Config(error.to_string()))?;
         let mut layers = Vec::with_capacity(config.block_count);
 
         for block in 0..config.block_count {
@@ -121,12 +121,8 @@ impl<'a> LlamaModel<'a> {
             "token_embd.weight",
             &[token_count(gguf)?, config.embedding_length],
         )?;
-        let output_norm = load_f32_tensor(
-            gguf,
-            data,
-            "output_norm.weight",
-            &[config.embedding_length],
-        )?;
+        let output_norm =
+            load_f32_tensor(gguf, data, "output_norm.weight", &[config.embedding_length])?;
         // Some LLaMA GGUFs tie the LM head to token embeddings and omit
         // output.weight. Reuse the embedding matrix in that case.
         let output = match find_tensor(gguf, "output.weight") {
@@ -157,15 +153,28 @@ impl<'a> LlamaModel<'a> {
     /// Decode one token embedding row from the GGUF storage.
     pub fn embed_token(&self, token_id: usize) -> Result<Vec<f32>, ModelError> {
         if token_id >= self.vocab_size() {
-            return Err(ModelError::InvalidConfig("token ID is outside the model vocabulary"));
+            return Err(ModelError::InvalidConfig(
+                "token ID is outside the model vocabulary",
+            ));
         }
         let row_bytes = self.token_embedding.data.len() / self.token_embedding.shape[0];
-        let start = token_id.checked_mul(row_bytes)
-            .ok_or(ModelError::InvalidConfig("token embedding row offset overflowed"))?;
-        let end = start.checked_add(row_bytes)
-            .ok_or(ModelError::InvalidConfig("token embedding row end overflowed"))?;
-        let row = self.token_embedding.data.get(start..end)
-            .ok_or(ModelError::InvalidConfig("token embedding row is outside tensor payload"))?;
+        let start = token_id
+            .checked_mul(row_bytes)
+            .ok_or(ModelError::InvalidConfig(
+                "token embedding row offset overflowed",
+            ))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or(ModelError::InvalidConfig(
+                "token embedding row end overflowed",
+            ))?;
+        let row = self
+            .token_embedding
+            .data
+            .get(start..end)
+            .ok_or(ModelError::InvalidConfig(
+                "token embedding row is outside tensor payload",
+            ))?;
         let raw_type = ggml_type_from_dtype(self.token_embedding.dtype);
         qarnyx_quant::dequantize(raw_type, &[self.config.embedding_length as u64], row)
             .map_err(|_| ModelError::InvalidConfig("failed to decode token embedding"))
@@ -284,12 +293,7 @@ fn load_layer<'a>(
             &format!("{prefix}.attn_output.weight"),
             &[hidden, hidden],
         )?,
-        ffn_norm: load_f32_tensor(
-            gguf,
-            data,
-            &format!("{prefix}.ffn_norm.weight"),
-            &[hidden],
-        )?,
+        ffn_norm: load_f32_tensor(gguf, data, &format!("{prefix}.ffn_norm.weight"), &[hidden])?,
         gate_proj: load_weight(
             gguf,
             data,
@@ -369,9 +373,8 @@ fn token_count(gguf: &GgufFile) -> Result<usize, TensorLoadError> {
             &[0, 0],
         ));
     }
-    usize::try_from(tensor.dimensions[1]).map_err(|_| TensorLoadError::Config(
-        "token vocabulary size does not fit usize".into(),
-    ))
+    usize::try_from(tensor.dimensions[1])
+        .map_err(|_| TensorLoadError::Config("token vocabulary size does not fit usize".into()))
 }
 
 fn ggml_type_from_dtype(dtype: DType) -> u32 {
@@ -410,22 +413,17 @@ fn validate_shape(tensor: &TensorInfo, expected: &[usize]) -> Result<(), TensorL
     Ok(())
 }
 
-fn tensor_bytes<'a>(
-    tensor: &TensorInfo,
-    data: &'a [u8],
-) -> Result<&'a [u8], TensorLoadError> {
-    let offset = usize::try_from(tensor.file_offset).map_err(|_| {
-        TensorLoadError::OffsetTooLarge {
+fn tensor_bytes<'a>(tensor: &TensorInfo, data: &'a [u8]) -> Result<&'a [u8], TensorLoadError> {
+    let offset =
+        usize::try_from(tensor.file_offset).map_err(|_| TensorLoadError::OffsetTooLarge {
             name: tensor.name.clone(),
             value: tensor.file_offset,
-        }
-    })?;
-    let byte_len = usize::try_from(tensor.byte_len).map_err(|_| {
-        TensorLoadError::ByteLengthTooLarge {
+        })?;
+    let byte_len =
+        usize::try_from(tensor.byte_len).map_err(|_| TensorLoadError::ByteLengthTooLarge {
             name: tensor.name.clone(),
             value: tensor.byte_len,
-        }
-    })?;
+        })?;
     let end = offset
         .checked_add(byte_len)
         .ok_or(TensorLoadError::PayloadOutOfBounds {
@@ -510,43 +508,39 @@ mod tests {
 
     fn build_tiny_llama_gguf() -> Vec<u8> {
         let tensors = [
-            ("token_embd.weight", vec![
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
-            ], vec![4_u64, 4]),
+            (
+                "token_embd.weight",
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                vec![4_u64, 4],
+            ),
             ("output_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4_u64]),
-            ("output.weight", vec![
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
-            ], vec![4_u64, 4]),
-            ("blk.0.attn_norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4_u64]),
+            (
+                "output.weight",
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                vec![4_u64, 4],
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                vec![1.0, 1.0, 1.0, 1.0],
+                vec![4_u64],
+            ),
             (
                 "blk.0.attn_q.weight",
                 vec![
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
-                    1.0,
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
                 ],
                 vec![4, 4],
             ),
-            (
-                "blk.0.attn_k.weight",
-                vec![0.0; 8],
-                vec![4, 2],
-            ),
-            (
-                "blk.0.attn_v.weight",
-                vec![0.0; 8],
-                vec![4, 2],
-            ),
+            ("blk.0.attn_k.weight", vec![0.0; 8], vec![4, 2]),
+            ("blk.0.attn_v.weight", vec![0.0; 8], vec![4, 2]),
             (
                 "blk.0.attn_output.weight",
                 vec![
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
-                    1.0,
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
                 ],
                 vec![4, 4],
             ),
@@ -570,11 +564,7 @@ mod tests {
         push_metadata_u32(&mut bytes, "llama.attention.head_count_kv", 1);
         push_metadata_u32(&mut bytes, "llama.attention.key_length", 2);
         push_metadata_u32(&mut bytes, "llama.attention.value_length", 2);
-        push_metadata_f32(
-            &mut bytes,
-            "llama.attention.layer_norm_rms_epsilon",
-            1.0e-5,
-        );
+        push_metadata_f32(&mut bytes, "llama.attention.layer_norm_rms_epsilon", 1.0e-5);
 
         push_metadata_f32(&mut bytes, "llama.rope.freq_base", 10000.0);
 

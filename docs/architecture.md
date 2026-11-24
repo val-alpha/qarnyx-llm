@@ -119,23 +119,37 @@ Matvec weights use [out_features, in_features] row-major logical shape and
 produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
-storage lengths and do not materialize a full F32 matrix. The automatic Q4_K
-matvec path decodes the active row into reusable F32 scratch for the AVX2/FMA
-dot. Other quantized matvec/matmul paths also decode only the active weight row
-into reusable F32 scratch. RMSNorm requires a positive finite epsilon. RoPE
-pairs the first and second halves of one head vector, matching the split-half
-convention used by LLaMA-style rotary embeddings. Softmax rejects empty or
-non-finite inputs.
+storage lengths and do not materialize a full F32 matrix. On x86_64 with AVX2
+and FMA, Q4_K/Q5_K/Q6_K matvecs quantize their F32 activation vector into
+reusable Q8_K blocks and execute integer SIMD dot products against packed
+weights. Q4_K/Q5_K minimum terms and the Q6_K -32 offset use Q8_K partial sums.
+Batched projections with the same input share one Q8_K buffer. CPUs without
+both features keep the runtime-SIMD dequantize-plus-dot fallback. The selectable
+CPU surface stays intentionally small: `auto` is the default dispatch mode
+and `fused-kq-fma` selects the same optimized path for controlled comparisons.
 
-The opt-in `fused-q4k` mode computes directly from packed Q4_K blocks without
-materializing an F32 row. It uses runtime AVX2/FMA on supported x86_64 CPUs and
-falls back to the scalar direct-block dot elsewhere. The opt-in `fused-qk`
-mode extends direct-block matvec to Q5_K and Q6_K, using AVX2 on supported
-x86_64 CPUs and scalar direct-block references elsewhere; it also enables the
-fused Q4_K path. Keep `auto` as the dequantize-plus-AVX2/FMA baseline. Fused
-paths are hardware- and workload-dependent and must remain opt-in until
-representative target-machine measurements are repeatable. RMSNorm, RoPE,
-softmax, and residual addition currently use scalar implementations.
+General matvec and matmul fallbacks reuse a per-thread F32 scratch allocation.
+Large operations are partitioned by encoded weight bytes into several tasks
+per worker, while small operations avoid Rayon scheduling overhead. The Q8_K
+activation scratch is also retained per thread and reused across matvec calls;
+matvec_batch prepares it once before scheduling projections that share input.
+F32 matmul decodes up to four weight rows together and uses an AVX2/FMA
+register tile to reuse each input vector across those rows when the tile and
+shape fit. This is a F32 GEMM micro-kernel after row decoding, not a packed
+Q4_Kx8 GEMM.
+RMSNorm requires a positive finite epsilon. RoPE pairs the first and second
+halves of one head vector, matching the split-half convention used by
+LLaMA-style rotary embeddings. Softmax rejects empty or non-finite inputs.
+
+The CPU runtime intentionally keeps only two selectable kernel modes: `auto`
+and `fused-kq-fma`. On x86_64 with AVX2+FMA, both use the Q8_K activation
+quantization and integer-dot Q4_K/Q5_K/Q6_K path. `auto` is the
+production/default mode and retains the portable fallback when the required
+ISA is unavailable; `fused-kq-fma` exposes the optimized path explicitly for
+controlled benchmarking. Earlier F32-input direct-block kernels are no longer
+the active K-quant matvec path.
+RMSNorm, RoPE, softmax, and residual addition currently use scalar
+implementations.
 
 The `workers` setting controls a persistent Rayon thread pool owned by the CPU
 backend. The pool is created once during backend construction and reused for
@@ -146,8 +160,8 @@ projection completes before the model continues. Small matrices remain on the
 single-threaded path to avoid scheduling overhead. Benchmark worker counts
 1, 2, 4, 6, 8, and 10 on the target VPS because scheduler contention and memory
 bandwidth may make fewer workers faster. Run
-`cargo bench -p qarnyx-cpu --bench kernels` to compare scaling for F32 and Q4_K
-matvec in addition to the storage-format comparisons.
+`cargo bench -p qarnyx-cpu --bench kernels` for focused comparisons of the
+retained `auto` and `fused-kq-fma` paths.
 
 The scalar implementation is the correctness oracle. SIMD implementations
 must be compared against it with documented tolerances and must pass
@@ -155,15 +169,21 @@ correctness tests before dispatch is enabled.
 
 ## CPU execution strategy
 
-Keep the scalar backend as the correctness reference and dispatch by runtime
-feature detection:
-- x86_64: AVX2/FMA matvec and matmul kernels are implemented;
-- x86_64: opt-in direct-block Q4_K matvec uses AVX2/FMA; scalar fallback is
-  available when those features are absent;
-- x86_64: opt-in direct-block Q5_K/Q6_K matvec uses AVX2 and selects FMA
-  accumulation when supported, with AVX2-only and scalar fallbacks;
-- aarch64: NEON kernels remain planned;
-- all other configurations: scalar fallback.
+Keep portable scalar/dequantization code internal as a correctness reference
+and fallback. The public CLI exposes only two selectable modes:
+- `auto`: production/default runtime dispatch; uses Q8_K activations and
+  Q4_K/Q5_K/Q6_K AVX2 integer-dot kernels on supported x86_64 CPUs, with
+  portable fallback otherwise;
+- `fused-kq-fma`: explicit selection of that same Q8_K/integer-dot path for
+  controlled comparisons; it is not a separate algorithm from the current
+  `auto` fast path;
+- aarch64: portable fallback until a NEON implementation is separately
+  validated;
+- other configurations: portable fallback.
+
+Do not add selectable kernel variants without a reproducible target-machine
+throughput gain and correctness evidence. Internal scalar reference code is
+not a third CLI kernel mode.
 
 Do not compile the default release build with target-cpu=native. That setting
 can produce a binary that fails on a different CPU. Use it only for
@@ -400,24 +420,25 @@ Remaining target validation:
 - Add process-wide admission/concurrency controls only when the serving layer
   is designed; do not start HTTP serving inside M7.
 
-## M8 - API and serving layer (planned)
+## M8 - API and serving layer (implemented; protocol parity remains scoped)
 
-M8 starts only after the runtime generation contract is stable. It is an API
-adapter/serving layer, not another model or inference layer.
+M8 is an API adapter/serving layer, not another model or inference layer. OpenAI,
+Anthropic, and native Qarnyx requests are translated to one protocol-neutral
+request contract before reaching the runtime.
 
-Architecture target:
+Architecture:
 
 ```text
 OpenAI request ─┐
-Anthropic       ├──> API adapter ──> common GenerationRequest
-Native Qarnyx ─┘                         │
-                                         ▼
-                                  Qarnyx Runtime
-                                         │
-                                         ▼
-                              common GenerationResult
-                                ├── normal response
-                                └── streaming events
+Anthropic       ├──> protocol adapters ──> GenerationRequest
+Native Qarnyx ─┘                              │
+                                              ▼
+                                       Qarnyx Runtime
+                                              │
+                                              ▼
+                                       GenerationOutput
+                                         ├── JSON response
+                                         └── streaming events
 ```
 
 Milestones:
@@ -428,32 +449,139 @@ Milestones:
   Prompt tokens and end-of-turn markers are not emitted as completion events.
   Blocking generation remains backward compatible and bypasses stream decoder
   and callback work. Event callbacks run synchronously on the generation
-  thread and can request cooperative cancellation through
-  `CancellationToken`.
-- M8-B OpenAI-compatible API: map OpenAI chat/completions-style requests onto
-  the common generation request and map results/events back to the expected
-  response or stream format.
-- M8-C Anthropic Messages-compatible API: provide the corresponding adapter
-  using the same runtime request/event contract.
-- M8-D Native Qarnyx API: expose the runtime's native request/configuration
-  surface without forcing vendor-specific semantics.
-- M8-E Common API abstraction: keep authentication, HTTP routing, JSON parsing,
-  SSE/stream transport, and protocol-specific validation in the serving/API
-  layer rather than in qarnyx-runtime.
+  thread and can request cooperative cancellation through `CancellationToken`.
+- M8-B OpenAI-compatible API (implemented): `qarnyx-api` exposes
+  `GET /v1/models` and `POST /v1/chat/completions`, including JSON completion
+  responses, OpenAI-style SSE chunks, `data: [DONE]`, token usage, supported
+  chat roles, sampling controls, and client-executed function tool calls.
+  Tool-call requests and tool-result history are normalized before prompt
+  formatting; the server never executes client functions.
+- M8-C Anthropic Messages-compatible API (implemented): `POST /v1/messages`
+  accepts system instructions, user/assistant text, text content blocks,
+  function tools, `auto`/`any`/named-tool choices, assistant `tool_use`
+  history, and user `tool_result` blocks. JSON responses use Anthropic message
+  and content-block shapes. Streaming uses message/content-block lifecycle
+  events and text/input-JSON deltas. Tool execution remains the client's
+  responsibility.
+- M8-D Native Qarnyx API (implemented): `POST /v1/generate` accepts a raw
+  prompt plus a native `config` containing `max_new_tokens`,
+  `max_context_tokens`, `max_cache_mib`, `temperature`, `top_k`,
+  `top_p`, and `seed`. Raw prompts are not wrapped in vendor chat syntax.
+  JSON responses expose generated token IDs and usage. Streaming emits native
+  token, text-delta, completion, and done events.
+- M8-F Tool-call reliability (implemented; model-backed validation remains):
+  tool instructions explicitly describe the forced-choice contract and the
+  Qarnyx JSON envelope. Model output normalization accepts that envelope,
+  Qwen-style `<tool_call>` JSON blocks, single-call JSON objects, and
+  OpenAI-shaped function-call objects. Encoded JSON-string arguments are
+  decoded into objects; unknown function names, mismatched forced choices,
+  malformed JSON, and non-object arguments are rejected. A model that ignores
+  a valid forced-tool request is reported as a server-side model-output error,
+  not as an invalid client request. Tool execution remains client-owned.
+- M8-E Common API abstraction (implemented): all adapters normalize prompt
+  text and `GenerationConfig` into the public, protocol-neutral
+  `GenerationRequest` contract in `qarnyx-api::common`. The shared
+  `ApiState::prepare_generation` validates limits, tokenizes the prompt, and
+  produces the same prepared request consumed by the single runtime dispatch
+  path. `GenerationOutput` presents generated-only token IDs and shared usage
+  counts to protocol response serializers. HTTP routing, JSON decoding,
+  protocol validation, SSE transport, and authentication boundaries remain in
+  `qarnyx-api`; vendor-specific protocol code is not added to
+  `qarnyx-runtime`.
+- M8-G Serving hardening (implemented; live overload/disconnect tests remain):
+  the server acquires a process-wide inference permit before prompt tokenization
+  and rejects saturation immediately with HTTP 429 and `Retry-After: 1`; it
+  does not accumulate an unbounded inference queue. The configured memory
+  admission reserves the per-request cache allowance multiplied by
+  `max_concurrent_requests` before accepting the model file. `/health` and
+  `/ready` expose active and maximum request slots. Each request receives an
+  independently cancellable token linked to the server shutdown token; SSE
+  receiver closure and dropped non-stream handlers request cancellation, and
+  Ctrl+C/SIGTERM cancel active inference at token boundaries. This is an
+  admission envelope, not an operating-system RSS limit.
+- M8-H Protocol compatibility (implemented; parity remains scoped):
+  OpenAI Chat Completions accepts `stop` as a non-empty string or an array of
+  1–4 strings, excludes the matched stop text, and reports `finish_reason:
+  "stop"`. It also accepts `response_format.type="json_object"`; the adapter
+  adds a JSON-only prompt instruction, buffers streamed JSON, and validates
+  that the final result is a JSON object. This is prompt-guided output
+  validation, not grammar-constrained decoding. Anthropic Messages accepts
+  `stop_sequences` (up to 16 sequences under the Qarnyx implementation guard)
+  and returns the matched `stop_sequence` with
+  `stop_reason="stop_sequence"`; `metadata.user_id` is accepted and validated
+  up to 512 characters but is not persisted. Stop detection occurs on decoded
+  text at token boundaries.
 
-Streaming should be implemented first because OpenAI, Anthropic, and native
-protocols can then share the same runtime event source. The API layer must not
-duplicate generation loops or model-specific logic.
+Implementation limits (not a claim of full vendor API parity):
+- The API currently serves one loaded GGUF model per server process and
+  supports the LLaMA and Qwen3.5 runtime architectures.
+- Multimodal content, OpenAI logprobs, broad vendor-specific parameter parity,
+  model-specific LLaMA chat templates, and built-in authentication remain
+  outstanding. Native `/v1/generate` intentionally remains a raw-prompt
+  endpoint and does not accept vendor stop/response-format fields.
+- Anthropic system and message content is text-only. Unsupported content block
+  types and unsupported request fields are rejected rather than silently
+  ignored.
+- The native endpoint is a deliberately small, explicit runtime surface. It
+  exposes the currently supported generation configuration, not internal
+  model/cache implementation details.
+- Tool execution is always performed by the client. Qarnyx formats and returns
+  tool calls and accepts the corresponding tool-result history; it does not
+  invoke external functions.
+- Tool calling remains model-dependent: a forced `tool_choice` cannot guarantee
+  that a small or instruction-insensitive model will emit a valid function call.
+  Qarnyx validates and rejects invalid output; it does not invent or infer tool
+  arguments from ordinary assistant text.
 
-Model-specific chat formatting remains below M8: Qwen3.5 ChatML templates,
-thinking-mode control tokens, and end-of-turn handling belong to the tokenizer
-and model/runtime integration rather than the HTTP protocol adapters.
+All three adapters share the runtime event source and the same non-blocking
+request-admission gate. Saturated inference requests receive HTTP 429 rather
+than waiting in a server-side queue. They must not duplicate model forward
+passes, decode loops, or model-specific prompt-formatting logic. Model-specific chat
+formatting remains below M8: Qwen3.5 ChatML templates, thinking-mode control
+tokens, and end-of-turn handling belong to tokenizer/model integration rather
+than HTTP protocol adapters.
 
 ## Benchmark methodology
 
-The repeatable CLI benchmark procedure, command template, CSV fields, warm-up
-rules, and interpretation limits are maintained in
-[docs/benchmarking.md](benchmarking.md). CLI wall-clock results include model
-loading and request setup as well as generation; they are not decode-only
-throughput measurements. Do not infer end-to-end performance from synthetic
-kernel tests alone.
+The repeatable CLI comparison, two-mode Python runner, phase-profiling output,
+CSV fields, warm-up rules, and interpretation limits are maintained in
+[docs/benchmarking.md](benchmarking.md). Whole-process timings include model
+loading and request setup; Qwen3.5 profiling separately reports prompt prefill,
+decode-loop, decode-forward, and per-operator aggregates. Do not infer
+end-to-end performance from synthetic kernel tests alone.
+
+
+## M9 - CPU performance gap closure (in progress)
+
+M9 focuses on measurable Qwen3.5 2B CPU performance, not expanding the kernel
+menu. Keep only `auto` and `fused-kq-fma` as selectable modes. The existing
+scalar/dequantization code remains internal for fallback and differential
+correctness checks.
+
+- **M9-A — Baseline and phase profiling:** separate Qwen3.5 prompt prefill from
+  autoregressive decode; report prefill tokens/sec, decode-loop tokens/sec,
+  decode-forward tokens/sec, and per-operator totals by phase. Add one
+  standard-library benchmark runner that compares only the two retained modes,
+  uses warm-up and round-robin trials, checks output hashes, and records median
+  and range.
+- **M9-B — Quantized GEMV:** Q8_K activation quantization and AVX2 integer-dot
+  kernels for Q4_K/Q5_K/Q6_K are implemented. Activation blocks are reused
+  across batched projections; partial sums handle Q4_K/Q5_K minimum
+  corrections and the Q6_K -32 bias. Scalar-oracle regression tests are added.
+  Target-host performance validation remains required before claiming a speedup.
+- **M9-C — Fused elementwise operations:** optimize only operators proven
+  material by M9-A profiling, such as RMSNorm, RoPE, softmax, activation, or
+  recurrent-state updates. Avoid speculative SIMD work on negligible phases.
+- **M9-D — Prefill matrix path:** measure prompt prefill separately and assess
+  tiled/repacked quantized GEMM only if projection matmul is a significant
+  bottleneck. Keep the decode path and model outputs unchanged.
+- **M9-E — Final validation:** compare the same GGUF, prompt, output-token
+  count, worker count, compiler/build, and host conditions against llama.cpp.
+  Report prefill and decode separately, output parity, median/spread, and peak
+  RSS. Historical or synthetic kernel timings are not substitutes for this
+  end-to-end evidence.
+
+M9 changes should be narrow and reversible: one measured bottleneck per
+change, a focused numerical regression test, and the same two-mode
+whole-model benchmark. Do not multiply kernel variants or create a large
+cross-product test matrix.

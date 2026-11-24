@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/m8-a-cli-token-streaming
   pull_request:
 
 permissions:
@@ -21,6 +23,21 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Validate Python test runner syntax
+        run: |
+          python3 -m py_compile \
+            scripts/api_test.py \
+            scripts/api_load_test.py \
+            scripts/cpu_kernel_cli_test.py \
+            scripts/benchmark_kernels.py
+          python3 scripts/benchmark_kernels.py --help >/dev/null
+          bash -n scripts/api-test.sh
+
+      - name: Verify clean skip when API server is offline
+        run: |
+          bash scripts/api-test.sh --skip-build --base-url http://127.0.0.1:1
+          python3 scripts/api_load_test.py --base-url http://127.0.0.1:1
+
       # Run build and tests before the repository-wide formatting gate.
       # Existing formatting debt should not hide compiler or test diagnostics.
       - name: Check workspace
@@ -28,6 +45,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Validate retained CPU kernel CLI modes
+        run: |
+          cargo build -p qarnyx-cli
+          python3 scripts/cpu_kernel_cli_test.py --bin target/debug/qarnyx
 
       - name: Check formatting
         run: cargo fmt --all -- --check

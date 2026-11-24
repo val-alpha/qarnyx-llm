@@ -1,0 +1,29 @@
+[package]
+name = "qarnyx-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "qarnyx-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+bytes = "1"
+clap.workspace = true
+qarnyx-cpu = { path = "../qarnyx-cpu" }
+qarnyx-gguf = { path = "../qarnyx-gguf" }
+qarnyx-models = { path = "../qarnyx-models" }
+qarnyx-runtime = { path = "../qarnyx-runtime" }
+qarnyx-tokenizer = { path = "../qarnyx-tokenizer" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tokio-stream = "0.1"
+
+[lints]
+workspace = true

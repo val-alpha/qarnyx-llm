@@ -3,7 +3,7 @@
 //! The parser reads the header, metadata, tensor directory, and validates each
 //! tensor's complete encoded byte range without reading payload bytes.
 
-use qarnyx_quant::{encoded_len, QuantError};
+use qarnyx_quant::{QuantError, encoded_len};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -220,14 +220,17 @@ impl fmt::Display for GgufError {
                 f,
                 "tensor {tensor} uses unsupported GGML type ID {ggml_type}"
             ),
-            Self::InvalidTensorEncoding { tensor, ggml_type, reason } => write!(
+            Self::InvalidTensorEncoding {
+                tensor,
+                ggml_type,
+                reason,
+            } => write!(
                 f,
                 "tensor {tensor} has an invalid GGML type {ggml_type} shape: {reason}"
             ),
-            Self::OverlappingTensorRanges { first, second } => write!(
-                f,
-                "tensor payload ranges overlap: {first} and {second}"
-            ),
+            Self::OverlappingTensorRanges { first, second } => {
+                write!(f, "tensor payload ranges overlap: {first} and {second}")
+            }
             Self::NonZeroPadding { offset } => {
                 write!(
                     f,
@@ -574,8 +577,8 @@ impl GgufFile {
                 return Err(GgufError::DuplicateTensorOffset(tensor.offset));
             }
 
-            let byte_len = encoded_len(tensor.ggml_type, &tensor.dimensions).map_err(|error| {
-                match error {
+            let byte_len =
+                encoded_len(tensor.ggml_type, &tensor.dimensions).map_err(|error| match error {
                     QuantError::UnsupportedType(ggml_type) => GgufError::UnsupportedGgmlType {
                         tensor: tensor.name.clone(),
                         ggml_type,
@@ -585,8 +588,7 @@ impl GgufFile {
                         ggml_type: tensor.ggml_type,
                         reason: other.to_string(),
                     },
-                }
-            })?;
+                })?;
             let relative_offset = tensor.offset;
             let relative_end = relative_offset
                 .checked_add(byte_len)
@@ -1184,7 +1186,6 @@ mod tests {
             Err(GgufError::LimitExceeded { kind: "tensor", .. })
         ));
     }
-
 
     #[test]
     fn validates_k_quant_payload_length() {

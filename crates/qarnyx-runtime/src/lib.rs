@@ -1,12 +1,15 @@
 //! Autoregressive generation orchestration for Qarnyx model execution.
 
 use qarnyx_core::Backend;
+use qarnyx_models::{
+    LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model, Qwen35Profile,
+};
+use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use qarnyx_models::{LlamaKvCache, LlamaModel, ModelError, Qwen35Cache, Qwen35Model, Qwen35Profile};
-use qarnyx_tokenizer::{GgufTokenizer, TokenizerError};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -51,6 +54,7 @@ pub enum GenerationError {
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    parents: Vec<Arc<AtomicBool>>,
 }
 
 impl CancellationToken {
@@ -58,6 +62,18 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            parents: Vec::new(),
+        }
+    }
+
+    /// Creates an independently cancellable child that is also cancelled when
+    /// this token (or any of its ancestors) is cancelled.
+    pub fn child_token(&self) -> Self {
+        let mut parents = self.parents.clone();
+        parents.push(Arc::clone(&self.cancelled));
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            parents,
         }
     }
 
@@ -66,9 +82,13 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Returns whether cancellation has been requested.
+    /// Returns whether this token or any parent has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .parents
+                .iter()
+                .any(|parent| parent.load(Ordering::Acquire))
     }
 
     fn check(&self) -> Result<(), GenerationError> {
@@ -117,22 +137,24 @@ impl Default for GenerationConfig {
 impl GenerationConfig {
     fn validate(&self) -> Result<(), GenerationError> {
         if self.max_new_tokens == 0 {
-            return Err(GenerationError::InvalidConfig("max_new_tokens must be non-zero"));
+            return Err(GenerationError::InvalidConfig(
+                "max_new_tokens must be non-zero",
+            ));
         }
         if self.max_context_tokens == 0 {
             return Err(GenerationError::InvalidConfig(
                 "max_context_tokens must be non-zero",
             ));
         }
-        if self.max_cache_mib == 0
-            || self.max_cache_mib.checked_mul(1024 * 1024).is_none()
-        {
+        if self.max_cache_mib == 0 || self.max_cache_mib.checked_mul(1024 * 1024).is_none() {
             return Err(GenerationError::InvalidConfig(
                 "max_cache_mib must be non-zero and fit in bytes",
             ));
         }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
-            return Err(GenerationError::InvalidConfig("temperature must be finite and >= 0"));
+            return Err(GenerationError::InvalidConfig(
+                "temperature must be finite and >= 0",
+            ));
         }
         if self.top_p <= 0.0 || self.top_p > 1.0 || !self.top_p.is_finite() {
             return Err(GenerationError::InvalidConfig("top_p must be in (0, 1]"));
@@ -154,9 +176,12 @@ impl GenerationConfig {
     }
 
     fn validate_cache_budget(&self, estimated_bytes: usize) -> Result<(), GenerationError> {
-        let limit_bytes = self.max_cache_mib.checked_mul(1024 * 1024).ok_or(
-            GenerationError::InvalidConfig("max_cache_mib must fit in bytes"),
-        )?;
+        let limit_bytes =
+            self.max_cache_mib
+                .checked_mul(1024 * 1024)
+                .ok_or(GenerationError::InvalidConfig(
+                    "max_cache_mib must fit in bytes",
+                ))?;
         if estimated_bytes > limit_bytes {
             return Err(GenerationError::CacheBudgetExceeded {
                 estimated_bytes,
@@ -175,17 +200,23 @@ fn estimate_llama_cache_bytes(
     let key_width = config
         .attention_head_count_kv
         .checked_mul(config.attention_key_length)
-        .ok_or(GenerationError::InvalidConfig("LLaMA KV key width overflow"))?;
+        .ok_or(GenerationError::InvalidConfig(
+            "LLaMA KV key width overflow",
+        ))?;
     let value_width = config
         .attention_head_count_kv
         .checked_mul(config.attention_value_length)
-        .ok_or(GenerationError::InvalidConfig("LLaMA KV value width overflow"))?;
+        .ok_or(GenerationError::InvalidConfig(
+            "LLaMA KV value width overflow",
+        ))?;
     key_width
         .checked_add(value_width)
         .and_then(|width| width.checked_mul(config.block_count))
         .and_then(|floats| floats.checked_mul(context_tokens))
         .and_then(|floats| floats.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or(GenerationError::InvalidConfig("LLaMA KV cache size overflow"))
+        .ok_or(GenerationError::InvalidConfig(
+            "LLaMA KV cache size overflow",
+        ))
 }
 
 /// Result of an autoregressive generation run.
@@ -287,11 +318,7 @@ mod tests {
             self.inner.silu_mul(gate, up)
         }
 
-        fn residual_add(
-            &self,
-            target: &mut [f32],
-            residual: &[f32],
-        ) -> Result<(), BackendError> {
+        fn residual_add(&self, target: &mut [f32], residual: &[f32]) -> Result<(), BackendError> {
             self.inner.residual_add(target, residual)
         }
     }
@@ -441,7 +468,6 @@ mod tests {
         assert!(cancellation.is_cancelled());
     }
 
-
     #[test]
     fn concurrent_generation_requests_keep_session_state_isolated() {
         use std::sync::Arc;
@@ -486,9 +512,7 @@ mod tests {
                                 config,
                             )
                             .unwrap_or_else(|error| {
-                                panic!(
-                                    "session {session_id}, request {request_id} failed: {error}"
-                                )
+                                panic!("session {session_id}, request {request_id} failed: {error}")
                             });
 
                         assert_eq!(
@@ -504,7 +528,9 @@ mod tests {
             }
 
             for handle in handles {
-                handle.join().expect("generation stress-test worker panicked");
+                handle
+                    .join()
+                    .expect("generation stress-test worker panicked");
             }
         });
     }
@@ -552,6 +578,33 @@ mod tests {
 
         assert!(first.is_cancelled());
         assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn child_cancellation_is_independent_but_inherits_parent_shutdown() {
+        let shutdown = CancellationToken::new();
+        let first_request = shutdown.child_token();
+        let second_request = shutdown.child_token();
+
+        first_request.cancel();
+        assert!(first_request.is_cancelled());
+        assert!(!second_request.is_cancelled());
+        assert!(!shutdown.is_cancelled());
+
+        shutdown.cancel();
+        assert!(first_request.is_cancelled());
+        assert!(second_request.is_cancelled());
+    }
+
+    #[test]
+    fn nested_child_tokens_inherit_all_ancestor_cancellation() {
+        let root = CancellationToken::new();
+        let child = root.child_token();
+        let request = child.child_token();
+
+        child.cancel();
+        assert!(request.is_cancelled());
+        assert!(!root.is_cancelled());
     }
 
     #[test]
@@ -705,9 +758,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(cancellation.is_cancelled());
     }
-
 }
-
 
 impl LlamaGenerator {
     pub fn new(seed: u64) -> Self {
@@ -729,7 +780,12 @@ impl LlamaGenerator {
     ) -> Result<GenerationResult, GenerationError> {
         let cancellation = CancellationToken::new();
         self.generate_ids_with_cancellation(
-            model, tokenizer, backend, prompt, config, &cancellation,
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            &cancellation,
         )
     }
 
@@ -807,8 +863,7 @@ impl LlamaGenerator {
         }
         config.validate_context(prompt.len())?;
         cancellation.check()?;
-        let estimated_cache_bytes =
-            estimate_llama_cache_bytes(model, config.max_context_tokens)?;
+        let estimated_cache_bytes = estimate_llama_cache_bytes(model, config.max_context_tokens)?;
         config.validate_cache_budget(estimated_cache_bytes)?;
         cancellation.check()?;
 
@@ -929,7 +984,11 @@ impl LlamaGenerator {
         )
     }
 
-    fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        config: GenerationConfig,
+    ) -> Result<usize, GenerationError> {
         if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
             return Err(GenerationError::NonFiniteLogits);
         }
@@ -1001,7 +1060,6 @@ impl LlamaGenerator {
     }
 }
 
-
 /// Autoregressive generator for one Qwen3.5 generation stream.
 ///
 /// Model weights and the backend may be shared across requests. Each concurrent
@@ -1013,7 +1071,9 @@ pub struct Qwen35Generator {
 
 impl Qwen35Generator {
     pub fn new(seed: u64) -> Self {
-        Self { rng_state: if seed == 0 { 1 } else { seed } }
+        Self {
+            rng_state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     pub fn generate_ids<B: Backend>(
@@ -1026,7 +1086,12 @@ impl Qwen35Generator {
     ) -> Result<GenerationResult, GenerationError> {
         let cancellation = CancellationToken::new();
         self.generate_ids_with_cancellation(
-            model, tokenizer, backend, prompt, config, &cancellation,
+            model,
+            tokenizer,
+            backend,
+            prompt,
+            config,
+            &cancellation,
         )
     }
 
@@ -1119,18 +1184,32 @@ impl Qwen35Generator {
         let mut logits = Vec::new();
         let mut decoder = on_event.as_ref().map(|_| tokenizer.stream_decoder());
         let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
-        let mut profile = Qwen35Profile::default();
+        let mut prefill_profile = Qwen35Profile::default();
+        let mut decode_profile = Qwen35Profile::default();
 
+        // Profile model forward passes independently. Prefill and decode have
+        // different shapes and bottlenecks, so merging their operator totals
+        // makes the result difficult to use for kernel decisions.
+        let prefill_started = profiling.then(Instant::now);
         for (position, &token_id) in prompt.iter().enumerate() {
             cancellation.check()?;
             if profiling {
                 logits = model.forward_logits_profiled(
-                    backend, token_id, position, &mut cache, &mut profile,
+                    backend,
+                    token_id,
+                    position,
+                    &mut cache,
+                    &mut prefill_profile,
                 )?;
             } else {
                 logits = model.forward_logits(backend, token_id, position, &mut cache)?;
             }
         }
+        let prefill_elapsed = prefill_started.map_or(Duration::ZERO, |start| start.elapsed());
+
+        let mut decode_forward_elapsed = Duration::ZERO;
+        let mut decode_forward_tokens = 0_usize;
+        let decode_loop_started = profiling.then(Instant::now);
 
         for _ in 0..config.max_new_tokens {
             cancellation.check()?;
@@ -1154,14 +1233,26 @@ impl Qwen35Generator {
             }
 
             let position = cache.sequence_len;
+            let forward_started = profiling.then(Instant::now);
             if profiling {
                 logits = model.forward_logits_profiled(
-                    backend, next, position, &mut cache, &mut profile,
+                    backend,
+                    next,
+                    position,
+                    &mut cache,
+                    &mut decode_profile,
                 )?;
             } else {
                 logits = model.forward_logits(backend, next, position, &mut cache)?;
             }
+            if let Some(start) = forward_started {
+                decode_forward_elapsed += start.elapsed();
+                decode_forward_tokens += 1;
+            }
         }
+
+        let decode_loop_elapsed =
+            decode_loop_started.map_or(Duration::ZERO, |start| start.elapsed());
 
         if let Some(callback) = on_event.as_mut() {
             let final_delta = decoder
@@ -1174,7 +1265,44 @@ impl Qwen35Generator {
         }
         cancellation.check()?;
         if profiling {
-            eprintln!("{}", profile.report());
+            let generated_tokens = generated.len().saturating_sub(prompt.len());
+            let prefill_tokens_per_second = if prefill_elapsed.is_zero() {
+                0.0
+            } else {
+                prompt.len() as f64 / prefill_elapsed.as_secs_f64()
+            };
+            let decode_forward_tokens_per_second = if decode_forward_elapsed.is_zero() {
+                0.0
+            } else {
+                decode_forward_tokens as f64 / decode_forward_elapsed.as_secs_f64()
+            };
+            let decode_loop_tokens_per_second = if decode_loop_elapsed.is_zero() {
+                0.0
+            } else {
+                generated_tokens as f64 / decode_loop_elapsed.as_secs_f64()
+            };
+
+            eprintln!("Qwen3.5 phase profile:");
+            eprintln!(
+                "  prefill: prompt_tokens={} forward_ms={:.3} tokens_per_sec={:.2}",
+                prompt.len(),
+                prefill_elapsed.as_secs_f64() * 1_000.0,
+                prefill_tokens_per_second
+            );
+            eprintln!(
+                "  decode: generated_tokens={} loop_ms={:.3} loop_tokens_per_sec={:.2}",
+                generated_tokens,
+                decode_loop_elapsed.as_secs_f64() * 1_000.0,
+                decode_loop_tokens_per_second
+            );
+            eprintln!(
+                "    forward_tokens={} forward_ms={:.3} forward_tokens_per_sec={:.2}",
+                decode_forward_tokens,
+                decode_forward_elapsed.as_secs_f64() * 1_000.0,
+                decode_forward_tokens_per_second
+            );
+            eprintln!("{}", prefill_profile.report_for_phase("prefill"));
+            eprintln!("{}", decode_profile.report_for_phase("decode"));
         }
 
         Ok(GenerationResult {
@@ -1238,16 +1366,26 @@ impl Qwen35Generator {
         )
     }
 
-    fn sample(&mut self, logits: &[f32], config: GenerationConfig) -> Result<usize, GenerationError> {
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        config: GenerationConfig,
+    ) -> Result<usize, GenerationError> {
         if logits.is_empty() || logits.iter().any(|v| !v.is_finite()) {
             return Err(GenerationError::NonFiniteLogits);
         }
-        let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
         if config.temperature == 0.0 {
-            return candidates.into_iter().max_by(|a,b| a.1.total_cmp(&b.1))
-                .map(|(id,_)| id).ok_or(GenerationError::NonFiniteLogits);
+            return logits
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| id)
+                .ok_or(GenerationError::NonFiniteLogits);
         }
-        candidates.sort_by(|a,b| b.1.total_cmp(&a.1));
+
+        let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
         if config.top_k > 0 && config.top_k < candidates.len() {
             candidates.truncate(config.top_k);
         }
@@ -1259,31 +1397,40 @@ impl Qwen35Generator {
             sum += w;
             weights.push(w);
         }
-        let mut probs: Vec<(usize,f64)> = candidates.iter().zip(weights)
-            .map(|(&(id,_),w)|(id,w/sum)).collect();
+        let mut probs: Vec<(usize, f64)> = candidates
+            .iter()
+            .zip(weights)
+            .map(|(&(id, _), w)| (id, w / sum))
+            .collect();
         if config.top_p < 1.0 {
             let mut cumulative = 0.0;
             let mut keep = 0;
             for &(_, p) in &probs {
                 cumulative += p;
                 keep += 1;
-                if cumulative >= f64::from(config.top_p) { break; }
+                if cumulative >= f64::from(config.top_p) {
+                    break;
+                }
             }
             probs.truncate(keep.max(1));
         }
-        let total = probs.iter().map(|(_,p)| *p).sum::<f64>();
+        let total = probs.iter().map(|(_, p)| *p).sum::<f64>();
         let threshold = self.next_unit() * total;
         let mut cumulative = 0.0;
-        for (id,p) in probs {
+        for (id, p) in probs {
             cumulative += p;
-            if cumulative >= threshold { return Ok(id); }
+            if cumulative >= threshold {
+                return Ok(id);
+            }
         }
         Ok(candidates[0].0)
     }
 
     fn next_unit(&mut self) -> f64 {
         let mut x = self.rng_state;
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
         self.rng_state = x;
         x as f64 / u64::MAX as f64
     }

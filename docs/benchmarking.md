@@ -1,3 +1,8 @@
+> **Current kernel policy:** only `auto` and `fused-kq-fma` are selectable.
+> Historical benchmark sections below may contain retired kernel names and
+> measurements from earlier revisions; those names are not valid CLI options
+> on the current branch.
+
 # Qarnyx benchmarking protocol
 
 This document defines a repeatable end-to-end CLI comparison. Keep the same
@@ -29,7 +34,98 @@ Build once before collecting measurements:
 
 ```bash
 cargo build --release -p qarnyx-cli
+python3 scripts/cpu_kernel_cli_test.py --bin target/release/qarnyx
 ```
+
+The Python smoke test verifies that help advertises exactly `auto` and
+`fused-kq-fma`, that both are accepted by the argument parser, and that the
+retired `fused-q4k`, `llama-q4k`, `fused-qk`, and `scalar` CLI values are
+rejected. It uses a deliberately missing model path, so no model download or
+inference run is required.
+
+## Focused two-mode comparison (M9-A)
+
+For a repeatable comparison of the only retained modes, use the standard-library
+runner:
+
+```bash
+cargo build --release -p qarnyx-cli
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 \
+  --max-new-tokens 32 \
+  --warmups 1 \
+  --runs 3 \
+  --csv qarnyx-kernel-benchmark.csv
+```
+
+The runner fixes greedy sampling, uses the same seed/configuration for both
+modes, performs warm-ups, alternates `auto` and `fused-kq-fma` per measured
+trial, and records elapsed time plus output SHA-256. It refuses to summarize
+performance if output hashes differ across runs or modes. The CSV contains
+only the two retained mode names.
+
+These measurements are whole-process wall time: model loading, tokenizer
+setup, backend construction, and generation are included. Compare medians and
+ranges; do not label these values decode-only tokens/sec.
+
+Add `--profile` to run one additional instrumented sample for each mode after
+the unprofiled timing trials:
+
+```bash
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 --runs 3 --warmups 1 --profile
+```
+
+The extra profile runs are not included in the CSV timing data. For Qwen3.5,
+the runtime prints:
+- **Prefill:** prompt forward-token count, elapsed forward time, and forward
+  tokens/sec.
+- **Decode loop:** generated-token count, elapsed loop time, and loop
+  tokens/sec, including sampling and synchronous event callback overhead.
+- **Decode forward:** number of model forward evaluations, their accumulated
+  elapsed time, and forward tokens/sec, excluding sampling and output callback
+  overhead.
+- Separate per-operator aggregate tables for prefill and decode.
+
+Profiling is opt-in and adds measurement overhead. Use profile output to find
+expensive phases/operators, but use the unprofiled CSV trials for clean
+whole-process comparisons. Prefill/decode figures are model-phase measurements
+and exclude model-file loading and tokenizer/model initialization.
+
+## Q8_K quantized GEMV (M9-B)
+
+The active AVX2+FMA K-quant matvec path converts each 256-value F32
+activation block to Q8_K once, then uses integer dot products for Q4_K,
+Q5_K, and Q6_K. Q8_K stores signed int8 activations, one F32 scale, and
+sixteen partial sums (one per 16 values). Batched projections with the same
+input share the same quantized activation buffer.
+
+Compare the new build to the recorded M9-A run using the same GGUF, prompt,
+worker count, token count, binary profile, and host. The first validation
+should keep the compact two-mode run count and include the phase profile:
+
+```bash
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 \
+  --max-new-tokens 32 \
+  --warmups 1 \
+  --runs 2 \
+  --profile \
+  --csv m9-b-q8k.csv
+```
+
+The scalar/dequantization path remains the numeric oracle and portable
+fallback. Q8_K adds activation quantization error, so token hashes need only
+match across the two current CLI routes and repeated runs of the new build;
+compare numerical matvec outputs to the scalar oracle using the focused Rust
+regression tests. Do not claim a speedup until the same-host model benchmark
+shows one.
 
 The following Bash example runs one warm-up and five measured trials for each
 kernel/worker combination. It writes elapsed wall time, peak process RSS, and
@@ -49,7 +145,7 @@ MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-4096}"
 MAX_CACHE_MIB="${MAX_CACHE_MIB:-512}"
 MAX_MEMORY_MIB="${MAX_MEMORY_MIB:-8192}"
 
-KERNELS=(auto fused-q4k fused-qk scalar)
+KERNELS=(auto fused-kq-fma)
 WORKERS=(1 2 4 6 8 10)
 
 tmpdir="$(mktemp -d)"
@@ -91,10 +187,11 @@ done
 echo "Wrote $RESULTS"
 ```
 
-Adjust `KERNELS` and `WORKERS` to the hardware under test. If a format is
-not supported by the selected model, omit kernel modes that do not apply.
-The `scalar` mode is a correctness/performance reference, not necessarily a
-production recommendation.
+Keep the kernel matrix intentionally small: `auto` is the production/default
+mode and `fused-kq-fma` is the explicit optimized path. Use the worker sweep
+only when investigating CPU scaling; do not reintroduce retired kernel modes
+just to enlarge the test matrix. Portable scalar/dequantization code remains
+internal and is covered by unit tests rather than exposed as a CLI mode.
 
 ## Interpret the results
 
@@ -239,11 +336,13 @@ not establish whether 2, 4, 6, or 8 workers would be optimal.
 
 ## Known benchmark limitations
 
-The current CLI runs one blocking generation per process and prints the final
-text after generation. It does not expose token streaming, time-to-first-token,
-or independent prefill/decode timers. End-to-end CLI timing therefore remains
-the reliable metric available from this command-line path until a dedicated
-benchmark harness is added.
+The CLI runs one generation per process. Whole-process wall time includes
+model loading and setup, so it is not a substitute for the Qwen3.5 phase
+profile. The current profiler separates prompt prefill and autoregressive
+decode, but its decode loop metric includes greedy sampling and any synchronous
+stream callback. The decode-forward metric isolates model forward evaluations
+more closely. Profiling is currently Qwen3.5-specific; do not assume identical
+phase instrumentation for the LLaMA path.
 
 
 ## User-reported VPS Q4_K fused-q4k worker scaling (2026-11-19)

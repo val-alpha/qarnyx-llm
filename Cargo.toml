@@ -9,6 +9,7 @@ members = [
     "crates/qarnyx-models",
     "crates/qarnyx-runtime",
     "crates/qarnyx-cli",
+    "crates/qarnyx-api",
 ]
 
 [workspace.package]
