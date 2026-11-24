@@ -225,9 +225,9 @@ def main() -> int:
     print(f"  output SHA-256: {next(iter(all_hashes))}")
     print(f"  CSV: {csv_path}")
     print(
-        "  NOTE: on AVX2+FMA hosts, auto and fused-kq-fma currently resolve "
-        "to the same direct-block implementation; compare their route/output "
-        "parity, not separate algorithm families."
+        "  NOTE: on AVX2+FMA hosts, auto and fused-kq-fma use the same "
+        "Q8_K activation + integer-dot implementation; these are dispatch "
+        "routes to one algorithm, not separate kernel families."
     )
     if args.profile:
         print("\nRunning separate instrumented phase-profile samples (not timed above).")

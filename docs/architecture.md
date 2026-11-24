@@ -120,30 +120,34 @@ produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
 storage lengths and do not materialize a full F32 matrix. On x86_64 with AVX2
-and FMA, the Q4_K/Q5_K/Q6_K matvec path computes directly from packed K-quant
-blocks using F32-input AVX2/FMA kernels; CPUs without both features keep the
-runtime-SIMD dequantize-plus-dot fallback. The selectable CPU surface is kept
-intentionally small: `auto` is the default dispatch mode and
-`fused-kq-fma` explicitly selects the same optimized path for controlled
-comparisons.
+and FMA, Q4_K/Q5_K/Q6_K matvecs quantize their F32 activation vector into
+reusable Q8_K blocks and execute integer SIMD dot products against packed
+weights. Q4_K/Q5_K minimum terms and the Q6_K -32 offset use Q8_K partial sums.
+Batched projections with the same input share one Q8_K buffer. CPUs without
+both features keep the runtime-SIMD dequantize-plus-dot fallback. The selectable
+CPU surface stays intentionally small: `auto` is the default dispatch mode
+and `fused-kq-fma` selects the same optimized path for controlled comparisons.
 
 General matvec and matmul fallbacks reuse a per-thread F32 scratch allocation.
 Large operations are partitioned by encoded weight bytes into several tasks
-per worker, while small operations avoid Rayon scheduling overhead. F32-input
-matmul decodes up to four weight rows together and uses an AVX2/FMA register
-tile to reuse each input vector across those rows when the tile and shape fit.
-This is a F32 GEMM micro-kernel after row decoding, not a packed Q4_Kx8 GEMM.
+per worker, while small operations avoid Rayon scheduling overhead. The Q8_K
+activation scratch is also retained per thread and reused across matvec calls;
+matvec_batch prepares it once before scheduling projections that share input.
+F32 matmul decodes up to four weight rows together and uses an AVX2/FMA
+register tile to reuse each input vector across those rows when the tile and
+shape fit. This is a F32 GEMM micro-kernel after row decoding, not a packed
+Q4_Kx8 GEMM.
 RMSNorm requires a positive finite epsilon. RoPE pairs the first and second
 halves of one head vector, matching the split-half convention used by
 LLaMA-style rotary embeddings. Softmax rejects empty or non-finite inputs.
 
 The CPU runtime intentionally keeps only two selectable kernel modes: `auto`
-and `fused-kq-fma`. On x86_64 with AVX2+FMA, both use the direct-block
-F32-input Q4_K/Q5_K/Q6_K path. `auto` is the production/default mode and
-retains the portable fallback when the required ISA is unavailable;
-`fused-kq-fma` exposes the optimized path explicitly for controlled
-benchmarking. Older experimental Q4_K/Q8_K and direct-block variants were
-removed from the selectable surface to keep runtime dispatch and tests small.
+and `fused-kq-fma`. On x86_64 with AVX2+FMA, both use the Q8_K activation
+quantization and integer-dot Q4_K/Q5_K/Q6_K path. `auto` is the
+production/default mode and retains the portable fallback when the required
+ISA is unavailable; `fused-kq-fma` exposes the optimized path explicitly for
+controlled benchmarking. Earlier F32-input direct-block kernels are no longer
+the active K-quant matvec path.
 RMSNorm, RoPE, softmax, and residual addition currently use scalar
 implementations.
 
@@ -167,11 +171,11 @@ correctness tests before dispatch is enabled.
 
 Keep portable scalar/dequantization code internal as a correctness reference
 and fallback. The public CLI exposes only two selectable modes:
-- `auto`: production/default runtime dispatch; uses direct-block F32-input
-  Q4_K/Q5_K/Q6_K AVX2/FMA on supported x86_64 CPUs and portable fallback
-  otherwise;
-- `fused-kq-fma`: explicit selection of that same direct-block AVX2/FMA path
-  for controlled comparisons; it is not a separate algorithm from the current
+- `auto`: production/default runtime dispatch; uses Q8_K activations and
+  Q4_K/Q5_K/Q6_K AVX2 integer-dot kernels on supported x86_64 CPUs, with
+  portable fallback otherwise;
+- `fused-kq-fma`: explicit selection of that same Q8_K/integer-dot path for
+  controlled comparisons; it is not a separate algorithm from the current
   `auto` fast path;
 - aarch64: portable fallback until a NEON implementation is separately
   validated;
@@ -560,11 +564,11 @@ correctness checks.
   standard-library benchmark runner that compares only the two retained modes,
   uses warm-up and round-robin trials, checks output hashes, and records median
   and range.
-- **M9-B — Quantized GEMV:** profile-guided improvements to direct-block
-  Q4_K/Q5_K/Q6_K decode kernels. Focus on block unpack, scale application,
-  activation reuse, independent accumulator chains, and memory access. Keep
-  changes only when target-machine decode throughput improves and numerical
-  differential tests pass.
+- **M9-B — Quantized GEMV:** Q8_K activation quantization and AVX2 integer-dot
+  kernels for Q4_K/Q5_K/Q6_K are implemented. Activation blocks are reused
+  across batched projections; partial sums handle Q4_K/Q5_K minimum
+  corrections and the Q6_K -32 bias. Scalar-oracle regression tests are added.
+  Target-host performance validation remains required before claiming a speedup.
 - **M9-C — Fused elementwise operations:** optimize only operators proven
   material by M9-A profiling, such as RMSNorm, RoPE, softmax, activation, or
   recurrent-state updates. Avoid speculative SIMD work on negligible phases.

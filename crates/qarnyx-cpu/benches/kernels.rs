@@ -1,4 +1,4 @@
-//! Focused microbenchmarks for the two retained CPU kernel modes.
+//! Focused microbenchmarks for the Q8_K integer-dot K-quant path and two retained CPU modes.
 //!
 //! Run with: cargo bench -p qarnyx-cpu --bench kernels
 
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         auto_backend.uses_avx2()
     );
 
-    println!("\\nRetained CPU kernel comparison (only auto vs fused-kq-fma):");
+    println!("\\nQ8_K integer-dot CPU kernel comparison (only auto vs fused-kq-fma):");
     for (label, dtype, raw_type) in [
         ("Q4_K", DType::Q4K, 12),
         ("Q5_K", DType::Q5K, 13),

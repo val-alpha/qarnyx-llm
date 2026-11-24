@@ -12,8 +12,8 @@ explicit memory ownership, and predictable resource usage.
 > Scalar decoders support F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, and Q6_K. The CPU
 > backend has runtime-dispatched AVX2/FMA matvec and matmul kernels, a persistent
 > Rayon pool, batched independent Qwen3.5 projections, reusable per-session
-> inference scratch, parallel recurrent heads, and an opt-in direct-block Q4_K
-> AVX2/FMA path with a scalar fallback. Experimental Qwen3.5 2B generation is
+> inference scratch, parallel recurrent heads, and AVX2 integer-dot Q4_K/Q5_K/
+> Q6_K kernels using reusable Q8_K activations. Experimental Qwen3.5 2B generation is
 > implemented; further quantized kernels and end-to-end performance validation
 > remain in progress.
 
@@ -79,16 +79,17 @@ during inspection.
 
 The CPU backend executes matrix-vector and matrix-matrix operations with all
 currently registered storage types. On x86_64 hosts with AVX2+FMA, the default
-`auto` backend uses direct-block F32-input kernels for Q4_K, Q5_K, and Q6_K,
-avoiding F32 weight-row materialization. Other hosts retain the runtime-SIMD
-dequantize-then-dot path (or its portable fallback).
+`auto` backend quantizes each K-quant activation vector into reusable Q8_K
+blocks and computes Q4_K/Q5_K/Q6_K dot products with integer SIMD. Q4_K/Q5_K
+minimum corrections and the Q6_K -32 bias use Q8_K partial sums. Other hosts
+retain the runtime-SIMD dequantize-then-dot path (or its portable fallback).
 
 The CPU CLI intentionally exposes only two kernel modes: `auto` and
-`fused-kq-fma`. Both select the direct-block F32-input AVX2/FMA K-quant path
-on supported x86_64 hosts; `auto` is the production/default mode and keeps
-the portable fallback when the required ISA is unavailable. Keeping one
-explicit optimized mode avoids benchmark/test matrix explosion while retaining
-a deterministic path for performance experiments.
+`fused-kq-fma`. Both select the Q8_K activation + AVX2 integer-dot K-quant
+path on supported x86_64 hosts; `auto` is the production/default mode and
+keeps the portable fallback when the required ISA is unavailable. Batched
+projections that share an input reuse the same quantized activation buffer.
+Keeping one explicit optimized mode avoids benchmark/test matrix explosion.
 
 Large matvec/matmul output rows and independent Qwen3.5 projection batches use
 the same persistent Rayon pool. Qwen3.5's Q/K/V, recurrent projections, and
@@ -118,12 +119,12 @@ kernel mode explicitly:
 For Qwen3.5, add `--thinking` to enable model reasoning output; without the
 flag the CLI uses the non-thinking prefix.
 
-The `auto` mode uses the retained direct-block F32-input Q4_K/Q5_K/Q6_K
-AVX2/FMA path when the runtime detects AVX2+FMA. `fused-kq-fma` exposes that
-same optimized path explicitly for controlled performance testing. Other
-experimental kernel modes were removed to keep the runtime and benchmark
-surface small; portable scalar/dequantization code remains internal as a
-fallback and correctness reference.
+The `auto` mode uses Q8_K-quantized activations and AVX2 integer-dot
+Q4_K/Q5_K/Q6_K kernels when the runtime detects AVX2+FMA. `fused-kq-fma`
+exposes that same optimized path explicitly for controlled performance
+testing. Other experimental kernel modes were removed to keep the runtime and
+benchmark surface small; portable scalar/dequantization code remains internal
+as a fallback and correctness reference.
 
 Generation is capped at 4096 combined prompt and requested output tokens by
 default. Use `--max-context-tokens N` to set a different per-request limit.

@@ -68,7 +68,7 @@ enum Command {
         /// Worker count for the CPU backend.
         #[arg(long, default_value_t = 1)]
         workers: usize,
-        /// CPU kernel implementation: automatic dispatch or explicit fused K-quant AVX2/FMA.
+        /// CPU kernel implementation: automatic dispatch or explicit Q8_K + AVX2 integer-dot K-quants.
         #[arg(long, value_enum, default_value = "auto")]
         cpu_kernel: CpuKernelMode,
         /// RNG seed.

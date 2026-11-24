@@ -1,10 +1,10 @@
 //! Runtime-dispatched CPU execution backend.
 //!
 //! Matrix kernels use reusable F32 scratch rows for general quantized formats.
-//! Experimental direct-block Q4_K, Q5_K, and Q6_K matvec paths avoid F32 row
-//! materialization. On x86_64, AVX2/FMA accelerates Q4_K and F32 dot products;
-//! AVX2 handles Q5_K/Q6_K block expansion. Scalar kernels remain the reference
-//! and portable fallback. Large matrix operations partition independent rows.
+//! On x86_64 with AVX2+FMA, Q4_K/Q5_K/Q6_K matvecs quantize activations once
+//! into Q8_K and use integer SIMD dot products with precomputed group sums.
+//! General scalar/dequantization paths remain the portable reference fallback.
+//! Large matrix operations partition independent rows.
 
 use qarnyx_core::{Backend, BackendError, DType, TensorView};
 use qarnyx_quant::{dequantize_into, encoded_len};
@@ -32,6 +32,17 @@ thread_local! {
     /// A decoded-row scratch allocation retained independently by each worker.
     static ROW_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
+
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    /// Reusable Q8_K activation blocks; a batch of projections shares one fill.
+    static KQ_Q8_SCRATCH: RefCell<Vec<kq::BlockQ8K>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(target_arch = "x86_64")]
+type KqActivations = [kq::BlockQ8K];
+#[cfg(not(target_arch = "x86_64"))]
+type KqActivations = ();
 
 /// Errors raised while constructing the CPU backend.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -218,30 +229,27 @@ impl CpuBackend {
         dot_scalar(lhs, rhs)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn fused_kq_fma_dot(
         &self,
         dtype: DType,
         encoded: &[u8],
-        input: &[f32],
-        group_sums: &[f32],
-    ) -> Result<f32, BackendError> {
-        #[cfg(target_arch = "x86_64")]
-        if self.simd_enabled && self.features.avx2 && self.features.fma {
-            return match dtype {
-                DType::Q4K => Ok(kq::dot_q4_k(encoded, input, group_sums)),
-                DType::Q5K => Ok(kq::dot_q5_k(encoded, input, group_sums)),
-                DType::Q6K => Ok(kq::dot_q6_k(encoded, input)),
-                _ => Err(invalid_parameter(
-                    "matvec",
-                    "experimental fused K-quantized dot received a non K-quantized tensor",
-                )),
-            };
+        activations: &[kq::BlockQ8K],
+    ) -> f32 {
+        debug_assert!(self.simd_enabled && self.features.avx2 && self.features.fma);
+        match dtype {
+            DType::Q4K => kq::dot_q4_k_q8(encoded, activations),
+            DType::Q5K => kq::dot_q5_k_q8(encoded, activations),
+            DType::Q6K => kq::dot_q6_k_q8(encoded, activations),
+            _ => unreachable!("only K-quantized weights use the Q8_K dot path"),
         }
+    }
 
-        Err(invalid_parameter(
-            "matvec",
-            format!("fused K-quantized dot unavailable for {:?}", dtype),
-        ))
+    #[cfg(target_arch = "x86_64")]
+    fn can_use_q8_k(&self, dtype: DType, input_len: usize) -> bool {
+        self.fused_kq_fma_matvec
+            && matches!(dtype, DType::Q4K | DType::Q5K | DType::Q6K)
+            && input_len % kq::QK_K == 0
     }
 
     fn matmul_row(&self, row: &[f32], input: &[f32], output: &mut [f32], columns: usize) {
@@ -573,76 +581,52 @@ fn decode_weight_row(
         .map_err(|error| shape_mismatch(operation, error.to_string()))
 }
 
-impl Backend for CpuBackend {
-    fn name(&self) -> &'static str {
-        "cpu"
+
+fn matvec_with_q8(
+    backend: &CpuBackend,
+    weights: TensorView<'_>,
+    input: &[f32],
+    output: &mut [f32],
+    activations: Option<&KqActivations>,
+) -> Result<(), BackendError> {
+    let Some((&out_features, &in_features)) =
+        weights.shape.first().zip(weights.shape.get(1))
+    else {
+        return Err(shape_mismatch(
+            "matvec",
+            "weight tensor must be a rank-2 [out_features, in_features] matrix",
+        ));
+    };
+
+    if input.len() != in_features {
+        return Err(shape_mismatch(
+            "matvec",
+            format!("input has {} elements; expected {in_features}", input.len()),
+        ));
+    }
+    if output.len() != out_features {
+        return Err(shape_mismatch(
+            "matvec",
+            format!(
+                "output has {} elements; expected {out_features}",
+                output.len()
+            ),
+        ));
     }
 
-    fn matvec(
-        &self,
-        weights: TensorView<'_>,
-        input: &[f32],
-        output: &mut [f32],
-    ) -> Result<(), BackendError> {
-        let Some((&out_features, &in_features)) = weights.shape.first().zip(weights.shape.get(1))
-        else {
-            return Err(shape_mismatch(
-                "matvec",
-                "weight tensor must be a rank-2 [out_features, in_features] matrix",
-            ));
-        };
+    let (raw_type, columns, row_bytes) =
+        matrix_row_layout(&weights, out_features, in_features, "matvec")?;
 
-        if input.len() != in_features {
-            return Err(shape_mismatch(
-                "matvec",
-                format!("input has {} elements; expected {in_features}", input.len()),
-            ));
-        }
-        if output.len() != out_features {
-            return Err(shape_mismatch(
-                "matvec",
-                format!(
-                    "output has {} elements; expected {out_features}",
-                    output.len()
-                ),
-            ));
-        }
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+    let fused_kq = backend.fused_kq_fma_matvec
+        && activations.is_some()
+        && matches!(weights.dtype, DType::Q4K | DType::Q5K | DType::Q6K);
 
-        let (raw_type, columns, row_bytes) =
-            matrix_row_layout(&weights, out_features, in_features, "matvec")?;
-
-        let fused_kq_fma = self.fused_kq_fma_matvec
-            && matches!(weights.dtype, DType::Q4K | DType::Q5K | DType::Q6K);
-
-        // Q4_K/Q5_K minimum correction needs one sum per 32 input values.
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
-        let mut q4k_sums_stack = [0.0_f32; 512];
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut, unused_variables))]
-        let mut q4k_sums_heap: Vec<f32>;
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut q4k_sums: &[f32] = &[];
-        #[cfg(target_arch = "x86_64")]
-        if fused_kq_fma
-            && matches!(weights.dtype, DType::Q4K | DType::Q5K)
-            && self.simd_enabled
-            && self.features.avx2
-            && self.features.fma
-        {
-            let groups = in_features / 32;
-            let buffer: &mut [f32] = if groups <= q4k_sums_stack.len() {
-                &mut q4k_sums_stack[..groups]
-            } else {
-                q4k_sums_heap = allocate_row_scratch("matvec", groups)?;
-                &mut q4k_sums_heap[..]
-            };
-            kq::group_sums(input, buffer);
-            q4k_sums = &*buffer;
-        }
-
-        let fused = fused_kq_fma;
-
-        let run_rows = |first_row: usize, output_rows: &mut [f32]| -> Result<(), BackendError> {
-            if fused {
+    let run_rows = |first_row: usize, output_rows: &mut [f32]| -> Result<(), BackendError> {
+        if fused_kq {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let q8 = activations.expect("Q8_K activations prepared for fused path");
                 for (offset, output_value) in output_rows.iter_mut().enumerate() {
                     let row_index = first_row + offset;
                     let start = row_index.checked_mul(row_bytes).ok_or_else(|| {
@@ -657,39 +641,65 @@ impl Backend for CpuBackend {
                             "encoded weight row is outside the tensor byte range",
                         )
                     })?;
-
-                    *output_value =
-                        self.fused_kq_fma_dot(weights.dtype, encoded_row, input, q4k_sums)?;
+                    *output_value = backend.fused_kq_fma_dot(weights.dtype, encoded_row, q8);
                 }
                 return Ok(());
             }
-
-            with_row_scratch("matvec", in_features, |row| {
-                for (offset, output_value) in output_rows.iter_mut().enumerate() {
-                    decode_weight_row(
-                        "matvec",
-                        raw_type,
-                        columns,
-                        row_bytes,
-                        first_row + offset,
-                        &weights,
-                        row,
-                    )?;
-                    *output_value = self.dot_product(row, input);
-                }
-                Ok(())
-            })
-        };
-
-        match self.rows_per_task(out_features, row_bytes, 1) {
-            Some(chunk_rows) => self.pool.install(|| {
-                output
-                    .par_chunks_mut(chunk_rows)
-                    .enumerate()
-                    .try_for_each(|(index, rows)| run_rows(index * chunk_rows, rows))
-            }),
-            None => run_rows(0, output),
         }
+
+        with_row_scratch("matvec", in_features as usize, |row| {
+            for (offset, output_value) in output_rows.iter_mut().enumerate() {
+                decode_weight_row(
+                    "matvec",
+                    raw_type,
+                    columns,
+                    row_bytes,
+                    first_row + offset,
+                    &weights,
+                    row,
+                )?;
+                *output_value = backend.dot_product(row, input);
+            }
+            Ok(())
+        })
+    };
+
+    match backend.rows_per_task(out_features as usize, row_bytes, 1) {
+        Some(chunk_rows) => backend.pool.install(|| {
+            output
+                .par_chunks_mut(chunk_rows)
+                .enumerate()
+                .try_for_each(|(index, rows)| run_rows(index * chunk_rows, rows))
+        }),
+        None => run_rows(0, output),
+    }
+}
+
+impl Backend for CpuBackend {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+
+    fn matvec(
+        &self,
+        weights: TensorView<'_>,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), BackendError> {
+        #[cfg(target_arch = "x86_64")]
+        if self.can_use_q8_k(weights.dtype, input.len()) {
+            return KQ_Q8_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                if kq::quantize_activations(input, &mut scratch) {
+                    matvec_with_q8(self, weights, input, output, Some(scratch.as_slice()))
+                } else {
+                    // Preserve the F32 path for NaN/Inf activations.
+                    matvec_with_q8(self, weights, input, output, None)
+                }
+            });
+        }
+
+        matvec_with_q8(self, weights, input, output, None)
     }
 
     fn matvec_batch(
@@ -709,21 +719,85 @@ impl Backend for CpuBackend {
             ));
         }
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            let input_len = input.len();
+            let can_share_q8 = self.fused_kq_fma_matvec
+                && input.len() % kq::QK_K == 0
+                && !weights.is_empty()
+                && weights.iter().all(|weight| {
+                    matches!(weight.dtype, DType::Q4K | DType::Q5K | DType::Q6K)
+                        && weight.shape.get(1).copied() == Some(input_len)
+                });
+
+            if can_share_q8 {
+                return KQ_Q8_SCRATCH.with(|scratch| {
+                    let mut scratch = scratch.borrow_mut();
+                    if kq::quantize_activations(input, &mut scratch) {
+                        let activations = scratch.as_slice();
+                        if self.worker_count <= 1 {
+                            for (weight, output) in
+                                weights.iter().copied().zip(outputs.iter_mut())
+                            {
+                                matvec_with_q8(
+                                    self,
+                                    weight,
+                                    input,
+                                    output,
+                                    Some(activations),
+                                )?;
+                            }
+                            return Ok(());
+                        }
+
+                        return self.pool.install(|| {
+                            outputs
+                                .par_iter_mut()
+                                .enumerate()
+                                .try_for_each(|(index, output)| {
+                                    matvec_with_q8(
+                                        self,
+                                        weights[index],
+                                        input,
+                                        output,
+                                        Some(activations),
+                                    )
+                                })
+                        });
+                    }
+                    // Non-finite values retain the ordinary F32 fallback.
+                    if self.worker_count <= 1 {
+                        for (weight, output) in weights.iter().copied().zip(outputs.iter_mut()) {
+                            matvec_with_q8(self, weight, input, output, None)?;
+                        }
+                        return Ok(());
+                    }
+                    self.pool.install(|| {
+                        outputs
+                            .par_iter_mut()
+                            .enumerate()
+                            .try_for_each(|(index, output)| {
+                                matvec_with_q8(self, weights[index], input, output, None)
+                            })
+                    })
+                });
+            }
+        }
+
         if weights.len() <= 1 || self.worker_count <= 1 {
             for (weight, output) in weights.iter().copied().zip(outputs.iter_mut()) {
-                self.matvec(weight, input, *output)?;
+                self.matvec(weight, input, output)?;
             }
             return Ok(());
         }
 
         // Projection tasks and their row-parallel matvecs share this same
-        // persistent pool. Rayon work-stealing prevents a second pool or
-        // per-projection OS threads from being created.
+        // persistent pool. Rayon work-stealing avoids creating extra pools.
         self.pool.install(|| {
             outputs
                 .par_iter_mut()
                 .enumerate()
-                .try_for_each(|(index, output)| self.matvec(weights[index], input, *output))
+                .try_for_each(|(index, output)| self.matvec(weights[index], input, output))
         })
     }
 
@@ -1088,46 +1162,185 @@ mod tests {
         );
     }
 
+    fn k_quant_fixture(dtype: DType, rows: usize, columns: usize) -> Vec<u8> {
+        let block_bytes = match dtype {
+            DType::Q4K => 144,
+            DType::Q5K => 176,
+            DType::Q6K => 210,
+            _ => panic!("fixture only supports K-quants"),
+        };
+        assert_eq!(columns % 256, 0);
+        let blocks_per_row = columns / 256;
+        let mut bytes = vec![0_u8; rows * blocks_per_row * block_bytes];
+
+        for (index, block) in bytes.chunks_exact_mut(block_bytes).enumerate() {
+            let row_and_block = index as u8;
+            match dtype {
+                DType::Q4K => {
+                    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+                    block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+                    for (lane, value) in block[4..16].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(23)
+                            .wrapping_add(row_and_block.wrapping_mul(7));
+                    }
+                    for (lane, value) in block[16..].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(29)
+                            .wrapping_add(row_and_block.wrapping_mul(17));
+                    }
+                }
+                DType::Q5K => {
+                    block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+                    block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
+                    for (lane, value) in block[4..16].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(19)
+                            .wrapping_add(row_and_block.wrapping_mul(13));
+                    }
+                    for (lane, value) in block[16..48].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(37)
+                            .wrapping_add(row_and_block.wrapping_mul(11));
+                    }
+                    for (lane, value) in block[48..].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(23)
+                            .wrapping_add(row_and_block.wrapping_mul(7));
+                    }
+                }
+                DType::Q6K => {
+                    for (lane, value) in block[..128].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(31)
+                            .wrapping_add(row_and_block.wrapping_mul(13));
+                    }
+                    for (lane, value) in block[128..192].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(19)
+                            .wrapping_add(row_and_block.wrapping_mul(5));
+                    }
+                    for (lane, value) in block[192..208].iter_mut().enumerate() {
+                        *value = (lane as u8)
+                            .wrapping_mul(17)
+                            .wrapping_add(row_and_block.wrapping_mul(11));
+                    }
+                    block[208..210].copy_from_slice(&0x3c00_u16.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+        }
+        bytes
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn fused_kq_fma_matvec_matches_scalar_reference() {
+    fn q8_k_matvec_matches_scalar_reference() {
         if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
             return;
         }
 
-        let shape = [4, 2048];
-        let mut bytes = vec![0_u8; 144 * 8 * shape[0]];
-        for (block_index, block) in bytes.chunks_exact_mut(144).enumerate() {
-            block[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
-            block[2..4].copy_from_slice(&0x3400_u16.to_le_bytes());
-            for (index, byte) in block[4..16].iter_mut().enumerate() {
-                *byte = (index * 19 + block_index * 7) as u8;
-            }
-            for (index, byte) in block[16..].iter_mut().enumerate() {
-                *byte = (index * 29 + block_index * 11) as u8;
-            }
-        }
-
-        let weights = TensorView::new(&bytes, &shape, DType::Q4K);
-        let input = (0..2048)
-            .map(|index| ((index * 13 % 97) as f32 - 48.0) / 49.0)
+        let (rows, columns) = (4, 1024);
+        let input = (0..columns)
+            .map(|index| ((index * 13 % 197) as f32 - 98.0) / 83.0)
             .collect::<Vec<_>>();
         let reference = CpuBackend::new_scalar(1).unwrap();
         let optimized = CpuBackend::new_fused_kq_fma(4).unwrap();
-        let mut expected = [0.0_f32; 4];
-        let mut actual = [0.0_f32; 4];
 
-        reference.matvec(weights, &input, &mut expected).unwrap();
-        optimized.matvec(weights, &input, &mut actual).unwrap();
+        let shape = [rows, columns];
+        for dtype in [DType::Q4K, DType::Q5K, DType::Q6K] {
+            let bytes = k_quant_fixture(dtype, rows, columns);
+            let weights = TensorView::new(&bytes, &shape, dtype);
+            let mut quantized_expected = vec![0.0_f32; rows];
+            let mut actual = vec![0.0_f32; rows];
+            let mut q8_blocks = Vec::new();
 
-        for row in 0..4 {
-            let tolerance = 1.0e-3 * (1.0 + expected[row].abs());
-            assert!(
-                (actual[row] - expected[row]).abs() <= tolerance,
-                "F32-input Q4_K FMA mismatch at row {row}: expected={}, actual={}",
-                expected[row],
-                actual[row]
-            );
+            assert!(kq::quantize_activations(&input, &mut q8_blocks));
+            let q8_input = q8_blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .qs
+                        .iter()
+                        .map(move |quantized| block.d * f32::from(*quantized))
+                })
+                .collect::<Vec<_>>();
+            reference
+                .matvec(weights, &q8_input, &mut quantized_expected)
+                .unwrap();
+            optimized.matvec(weights, &input, &mut actual).unwrap();
+
+            for row in 0..rows {
+                let kernel_tolerance = 5.0e-4 * (1.0 + quantized_expected[row].abs());
+                assert!(
+                    (actual[row] - quantized_expected[row]).abs() <= kernel_tolerance,
+                    "{dtype:?} integer-dot mismatch at row {row}: Q8_K reference={}, actual={}",
+                    quantized_expected[row],
+                    actual[row]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q8_k_matvec_batch_reuses_quantized_input_for_mixed_k_quants() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let (rows, columns) = (4, 512);
+        let input = (0..columns)
+            .map(|index| ((index * 17 % 211) as f32 - 105.0) / 97.0)
+            .collect::<Vec<_>>();
+        let q4_bytes = k_quant_fixture(DType::Q4K, rows, columns);
+        let q5_bytes = k_quant_fixture(DType::Q5K, rows, columns);
+        let shape = [rows, columns];
+        let weights = [
+            TensorView::new(&q4_bytes, &shape, DType::Q4K),
+            TensorView::new(&q5_bytes, &shape, DType::Q5K),
+        ];
+
+        let reference = CpuBackend::new_scalar(1).unwrap();
+        let optimized = CpuBackend::new_fused_kq_fma(4).unwrap();
+        let mut q8_blocks = Vec::new();
+        assert!(kq::quantize_activations(&input, &mut q8_blocks));
+        let q8_input = q8_blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .qs
+                    .iter()
+                    .map(move |quantized| block.d * f32::from(*quantized))
+            })
+            .collect::<Vec<_>>();
+        let mut expected_q4 = vec![0.0_f32; rows];
+        let mut expected_q5 = vec![0.0_f32; rows];
+        reference
+            .matvec(weights[0], &q8_input, &mut expected_q4)
+            .unwrap();
+        reference
+            .matvec(weights[1], &q8_input, &mut expected_q5)
+            .unwrap();
+
+        let mut actual_q4 = vec![0.0_f32; rows];
+        let mut actual_q5 = vec![0.0_f32; rows];
+        let mut outputs: [&mut [f32]; 2] = [&mut actual_q4, &mut actual_q5];
+        optimized
+            .matvec_batch(&weights, &input, &mut outputs)
+            .unwrap();
+
+        for (format, expected, actual) in [
+            ("Q4_K", &expected_q4, &actual_q4),
+            ("Q5_K", &expected_q5, &actual_q5),
+        ] {
+            for (row, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                let tolerance = 5.0e-4 * (1.0 + expected.abs());
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{format} batched Q8_K mismatch at row {row}: expected={expected}, actual={actual}"
+                );
+            }
         }
     }
 

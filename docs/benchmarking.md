@@ -96,6 +96,37 @@ expensive phases/operators, but use the unprofiled CSV trials for clean
 whole-process comparisons. Prefill/decode figures are model-phase measurements
 and exclude model-file loading and tokenizer/model initialization.
 
+## Q8_K quantized GEMV (M9-B)
+
+The active AVX2+FMA K-quant matvec path converts each 256-value F32
+activation block to Q8_K once, then uses integer dot products for Q4_K,
+Q5_K, and Q6_K. Q8_K stores signed int8 activations, one F32 scale, and
+sixteen partial sums (one per 16 values). Batched projections with the same
+input share the same quantized activation buffer.
+
+Compare the new build to the recorded M9-A run using the same GGUF, prompt,
+worker count, token count, binary profile, and host. The first validation
+should keep the compact two-mode run count and include the phase profile:
+
+```bash
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 \
+  --max-new-tokens 32 \
+  --warmups 1 \
+  --runs 2 \
+  --profile \
+  --csv m9-b-q8k.csv
+```
+
+The scalar/dequantization path remains the numeric oracle and portable
+fallback. Q8_K adds activation quantization error, so token hashes need only
+match across the two current CLI routes and repeated runs of the new build;
+compare numerical matvec outputs to the scalar oracle using the focused Rust
+regression tests. Do not claim a speedup until the same-host model benchmark
+shows one.
+
 The following Bash example runs one warm-up and five measured trials for each
 kernel/worker combination. It writes elapsed wall time, peak process RSS, and
 an output hash to CSV. Set `MODEL` to the exact GGUF file.
