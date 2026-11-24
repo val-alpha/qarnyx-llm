@@ -50,8 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="enable QARNYX_PROFILE=1; timings are instrumented and not comparable "
-        "to unprofiled end-to-end runs",
+        help="run separate Qwen3.5 phase-profile samples after unprofiled timing trials",
     )
     args = parser.parse_args()
 
@@ -225,6 +224,11 @@ def main() -> int:
         print(f"  auto / fused-kq-fma median ratio: {speedup:.3f}x")
     print(f"  output SHA-256: {next(iter(all_hashes))}")
     print(f"  CSV: {csv_path}")
+    print(
+        "  NOTE: on AVX2+FMA hosts, auto and fused-kq-fma currently resolve "
+        "to the same direct-block implementation; compare their route/output "
+        "parity, not separate algorithm families."
+    )
     if args.profile:
         print("\\nRunning separate instrumented phase-profile samples (not timed above).")
         for kernel in KERNELS:
