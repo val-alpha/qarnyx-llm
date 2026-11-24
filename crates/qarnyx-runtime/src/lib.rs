@@ -1290,10 +1290,13 @@ impl Qwen35Generator {
                 prefill_tokens_per_second
             );
             eprintln!(
-                "  decode: generated_tokens={} loop_ms={:.3} loop_tokens_per_sec={:.2} \\\n   forward_tokens={} forward_ms={:.3} forward_tokens_per_sec={:.2}",
+                "  decode: generated_tokens={} loop_ms={:.3} loop_tokens_per_sec={:.2}",
                 generated_tokens,
                 decode_loop_elapsed.as_secs_f64() * 1_000.0,
-                decode_loop_tokens_per_second,
+                decode_loop_tokens_per_second
+            );
+            eprintln!(
+                "    forward_tokens={} forward_ms={:.3} forward_tokens_per_sec={:.2}",
                 decode_forward_tokens,
                 decode_forward_elapsed.as_secs_f64() * 1_000.0,
                 decode_forward_tokens_per_second
