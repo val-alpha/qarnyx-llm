@@ -99,11 +99,13 @@ intermediate buffers.
 
 Validate the two selectable CPU kernel modes with
 `python3 scripts/cpu_kernel_cli_test.py --bin target/release/qarnyx`.
-Run the focused CPU microbenchmarks with
-`cargo bench -p qarnyx-cpu --bench kernels`; the harness compares only
-`auto` and `fused-kq-fma` for Q4_K/Q5_K/Q6_K, plus `auto` worker scaling.
-Cargo's bench profile is optimized by default; do not pass `--release` to
-`cargo bench`.
+For the representative Qwen3.5 end-to-end benchmark, use
+`python3 scripts/benchmark_kernels.py /path/to/model.gguf "model apa kamu" --bin target/release/qarnyx --workers 10 --runs 3`.
+Add `--profile` for separate prefill/decode phase and operator reports; those
+instrumented samples are not included in the unprofiled timing CSV.
+The focused Rust microbenchmark remains available with
+`cargo bench -p qarnyx-cpu --bench kernels`; Cargo's bench profile is
+optimized by default, so do not pass `--release` to `cargo bench`.
 
 To compare end-to-end generation using the same model and prompt, select a
 kernel mode explicitly:
