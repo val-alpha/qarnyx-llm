@@ -230,12 +230,7 @@ impl CpuBackend {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn fused_kq_fma_dot(
-        &self,
-        dtype: DType,
-        encoded: &[u8],
-        activations: &[kq::BlockQ8K],
-    ) -> f32 {
+    fn fused_kq_fma_dot(&self, dtype: DType, encoded: &[u8], activations: &[kq::BlockQ8K]) -> f32 {
         debug_assert!(self.simd_enabled && self.features.avx2 && self.features.fma);
         match dtype {
             DType::Q4K => kq::dot_q4_k_q8(encoded, activations),
@@ -581,7 +576,6 @@ fn decode_weight_row(
         .map_err(|error| shape_mismatch(operation, error.to_string()))
 }
 
-
 fn matvec_with_q8(
     backend: &CpuBackend,
     weights: TensorView<'_>,
@@ -589,8 +583,7 @@ fn matvec_with_q8(
     output: &mut [f32],
     activations: Option<&KqActivations>,
 ) -> Result<(), BackendError> {
-    let Some((&out_features, &in_features)) =
-        weights.shape.first().zip(weights.shape.get(1))
+    let Some((&out_features, &in_features)) = weights.shape.first().zip(weights.shape.get(1))
     else {
         return Err(shape_mismatch(
             "matvec",
@@ -736,16 +729,8 @@ impl Backend for CpuBackend {
                     if kq::quantize_activations(input, &mut scratch) {
                         let activations = scratch.as_slice();
                         if self.worker_count <= 1 {
-                            for (weight, output) in
-                                weights.iter().copied().zip(outputs.iter_mut())
-                            {
-                                matvec_with_q8(
-                                    self,
-                                    weight,
-                                    input,
-                                    output,
-                                    Some(activations),
-                                )?;
+                            for (weight, output) in weights.iter().copied().zip(outputs.iter_mut()) {
+                                matvec_with_q8(self, weight, input, output, Some(activations))?;
                             }
                             return Ok(());
                         }

@@ -72,9 +72,7 @@ pub(crate) fn quantize_activations(input: &[f32], output: &mut Vec<BlockQ8K>) ->
             let start = group * 16;
             let mut sum = 0_i16;
             for (offset, value) in source_group.iter().copied().enumerate() {
-                let quantized = (value * inverse)
-                    .round_ties_even()
-                    .clamp(-127.0, 127.0) as i8;
+                let quantized = (value * inverse).round_ties_even().clamp(-127.0, 127.0) as i8;
                 target.qs[start + offset] = quantized;
                 sum += i16::from(quantized);
             }
@@ -293,23 +291,15 @@ unsafe fn dot_q6_k_q8_impl(encoded: &[u8], activations: &[BlockQ8K]) -> f32 {
                 let planes = [
                     _mm256_or_si256(_mm256_and_si256(l0, low_mask), h0),
                     _mm256_or_si256(_mm256_and_si256(l1, low_mask), h1),
-                    _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16::<4>(l0), low_mask),
-                        h2,
-                    ),
-                    _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16::<4>(l1), low_mask),
-                        h3,
-                    ),
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(l0), low_mask), h2),
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(l1), low_mask), h3),
                 ];
 
                 for (plane_index, plane) in planes.iter().enumerate() {
                     let group = half * 8 + plane_index * 2;
                     let activation_offset = half * 128 + plane_index * 32;
-                    let (dot_low, dot_high) = dot_u6_i8_32(
-                        *plane,
-                        activation.qs.as_ptr().add(activation_offset),
-                    );
+                    let (dot_low, dot_high) =
+                        dot_u6_i8_32(*plane, activation.qs.as_ptr().add(activation_offset));
 
                     let low_sum = i32::from(activation.bsums[group]);
                     let high_sum = i32::from(activation.bsums[group + 1]);
@@ -319,8 +309,7 @@ unsafe fn dot_q6_k_q8_impl(encoded: &[u8], activations: &[BlockQ8K]) -> f32 {
                     let high_corrected = dot_high - 32 * high_sum;
 
                     total += combined_scale
-                        * (low_scale * low_corrected as f32
-                            + high_scale * high_corrected as f32);
+                        * (low_scale * low_corrected as f32 + high_scale * high_corrected as f32);
                 }
             }
         }
