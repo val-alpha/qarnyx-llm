@@ -729,7 +729,8 @@ impl Backend for CpuBackend {
                     if kq::quantize_activations(input, &mut scratch) {
                         let activations = scratch.as_slice();
                         if self.worker_count <= 1 {
-                            for (weight, output) in weights.iter().copied().zip(outputs.iter_mut()) {
+                            for (weight, output) in weights.iter().copied().zip(outputs.iter_mut())
+                            {
                                 matvec_with_q8(self, weight, input, output, Some(activations))?;
                             }
                             return Ok(());
