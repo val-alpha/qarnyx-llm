@@ -152,7 +152,7 @@ def main() -> int:
     print(
         f"Model: {args.model}\nWorkers: {args.workers}\n"
         f"Tokens: {args.max_new_tokens}\nWarmups: {args.warmups}\n"
-        f"Measured runs: {args.runs}\nProfiled: {args.profile}"
+        f"Measured runs: {args.runs}\nSeparate profile samples: {args.profile}"
     )
 
     for kernel in KERNELS:
@@ -230,7 +230,7 @@ def main() -> int:
         "parity, not separate algorithm families."
     )
     if args.profile:
-        print("\\nRunning separate instrumented phase-profile samples (not timed above).")
+        print("\nRunning separate instrumented phase-profile samples (not timed above).")
         for kernel in KERNELS:
             run_once(args, kernel, profile=True)
     return 0
