@@ -1,4 +1,4 @@
-//! Scalar-versus-runtime-dispatch microbenchmarks for F32 and GGUF formats.
+//! Focused microbenchmarks for the two retained CPU kernel modes.
 //!
 //! Run with: cargo bench -p qarnyx-cpu --bench kernels
 
