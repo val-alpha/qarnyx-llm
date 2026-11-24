@@ -41,15 +41,19 @@ impl Qwen35Profile {
     }
 
     pub fn report(&self) -> String {
+        self.report_for_phase("aggregate")
+    }
+
+    pub fn report_for_phase(&self, phase: &str) -> String {
         let mut rows: Vec<_> = self.entries.iter().collect();
         rows.sort_by_key(|(_, e)| std::cmp::Reverse(e.nanos));
-        let mut out = String::from("Qwen3.5 profile (aggregate):\n");
-        out.push_str("  label                         calls      total_ms      avg_us\n");
+        let mut out = format!("Qwen3.5 profile ({phase}):\\n");
+        out.push_str("  label                         calls      total_ms      avg_us\\n");
         for (label, entry) in rows {
             let total_ms = entry.nanos as f64 / 1_000_000.0;
             let avg_us = entry.nanos as f64 / entry.calls as f64 / 1_000.0;
             out.push_str(&format!(
-                "  {:<28} {:>5} {:>13.3} {:>12.3}\n",
+                "  {:<28} {:>5} {:>13.3} {:>12.3}\\n",
                 label, entry.calls, total_ms, avg_us
             ));
         }
