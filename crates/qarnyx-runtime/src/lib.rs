@@ -9,6 +9,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -1183,8 +1184,13 @@ impl Qwen35Generator {
         let mut logits = Vec::new();
         let mut decoder = on_event.as_ref().map(|_| tokenizer.stream_decoder());
         let profiling = std::env::var_os("QARNYX_PROFILE").is_some();
-        let mut profile = Qwen35Profile::default();
+        let mut prefill_profile = Qwen35Profile::default();
+        let mut decode_profile = Qwen35Profile::default();
 
+        // Profile model forward passes independently. Prefill and decode have
+        // different shapes and bottlenecks, so merging their operator totals
+        // makes the result difficult to use for kernel decisions.
+        let prefill_started = profiling.then(Instant::now);
         for (position, &token_id) in prompt.iter().enumerate() {
             cancellation.check()?;
             if profiling {
@@ -1193,12 +1199,17 @@ impl Qwen35Generator {
                     token_id,
                     position,
                     &mut cache,
-                    &mut profile,
+                    &mut prefill_profile,
                 )?;
             } else {
                 logits = model.forward_logits(backend, token_id, position, &mut cache)?;
             }
         }
+        let prefill_elapsed = prefill_started.map_or(Duration::ZERO, |start| start.elapsed());
+
+        let mut decode_forward_elapsed = Duration::ZERO;
+        let mut decode_forward_tokens = 0_usize;
+        let decode_loop_started = profiling.then(Instant::now);
 
         for _ in 0..config.max_new_tokens {
             cancellation.check()?;
@@ -1222,18 +1233,26 @@ impl Qwen35Generator {
             }
 
             let position = cache.sequence_len;
+            let forward_started = profiling.then(Instant::now);
             if profiling {
                 logits = model.forward_logits_profiled(
                     backend,
                     next,
                     position,
                     &mut cache,
-                    &mut profile,
+                    &mut decode_profile,
                 )?;
             } else {
                 logits = model.forward_logits(backend, next, position, &mut cache)?;
             }
+            if let Some(start) = forward_started {
+                decode_forward_elapsed += start.elapsed();
+                decode_forward_tokens += 1;
+            }
         }
+
+        let decode_loop_elapsed =
+            decode_loop_started.map_or(Duration::ZERO, |start| start.elapsed());
 
         if let Some(callback) = on_event.as_mut() {
             let final_delta = decoder
@@ -1246,7 +1265,41 @@ impl Qwen35Generator {
         }
         cancellation.check()?;
         if profiling {
-            eprintln!("{}", profile.report());
+            let generated_tokens = generated.len().saturating_sub(prompt.len());
+            let prefill_tokens_per_second = if prefill_elapsed.is_zero() {
+                0.0
+            } else {
+                prompt.len() as f64 / prefill_elapsed.as_secs_f64()
+            };
+            let decode_forward_tokens_per_second = if decode_forward_elapsed.is_zero() {
+                0.0
+            } else {
+                decode_forward_tokens as f64 / decode_forward_elapsed.as_secs_f64()
+            };
+            let decode_loop_tokens_per_second = if decode_loop_elapsed.is_zero() {
+                0.0
+            } else {
+                generated_tokens as f64 / decode_loop_elapsed.as_secs_f64()
+            };
+
+            eprintln!("Qwen3.5 phase profile:");
+            eprintln!(
+                "  prefill: prompt_tokens={} forward_ms={:.3} tokens_per_sec={:.2}",
+                prompt.len(),
+                prefill_elapsed.as_secs_f64() * 1_000.0,
+                prefill_tokens_per_second
+            );
+            eprintln!(
+                "  decode: generated_tokens={} loop_ms={:.3} loop_tokens_per_sec={:.2} \\\n   forward_tokens={} forward_ms={:.3} forward_tokens_per_sec={:.2}",
+                generated_tokens,
+                decode_loop_elapsed.as_secs_f64() * 1_000.0,
+                decode_loop_tokens_per_second,
+                decode_forward_tokens,
+                decode_forward_elapsed.as_secs_f64() * 1_000.0,
+                decode_forward_tokens_per_second
+            );
+            eprintln!("{}", prefill_profile.report_for_phase("prefill"));
+            eprintln!("{}", decode_profile.report_for_phase("decode"));
         }
 
         Ok(GenerationResult {
