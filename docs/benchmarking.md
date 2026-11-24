@@ -43,6 +43,59 @@ retired `fused-q4k`, `llama-q4k`, `fused-qk`, and `scalar` CLI values are
 rejected. It uses a deliberately missing model path, so no model download or
 inference run is required.
 
+## Focused two-mode comparison (M9-A)
+
+For a repeatable comparison of the only retained modes, use the standard-library
+runner:
+
+```bash
+cargo build --release -p qarnyx-cli
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 \
+  --max-new-tokens 32 \
+  --warmups 1 \
+  --runs 3 \
+  --csv qarnyx-kernel-benchmark.csv
+```
+
+The runner fixes greedy sampling, uses the same seed/configuration for both
+modes, performs warm-ups, alternates `auto` and `fused-kq-fma` per measured
+trial, and records elapsed time plus output SHA-256. It refuses to summarize
+performance if output hashes differ across runs or modes. The CSV contains
+only the two retained mode names.
+
+These measurements are whole-process wall time: model loading, tokenizer
+setup, backend construction, and generation are included. Compare medians and
+ranges; do not label these values decode-only tokens/sec.
+
+Add `--profile` to run one additional instrumented sample for each mode after
+the unprofiled timing trials:
+
+```bash
+python3 scripts/benchmark_kernels.py \
+  /path/to/model.gguf "model apa kamu" \
+  --bin target/release/qarnyx \
+  --workers 10 --runs 3 --warmups 1 --profile
+```
+
+The extra profile runs are not included in the CSV timing data. For Qwen3.5,
+the runtime prints:
+- **Prefill:** prompt forward-token count, elapsed forward time, and forward
+  tokens/sec.
+- **Decode loop:** generated-token count, elapsed loop time, and loop
+  tokens/sec, including sampling and synchronous event callback overhead.
+- **Decode forward:** number of model forward evaluations, their accumulated
+  elapsed time, and forward tokens/sec, excluding sampling and output callback
+  overhead.
+- Separate per-operator aggregate tables for prefill and decode.
+
+Profiling is opt-in and adds measurement overhead. Use profile output to find
+expensive phases/operators, but use the unprofiled CSV trials for clean
+whole-process comparisons. Prefill/decode figures are model-phase measurements
+and exclude model-file loading and tokenizer/model initialization.
+
 The following Bash example runs one warm-up and five measured trials for each
 kernel/worker combination. It writes elapsed wall time, peak process RSS, and
 an output hash to CSV. Set `MODEL` to the exact GGUF file.
@@ -252,11 +305,13 @@ not establish whether 2, 4, 6, or 8 workers would be optimal.
 
 ## Known benchmark limitations
 
-The current CLI runs one blocking generation per process and prints the final
-text after generation. It does not expose token streaming, time-to-first-token,
-or independent prefill/decode timers. End-to-end CLI timing therefore remains
-the reliable metric available from this command-line path until a dedicated
-benchmark harness is added.
+The CLI runs one generation per process. Whole-process wall time includes
+model loading and setup, so it is not a substitute for the Qwen3.5 phase
+profile. The current profiler separates prompt prefill and autoregressive
+decode, but its decode loop metric includes greedy sampling and any synchronous
+stream callback. The decode-forward metric isolates model forward evaluations
+more closely. Profiling is currently Qwen3.5-specific; do not assume identical
+phase instrumentation for the LLaMA path.
 
 
 ## User-reported VPS Q4_K fused-q4k worker scaling (2026-11-19)
