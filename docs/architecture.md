@@ -120,10 +120,12 @@ produce out_features values. Matmul weights are [m, k], the row-major input is
 [k, n], and the row-major output is [m, n]. The physical quantized block layout
 remains specific to the tensor type. Matrix kernels validate exact encoded
 storage lengths and do not materialize a full F32 matrix. On x86_64 with AVX2
-and FMA, the automatic Q4_K/Q5_K/Q6_K matvec path computes directly from packed
-K-quant blocks using F32-input AVX2/FMA kernels; CPUs without both features keep
-the runtime-SIMD dequantize-plus-dot fallback. The previous dequantized mode is
-retained as an explicit Rust API baseline through `CpuBackend::new_dequant()`.
+and FMA, the Q4_K/Q5_K/Q6_K matvec path computes directly from packed K-quant
+blocks using F32-input AVX2/FMA kernels; CPUs without both features keep the
+runtime-SIMD dequantize-plus-dot fallback. The selectable CPU surface is kept
+intentionally small: `auto` is the default dispatch mode and
+`fused-kq-fma` explicitly selects the same optimized path for controlled
+comparisons.
 
 General matvec and matmul fallbacks reuse a per-thread F32 scratch allocation.
 Large operations are partitioned by encoded weight bytes into several tasks
@@ -154,8 +156,8 @@ projection completes before the model continues. Small matrices remain on the
 single-threaded path to avoid scheduling overhead. Benchmark worker counts
 1, 2, 4, 6, 8, and 10 on the target VPS because scheduler contention and memory
 bandwidth may make fewer workers faster. Run
-`cargo bench -p qarnyx-cpu --bench kernels` to compare scaling for F32 and Q4_K
-matvec in addition to the storage-format comparisons.
+`cargo bench -p qarnyx-cpu --bench kernels` for focused comparisons of the
+retained `auto` and `fused-kq-fma` paths.
 
 The scalar implementation is the correctness oracle. SIMD implementations
 must be compared against it with documented tolerances and must pass
@@ -163,15 +165,21 @@ correctness tests before dispatch is enabled.
 
 ## CPU execution strategy
 
-Keep the scalar backend as the correctness reference and dispatch by runtime
-feature detection:
-- x86_64: AVX2/FMA matvec and four-row F32 GEMM micro-kernels are implemented;
-- x86_64: automatic direct-block Q4_K/Q5_K/Q6_K matvec uses AVX2+FMA when
-  supported, with dequantized SIMD and scalar fallback paths;
-- x86_64: explicit Q8_K-based Q4_K and integer K-quant alternatives remain
-  selectable for A/B comparisons;
-- aarch64: NEON kernels remain planned;
-- all other configurations: scalar fallback.
+Keep portable scalar/dequantization code internal as a correctness reference
+and fallback. The public CLI exposes only two selectable modes:
+- `auto`: production/default runtime dispatch; uses direct-block F32-input
+  Q4_K/Q5_K/Q6_K AVX2/FMA on supported x86_64 CPUs and portable fallback
+  otherwise;
+- `fused-kq-fma`: explicit selection of that same direct-block AVX2/FMA path
+  for controlled comparisons; it is not a separate algorithm from the current
+  `auto` fast path;
+- aarch64: portable fallback until a NEON implementation is separately
+  validated;
+- other configurations: portable fallback.
+
+Do not add selectable kernel variants without a reproducible target-machine
+throughput gain and correctness evidence. Internal scalar reference code is
+not a third CLI kernel mode.
 
 Do not compile the default release build with target-cpu=native. That setting
 can produce a binary that fails on a different CPU. Use it only for
@@ -531,9 +539,45 @@ than HTTP protocol adapters.
 
 ## Benchmark methodology
 
-The repeatable CLI benchmark procedure, command template, CSV fields, warm-up
-rules, and interpretation limits are maintained in
-[docs/benchmarking.md](benchmarking.md). CLI wall-clock results include model
-loading and request setup as well as generation; they are not decode-only
-throughput measurements. Do not infer end-to-end performance from synthetic
-kernel tests alone.
+The repeatable CLI comparison, two-mode Python runner, phase-profiling output,
+CSV fields, warm-up rules, and interpretation limits are maintained in
+[docs/benchmarking.md](benchmarking.md). Whole-process timings include model
+loading and request setup; Qwen3.5 profiling separately reports prompt prefill,
+decode-loop, decode-forward, and per-operator aggregates. Do not infer
+end-to-end performance from synthetic kernel tests alone.
+
+
+## M9 - CPU performance gap closure (in progress)
+
+M9 focuses on measurable Qwen3.5 2B CPU performance, not expanding the kernel
+menu. Keep only `auto` and `fused-kq-fma` as selectable modes. The existing
+scalar/dequantization code remains internal for fallback and differential
+correctness checks.
+
+- **M9-A — Baseline and phase profiling:** separate Qwen3.5 prompt prefill from
+  autoregressive decode; report prefill tokens/sec, decode-loop tokens/sec,
+  decode-forward tokens/sec, and per-operator totals by phase. Add one
+  standard-library benchmark runner that compares only the two retained modes,
+  uses warm-up and round-robin trials, checks output hashes, and records median
+  and range.
+- **M9-B — Quantized GEMV:** profile-guided improvements to direct-block
+  Q4_K/Q5_K/Q6_K decode kernels. Focus on block unpack, scale application,
+  activation reuse, independent accumulator chains, and memory access. Keep
+  changes only when target-machine decode throughput improves and numerical
+  differential tests pass.
+- **M9-C — Fused elementwise operations:** optimize only operators proven
+  material by M9-A profiling, such as RMSNorm, RoPE, softmax, activation, or
+  recurrent-state updates. Avoid speculative SIMD work on negligible phases.
+- **M9-D — Prefill matrix path:** measure prompt prefill separately and assess
+  tiled/repacked quantized GEMM only if projection matmul is a significant
+  bottleneck. Keep the decode path and model outputs unchanged.
+- **M9-E — Final validation:** compare the same GGUF, prompt, output-token
+  count, worker count, compiler/build, and host conditions against llama.cpp.
+  Report prefill and decode separately, output parity, median/spread, and peak
+  RSS. Historical or synthetic kernel timings are not substitutes for this
+  end-to-end evidence.
+
+M9 changes should be narrow and reversible: one measured bottleneck per
+change, a focused numerical regression test, and the same two-mode
+whole-model benchmark. Do not multiply kernel variants or create a large
+cross-product test matrix.
